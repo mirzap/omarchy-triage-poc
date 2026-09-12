@@ -6,14 +6,15 @@ import json
 from pathlib import Path
 from typing import Any
 
+from triage.assign import assign_incremental
 from triage.cluster import DEFAULT_THRESHOLD, cluster_prs
 from triage.dedupe import apply_fingerprints, file_set_signature
-from triage.embed import Embedder, cosine_similarity
+from triage.embed import cosine_similarity
 from triage.github import fetch_pulls, parse_repo
-from triage.graph import build_graph_payload
 from triage.models import Group, PullRequest, TrustedRule
 from triage.overlap import overlap_for_groups
-from triage.store import load_rules, save_run_state
+from triage.queue import build_queue
+from triage.store import load_rules, load_store, save_run_state
 from triage.summarize import summarize_all
 
 AUTO_APPROVE_LABEL = "auto:approved-shape"
@@ -111,12 +112,11 @@ def match_rule(
     for r in approved:
         if pr.fingerprint and pr.fingerprint in r.fingerprints:
             return r
-        sim = cosine_similarity(vector, r.centroid) if r.centroid and vector else 0.0
+        if r.file_set_signature and file_set_signature(pr.paths) == r.file_set_signature:
+            return r
         overlap = files_overlap(pr.paths, r.shared_files)
-        # Also accept matching file-set signature as overlap signal
-        if not overlap and r.file_set_signature:
-            overlap = file_set_signature(pr.paths) == r.file_set_signature
-        if sim >= auto_threshold and overlap:
+        sim = cosine_similarity(vector, r.centroid) if r.centroid and vector else 0.0
+        if overlap and sim >= auto_threshold:
             return r
         # SimHash near-dup + file overlap
         rule_sh = getattr(r, "simhash", 0) or 0
@@ -143,6 +143,27 @@ def auto_classify(
     return prs
 
 
+def _slim_prs(prs: list[PullRequest], groups: list[Group], repo: str) -> list[dict[str, Any]]:
+    gid_of = {}
+    for g in groups:
+        for n in g.pr_numbers:
+            gid_of[n] = g.group_id
+    out = []
+    for p in prs:
+        html = p.html_url or (f"https://github.com/{repo}/pull/{p.number}" if repo else "")
+        out.append({
+            "number": p.number,
+            "title": p.title,
+            "user": p.user,
+            "label": p.label,
+            "paths": list(p.paths),
+            "group_id": gid_of.get(p.number, ""),
+            "html_url": html,
+            "created_at": p.created_at,
+        })
+    return out
+
+
 def run_pipeline(
     prs: list[PullRequest],
     threshold: float = DEFAULT_THRESHOLD,
@@ -152,53 +173,77 @@ def run_pipeline(
     apply_rules: bool = True,
     source: str = "",
     repo: str = "",
+    incremental: bool | None = None,
 ) -> dict[str, Any]:
+    """
+    File-set pipeline. Skips TF-IDF (that hung 2.2k PRs on 8GB).
+    incremental=True (default when persisting onto an existing store)
+    assigns new PRs into current groups instead of reclustering.
+    """
+    from triage.store import DEFAULT_STORE_PATH
+
+    path = store_path or DEFAULT_STORE_PATH
     prs = apply_fingerprints(list(prs))
-    docs = [p.text_for_embed for p in prs]
-    embedder = Embedder(n=3)
-    vectors = embedder.fit_transform(docs)
-    groups = cluster_prs(prs, vectors, threshold=threshold)
+    dummy = [[0.0] for _ in prs]
+
+    existing: list[Group] = []
+    prev_nums: set[int] = set()
+    if incremental is None:
+        incremental = persist
+    if incremental:
+        data = load_store(path)
+        raw = data.get("last_groups") or []
+        prev_nums = {int(n) for n in (data.get("last_pr_numbers") or []) if n}
+        if raw:
+            existing = [g if isinstance(g, Group) else Group.from_dict(g) for g in raw]
+
+    if existing:
+        groups = assign_incremental(prs, existing)
+        mode = "incremental"
+    else:
+        groups = cluster_prs(prs, dummy, threshold=threshold)
+        mode = "full"
+
     groups = summarize_all(groups, prs, use_llm=use_llm)
 
     rules: list[TrustedRule] = []
     if apply_rules:
-        from triage.store import DEFAULT_STORE_PATH
-
-        path = store_path or DEFAULT_STORE_PATH
         rules = load_rules(path)
-        # Re-embed against same vocab for rule centroids already stored;
-        # match_rule uses stored centroids directly with current vectors.
-        auto_classify(prs, vectors, rules)
+        auto_classify(prs, dummy, rules)
 
-    graph = build_graph_payload(prs, groups, vectors, repo=repo or None)
+    slim = _slim_prs(prs, groups, repo)
     overlap = overlap_for_groups(groups, prs)
+    new_nums = [p.number for p in prs if p.number not in prev_nums]
+    queue = build_queue(groups, prs, rules, new_pr_numbers=new_nums)
 
     if persist:
-        from triage.store import DEFAULT_STORE_PATH
-
-        path = store_path or DEFAULT_STORE_PATH
         save_run_state(
             groups,
             [p.number for p in prs],
-            last_prs=graph["prs"],
-            last_edges=graph["edges"],
-            last_group_edges=graph["group_edges"],
+            last_prs=slim,
+            last_edges=[],
+            last_group_edges=[],
             last_overlap=overlap,
             source=source or None,
             repo=repo or None,
             path=path,
+            last_new_pr_numbers=new_nums,
+            last_queue=queue,
         )
 
     return {
         "prs": prs,
         "groups": groups,
-        "vectors": vectors,
-        "embedder": embedder,
+        "vectors": dummy,
+        "embedder": None,
         "rules": rules,
-        "edges": graph["edges"],
-        "group_edges": graph["group_edges"],
-        "slim_prs": graph["prs"],
+        "edges": [],
+        "group_edges": [],
+        "slim_prs": slim,
         "overlap": overlap,
+        "queue": queue,
+        "new_pr_numbers": new_nums,
+        "assign_mode": mode,
     }
 
 

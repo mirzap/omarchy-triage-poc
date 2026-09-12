@@ -23,6 +23,8 @@ def _empty_store() -> dict[str, Any]:
         "last_overlap": {},
         "source": "",
         "repo": "",
+        "last_new_pr_numbers": [],
+        "last_queue": {},
     }
 
 
@@ -44,6 +46,8 @@ def load_store(path: Path = DEFAULT_STORE_PATH) -> dict[str, Any]:
     data.setdefault("last_overlap", {})
     data.setdefault("source", "")
     data.setdefault("repo", "")
+    data.setdefault("last_new_pr_numbers", [])
+    data.setdefault("last_queue", {})
     return data
 
 
@@ -72,6 +76,8 @@ def save_run_state(
     source: str | None = None,
     repo: str | None = None,
     path: Path = DEFAULT_STORE_PATH,
+    last_new_pr_numbers: list[int] | None = None,
+    last_queue: dict[str, Any] | None = None,
 ) -> None:
     """Persist groups plus slim PR/graph payload for the UI."""
     data = load_store(path)
@@ -89,6 +95,10 @@ def save_run_state(
         data["source"] = source
     if repo is not None:
         data["repo"] = repo
+    if last_new_pr_numbers is not None:
+        data["last_new_pr_numbers"] = last_new_pr_numbers
+    if last_queue is not None:
+        data["last_queue"] = last_queue
     save_store(data, path)
 
 
@@ -141,7 +151,23 @@ def decide_group(
         simhash=int(getattr(match, "simhash", 0) or 0),
     )
     upsert_rule(rule, path)
+    _refresh_queue(path)
     return rule
+
+
+def _refresh_queue(path: Path = DEFAULT_STORE_PATH) -> None:
+    """Rebuild last_queue after a bless/reject so the Queue tab moves."""
+    from triage.overlap import slim_to_pr
+    from triage.queue import build_queue
+
+    data = load_store(path)
+    groups = [Group.from_dict(g) for g in (data.get("last_groups") or [])]
+    prs = [slim_to_pr(p) for p in (data.get("last_prs") or [])]
+    rules = [TrustedRule.from_dict(r) for r in (data.get("trusted_rules") or [])]
+    data["last_queue"] = build_queue(
+        groups, prs, rules, new_pr_numbers=data.get("last_new_pr_numbers") or []
+    )
+    save_store(data, path)
 
 
 MAX_STATE_TITLES = 4
@@ -253,4 +279,6 @@ def ui_state(path: Path = DEFAULT_STORE_PATH) -> dict[str, Any]:
         "overlap": overlap,
         "source": data.get("source", ""),
         "repo": data.get("repo", ""),
+        "queue": data.get("last_queue") or {},
+        "new_pr_numbers": data.get("last_new_pr_numbers") or [],
     }

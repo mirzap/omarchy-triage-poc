@@ -473,3 +473,27 @@ pre.diff {
 pre.diff .add { color: #34d399; }
 pre.diff .del { color: #f87171; }
 pre.diff .hunk { color: #71717a; }
+
+.pile-head {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  padding: 10px 4px 6px;
+  font-weight: 600;
+}
+.pile-empty { padding: 4px 6px 10px; font-size: 12px; }
+.hotspot-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  margin-bottom: 4px;
+  cursor: pointer;
+  background: var(--bg-elev);
+}
+.hotspot-row:hover { border-color: #52525b; }
+.hotspot-row .mono { font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.left-tabs .tab { font-size: 12px; padding: 8px 6px; }

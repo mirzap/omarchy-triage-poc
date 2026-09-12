@@ -30,11 +30,13 @@
   <main class="layout">
     <aside class="pane left">
       <div class="left-tabs" role="tablist">
-        <button type="button" class="tab active" id="tabGroups" data-tab="groups" role="tab" aria-selected="true">Groups</button>
+        <button type="button" class="tab active" id="tabQueue" data-tab="queue" role="tab" aria-selected="true">Queue</button>
+        <button type="button" class="tab" id="tabGroups" data-tab="groups" role="tab" aria-selected="false">Groups</button>
         <button type="button" class="tab" id="tabAllPrs" data-tab="allprs" role="tab" aria-selected="false">All PRs</button>
       </div>
       <div id="groupListHeader" class="list-header muted"></div>
-      <div id="groupList" class="virt-scroll" role="list"></div>
+      <div id="queueList" class="virt-scroll" role="list"></div>
+      <div id="groupList" class="virt-scroll hidden" role="list"></div>
       <div id="allPrList" class="virt-scroll hidden" role="list"></div>
     </aside>
 

@@ -23,7 +23,9 @@
     selectedPr: null,
     selectedFile: null,
     showGroupGraph: false,
-    leftTab: "groups", // groups | allprs
+    leftTab: "queue", // queue | groups | allprs
+    queue: {},
+    new_pr_numbers: [],
     fetching: false,
   };
 
@@ -59,6 +61,8 @@
     state.overlap = data.overlap || {};
     state.source = data.source || "";
     state.repo = data.repo || "";
+    state.queue = data.queue || {};
+    state.new_pr_numbers = data.new_pr_numbers || [];
     if (data.source) $("source").value = "gh";
     if (data.repo) $("repo").value = data.repo;
     if (
@@ -122,8 +126,15 @@
 
   function renderLeftHeader() {
     const hdr = $("groupListHeader");
+    const q = state.queue || {};
+    const c = q.counts || {};
     if (state.leftTab === "allprs") {
       hdr.textContent = state.prs.length + " PRs";
+    } else if (state.leftTab === "queue") {
+      hdr.textContent =
+        (c.needs_you || 0) + " need you · " +
+        (c.known || 0) + " known · " +
+        (c.hotspots || 0) + " hotspots";
     } else {
       hdr.textContent = state.groups.length + " groups · " + state.prs.length + " PRs";
     }
@@ -345,17 +356,89 @@
 
   function setLeftTab(tab) {
     state.leftTab = tab;
+    const qTab = $("tabQueue");
     const groupsTab = $("tabGroups");
     const allTab = $("tabAllPrs");
+    qTab.classList.toggle("active", tab === "queue");
     groupsTab.classList.toggle("active", tab === "groups");
     allTab.classList.toggle("active", tab === "allprs");
+    qTab.setAttribute("aria-selected", tab === "queue" ? "true" : "false");
     groupsTab.setAttribute("aria-selected", tab === "groups" ? "true" : "false");
     allTab.setAttribute("aria-selected", tab === "allprs" ? "true" : "false");
+    $("queueList").classList.toggle("hidden", tab !== "queue");
     $("groupList").classList.toggle("hidden", tab !== "groups");
     $("allPrList").classList.toggle("hidden", tab !== "allprs");
     renderLeftHeader();
-    if (tab === "groups") renderGroupList();
+    if (tab === "queue") renderQueue();
+    else if (tab === "groups") renderGroupList();
     else renderAllPrList();
+  }
+
+  function groupById(id) {
+    return state.groups.find((g) => g.group_id === id) || null;
+  }
+
+  function renderQueue() {
+    const root = $("queueList");
+    const q = state.queue || {};
+    renderLeftHeader();
+    root.innerHTML = "";
+    const piles = [
+      ["Needs you", q.needs_you || []],
+      ["Known shape", q.known || []],
+      ["Junk", q.junk || []],
+    ];
+    for (const [label, ids] of piles) {
+      const h = document.createElement("div");
+      h.className = "pile-head";
+      h.textContent = label + " · " + ids.length;
+      root.appendChild(h);
+      if (!ids.length) {
+        const empty = document.createElement("div");
+        empty.className = "muted pile-empty";
+        empty.textContent = "none";
+        root.appendChild(empty);
+        continue;
+      }
+      ids.slice(0, 80).forEach((id) => {
+        const g = groupById(id);
+        if (g) root.appendChild(buildGroupCard(g));
+      });
+      if (ids.length > 80) {
+        const more = document.createElement("div");
+        more.className = "muted pile-empty";
+        more.textContent = "+" + (ids.length - 80) + " more";
+        root.appendChild(more);
+      }
+    }
+    const h = document.createElement("div");
+    h.className = "pile-head";
+    const spots = q.hotspots || [];
+    h.textContent = "File hotspots · " + spots.length;
+    root.appendChild(h);
+    spots.forEach((hs) => {
+      const row = document.createElement("div");
+      row.className = "hotspot-row";
+      row.innerHTML =
+        '<span class="mono">' +
+        escapeHtml(hs.path) +
+        '</span><span class="muted">' +
+        hs.pr_count +
+        " PRs</span>";
+      row.addEventListener("click", () => {
+        state.selectedFile = hs.path;
+        const hit = state.groups.find((g) =>
+          (g.shared_files || []).includes(hs.path) ||
+          (g.pr_numbers || []).some((n) => {
+            const pr = prByNumber(n);
+            return pr && (pr.paths || []).includes(hs.path);
+          })
+        );
+        if (hit) state.selectedGroupId = hit.group_id;
+        render();
+      });
+      root.appendChild(row);
+    });
   }
 
   function renderDetail() {
@@ -910,6 +993,7 @@
 
   function render() {
     if (state.leftTab === "allprs") renderAllPrList();
+    else if (state.leftTab === "queue") renderQueue();
     else renderGroupList();
     renderDetail();
   }
@@ -919,8 +1003,9 @@
     try {
       const data = await api("/api/state");
       applyState(data);
+      const c = (state.queue && state.queue.counts) || {};
       setStatus(
-        `${state.prs.length} PRs · ${state.groups.length} groups · ${state.edges.length} edges`
+        `${state.prs.length} PRs · ${state.groups.length} groups · ${c.needs_you || 0} need you`
       );
     } catch (err) {
       setStatus("error: " + err.message);
@@ -1045,6 +1130,7 @@
     state.showGroupGraph = !!e.target.checked;
     drawGraph();
   });
+  $("tabQueue").addEventListener("click", () => setLeftTab("queue"));
   $("tabGroups").addEventListener("click", () => setLeftTab("groups"));
   $("tabAllPrs").addEventListener("click", () => setLeftTab("allprs"));
 
