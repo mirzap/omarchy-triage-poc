@@ -595,3 +595,37 @@ a.pr-link { color: var(--accent); font-family: var(--mono); }
 .diff-line.del { background: #3f0d0d; }
 .diff-line.del .src { color: #f87171; }
 .diff-line.hunk .src, .diff-line.meta .src { color: #71717a; }
+
+
+.detail-ident { min-width: 0; flex: 1; }
+.detail-kicker {
+  font-family: var(--mono);
+  font-size: 12px;
+  margin-bottom: 2px;
+}
+.detail-title {
+  font-size: 16px;
+  font-weight: 600;
+  line-height: 1.35;
+  max-width: 52rem;
+}
+.detail-title .pr-link { font-size: 16px; }
+.detail-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+.member-wrap {
+  max-height: 220px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #0c0c0e;
+}
+.more-block summary.queue-toggle {
+  display: list-item;
+  cursor: pointer;
+}
+.more-block .file-queue,
+.more-block .related-list { margin-top: 8px; }

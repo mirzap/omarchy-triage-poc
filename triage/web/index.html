@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Omarchy triage</title>
-  <link rel="stylesheet" href="/styles.css?v=8" />
+  <link rel="stylesheet" href="/styles.css?v=9" />
 </head>
 <body>
   <header class="topbar">
@@ -44,9 +44,11 @@
       <div id="detailEmpty" class="empty-state">Select a group</div>
       <div id="detail" class="detail hidden">
         <div class="detail-head">
-          <div>
-            <div class="mono" id="detailId"></div>
+          <div class="detail-ident">
+            <div class="detail-kicker muted" id="detailKicker"></div>
+            <div class="detail-title" id="detailTitle"></div>
             <div class="muted" id="detailMeta"></div>
+            <div class="detail-pills" id="detailPills"></div>
           </div>
           <div class="actions">
             <button id="blessBtn" type="button" class="btn accent">Bless shape</button>
@@ -55,8 +57,14 @@
             <button id="rejectBtn" type="button" class="btn danger">Reject</button>
           </div>
         </div>
+        <div class="block" id="membersBlock">
+          <h3 id="membersHead">PRs in this shape</h3>
+          <div id="detailMembersWrap" class="member-wrap">
+            <ul id="detailMembers" class="member-list"></ul>
+          </div>
+        </div>
         <div class="block">
-          <h3>Overlap</h3>
+          <h3>Files in this shape</h3>
           <div id="overlapSummary" class="overlap-summary muted"></div>
           <div class="overlap-legend">
             <span class="item"><span class="sq shared"></span> all PRs</span>
@@ -72,54 +80,22 @@
           <h3>Diff</h3>
           <div id="diffMeta" class="muted diff-hint"></div>
           <div id="diffPanels" class="diff-panels">
-            <div class="muted diff-hint">Click a file in the matrix.</div>
+            <div class="muted diff-hint">Pick a file above to compare hunks.</div>
           </div>
         </div>
-        <div class="block" id="fileQueueBlock">
-          <button type="button" id="fileQueueToggle" class="queue-toggle">Other PRs on this file</button>
-          <div id="fileQueue" class="file-queue muted hidden">Click a file row.</div>
-        </div>
-        <div class="block">
-          <h3>Agent card</h3>
-          <div id="agentCard" class="agent-card">
-            <div id="agentClass" class="pill"></div>
-            <div id="agentNote" class="card-title"></div>
-            <div id="agentHint" class="muted"></div>
-          </div>
-        </div>
-        <div class="block">
-          <h3>Related by patch</h3>
+        <details class="block more-block" id="fileQueueBlock">
+          <summary id="fileQueueToggle" class="queue-toggle">Also on this file</summary>
+          <div id="fileQueue" class="file-queue muted">Pick a file above.</div>
+        </details>
+        <details class="block more-block" id="relatedBlock">
+          <summary class="queue-toggle">Related by patch</summary>
           <div id="relatedList" class="related-list muted">Embedding idle.</div>
-        </div>
-        <div class="block">
-          <h3>Suggested</h3>
-          <div id="detailDecision" class="pill"></div>
-        </div>
-        <div class="block">
-          <h3>Title variants</h3>
-          <ul id="detailTitles" class="title-list"></ul>
-        </div>
-        <div class="block">
-          <h3>Members</h3>
-          <div id="detailMembersWrap" class="member-wrap">
-            <ul id="detailMembers" class="member-list"></ul>
-          </div>
-        </div>
-        <div class="block graph-block">
-          <div class="graph-head">
-            <h3>Neighborhood</h3>
-            <label class="toggle">
-              <input type="checkbox" id="groupGraphToggle" />
-              group overview
-            </label>
-          </div>
-          <svg id="graphSvg" class="graph" viewBox="0 0 400 280" aria-label="neighborhood graph"></svg>
-        </div>
+        </details>
       </div>
     </section>
   </main>
 
   <script src="/vendor/virtual.js"></script>
-  <script src="/app.js?v=8"></script>
+  <script src="/app.js?v=9"></script>
 </body>
 </html>

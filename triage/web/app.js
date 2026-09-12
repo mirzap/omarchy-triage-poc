@@ -624,6 +624,8 @@
   async function openFileQueue(path) {
     state.selectedFile = path;
     state.fileQueue = { path: path, prs: [], loading: true, same_patch: [] };
+    const block = $("fileQueueBlock");
+    if (block && block.tagName === "DETAILS") block.open = true;
     renderFileQueue();
     const g = state.groups.find((x) => x.group_id === state.selectedGroupId);
     if (g) renderDiffs(g);
@@ -649,15 +651,17 @@
     const count = (fq && (fq.pr_count || (fq.prs || []).length)) || 0;
     if (toggle) {
       toggle.textContent = count
-        ? "Other PRs on this file · " + count
-        : "Other PRs on this file";
+        ? "Also on this file · " + count
+        : "Also on this file";
     }
-    root.classList.toggle("hidden", !state.fileQueueOpen);
-    if (!state.fileQueueOpen) return;
+    const block = $("fileQueueBlock");
+    if (block && block.tagName === "DETAILS" && !block.open) {
+      /* keep collapsed; still refresh label */
+    }
     const path = state.selectedFile;
     if (!path) {
       root.className = "file-queue muted";
-      root.textContent = "Click a hotspot or a file row.";
+      root.textContent = "Pick a file in the table above.";
       return;
     }
     if (fq && fq.loading) {
@@ -727,6 +731,13 @@
     });
   }
 
+  function makePill(text, cls) {
+    const el = document.createElement("span");
+    el.className = "pill " + (cls || text);
+    el.textContent = text;
+    return el;
+  }
+
   function renderDetail() {
     const empty = $("detailEmpty");
     const detail = $("detail");
@@ -738,43 +749,62 @@
     }
     empty.classList.add("hidden");
     detail.classList.remove("hidden");
-    renderFileQueue();
 
     const rule = ruleFor(g.group_id);
-    $("detailId").textContent = g.group_id;
-    $("detailMeta").textContent = rule
-      ? `rule: ${rule.decision} (${rule.rule_id})`
-      : "no rule yet";
-    const cls = g.card_class || "needs-look";
-    const ac = $("agentClass");
-    ac.textContent = cls;
-    ac.className = "pill " + cls;
-    $("agentNote").textContent = g.card_note || (g.title_variants || [])[0] || "";
     const n = (g.pr_numbers || []).length;
-    $("agentHint").textContent = n >= 2
-      ? n + " PRs, same file-set. Bless once if the shape is safe."
-      : "Singleton. Read it or wait for a twin.";
-
+    const pr = state.selectedPr ? prByNumber(state.selectedPr) : null;
+    const firstTitle = (g.title_variants && g.title_variants[0]) || "";
+    const cls = g.card_class || "needs-look";
     const decision = g.suggested_decision || "unique";
-    const pill = $("detailDecision");
-    pill.textContent = decision;
-    pill.className = "pill " + decision;
 
-    renderOverlap(g);
-    renderDiffs(g);
-    const qPr = state.selectedPr || (g.pr_numbers || [])[0];
-    loadRelated(qPr, state.selectedFile || null);
+    if (pr) {
+      $("detailKicker").textContent = g.group_id + " · " + n + " PRs in this shape";
+      $("detailTitle").innerHTML =
+        '<a class="pr-link" href="' +
+        escapeHtml(prUrl(pr)) +
+        '" target="_blank" rel="noopener">#' +
+        pr.number +
+        "</a> " +
+        escapeHtml(pr.title || "");
+      $("detailMeta").textContent =
+        (pr.user || "") + (rule ? " · marked " + rule.decision : " · unreviewed");
+    } else {
+      $("detailKicker").textContent = g.group_id + " · " + n + (n === 1 ? " PR" : " PRs");
+      $("detailTitle").textContent = firstTitle || g.group_id;
+      $("detailMeta").textContent = rule
+        ? "marked " + rule.decision
+        : n >= 2
+          ? "same file-set. Bless once if the shape is safe."
+          : "singleton. Read it or wait for a twin.";
+    }
 
-    const titles = $("detailTitles");
-    titles.innerHTML = "";
-    (g.title_variants || []).forEach((t) => {
-      const li = document.createElement("li");
-      li.textContent = t;
-      titles.appendChild(li);
-    });
+    const pills = $("detailPills");
+    pills.innerHTML = "";
+    pills.appendChild(makePill(cls));
+    pills.appendChild(makePill(decision));
+    if (rule) {
+      const label =
+        rule.decision === "approve"
+          ? "blessed"
+          : rule.decision === "reject"
+            ? "rejected"
+            : rule.decision;
+      pills.appendChild(makePill(label, rule.decision === "approve" ? "blessed" : rule.decision));
+    }
+    const titles = (g.title_variants || []).filter((t) => t && t !== firstTitle);
+    if (titles.length) {
+      $("detailMeta").textContent += " · " + titles.length + " other titles";
+    }
+
+    const mh = $("membersHead");
+    if (mh) mh.textContent = "PRs in this shape · " + n;
 
     renderMembers(g);
-    drawGraph();
+    renderOverlap(g);
+    renderDiffs(g);
+    renderFileQueue();
+    const qPr = state.selectedPr || (g.pr_numbers || [])[0];
+    loadRelated(qPr, state.selectedFile || null);
   }
 
   function renderMembers(g) {
@@ -847,7 +877,6 @@
       if (ev.target.tagName === "A") return;
       state.selectedPr = num;
       renderDetail();
-      drawGraph();
     });
     return li;
   }
@@ -1013,7 +1042,7 @@
     const root = $("diffPanels");
     const path = state.selectedFile;
     if (!path) {
-      root.innerHTML = '<div class="muted diff-hint">Click a file to see patches.</div>';
+      root.innerHTML = '<div class="muted diff-hint">Pick a file above to compare hunks.</div>';
       return;
     }
     const groupSet = new Set(g.pr_numbers || []);
@@ -1491,21 +1520,10 @@
   }
 
   $("fetchBtn").addEventListener("click", doFetch);
-  const fqToggle = $("fileQueueToggle");
-  if (fqToggle) {
-    fqToggle.addEventListener("click", () => {
-      state.fileQueueOpen = !state.fileQueueOpen;
-      renderFileQueue();
-    });
-  }
   $("blessBtn").addEventListener("click", () => doDecide("approve"));
   $("hardwareBtn").addEventListener("click", () => doDecide("hardware"));
   $("upgradeBtn").addEventListener("click", () => doDecide("upgrade"));
   $("rejectBtn").addEventListener("click", () => doDecide("reject"));
-  $("groupGraphToggle").addEventListener("change", (e) => {
-    state.showGroupGraph = !!e.target.checked;
-    drawGraph();
-  });
   $("tabQueue").addEventListener("click", () => setLeftTab("queue"));
   $("tabGroups").addEventListener("click", () => setLeftTab("groups"));
   $("tabAllPrs").addEventListener("click", () => setLeftTab("allprs"));
