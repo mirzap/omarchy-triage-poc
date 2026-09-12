@@ -198,11 +198,11 @@
           );
           if (idx >= 0) queueVirtualizer.scrollToIndex(idx, { align: "center" });
         } else if (state.leftTab === "groups" && groupVirtualizer) {
-          const groups = sortedGroups();
+          const groups = visibleGroups();
           const idx = groups.findIndex((g) => g.group_id === gid);
           if (idx >= 0) groupVirtualizer.scrollToIndex(idx, { align: "center" });
         } else if (state.leftTab === "allprs" && allPrVirtualizer && prn) {
-          const prs = sortedAllPrs();
+          const prs = visibleAllPrs();
           const idx = prs.findIndex((p) => p.number === prn);
           if (idx >= 0) allPrVirtualizer.scrollToIndex(idx, { align: "center" });
         }
