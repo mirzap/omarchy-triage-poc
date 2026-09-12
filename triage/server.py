@@ -15,7 +15,7 @@ from urllib.parse import parse_qs, urlparse
 from triage.gh import cached_pr_files
 from triage.github import parse_repo
 from triage.pipeline import ingest, run_pipeline
-from triage.embed import related
+from triage.rank import related
 from triage.store import (
     DEFAULT_STORE_PATH,
     decide_group,
