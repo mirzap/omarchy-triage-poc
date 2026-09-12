@@ -513,3 +513,26 @@ pre.diff .hunk { color: #71717a; }
 .btn.warn { color: #fbbf24; border-color: #92400e; }
 .pill.hardware { color: #fbbf24; border-color: #92400e; }
 .pill.upgrade { color: #f87171; border-color: #7f1d1d; }
+
+.file-queue {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 260px;
+  overflow: auto;
+  padding-right: 4px;
+}
+.file-queue .hotspot-row {
+  display: grid;
+  grid-template-columns: 64px 1fr auto;
+  align-items: center;
+  min-height: 32px;
+}
+.file-queue .hotspot-row span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.actions { flex-wrap: wrap; justify-content: flex-end; }
+.detail-head { flex-wrap: wrap; }
+.same-patch-list { font-family: var(--mono); font-size: 11px; margin: 4px 0 8px; }

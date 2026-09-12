@@ -529,7 +529,7 @@
 
   async function openFileQueue(path) {
     state.selectedFile = path;
-    state.fileQueue = { path: path, prs: [], loading: true };
+    state.fileQueue = { path: path, prs: [], loading: true, same_patch: [] };
     renderFileQueue();
     const g = state.groups.find((x) => x.group_id === state.selectedGroupId);
     if (g) renderDiffs(g);
@@ -598,7 +598,7 @@
       });
       root.appendChild(box);
     }
-    items.forEach((pr) => {
+    items.slice(0, 20).forEach((pr) => {
       const row = document.createElement("div");
       row.className = "hotspot-row";
       if (state.selectedPr === pr.number) row.classList.add("selected");
@@ -874,10 +874,12 @@
       root.innerHTML = '<div class="muted diff-hint">Click a file to see patches.</div>';
       return;
     }
+    const groupSet = new Set(g.pr_numbers || []);
     const fqNums = ((state.fileQueue && state.fileQueue.prs) || [])
       .map((p) => p.number)
       .filter(Boolean);
-    const nums = (fqNums.length ? fqNums : (g.pr_numbers || [])).slice(0, 12);
+    const groupOnFile = fqNums.filter((n) => groupSet.has(n));
+    const nums = (groupOnFile.length ? groupOnFile : (g.pr_numbers || [])).slice(0, 8);
     if (!nums.length) {
       root.innerHTML =
         '<div class="muted diff-hint">No patches for ' +
@@ -948,7 +950,7 @@
         (patch ? (same ? "same hunk" : "different") : "no patch") +
         "</span></div>" +
         '<pre class="diff">' +
-        colorizeDiff(patch || "(empty patch)") +
+        colorizeDiff((patch && patch.length > 4000 ? patch.slice(0, 4000) + "\n… truncated" : patch) || "(empty patch)") +
         "</pre>";
       root.appendChild(panel);
     });

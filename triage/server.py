@@ -287,7 +287,7 @@ class TriageHandler(BaseHTTPRequestHandler):
             repo = (qs.get("repo") or [""])[0] or (load_store(self.store_path).get("repo") or "omacom/omarchy")
             file_path = (qs.get("path") or [""])[0]
             raw_prs = (qs.get("prs") or [""])[0]
-            numbers = [int(x) for x in raw_prs.split(",") if x.strip().isdigit()][:40]
+            numbers = [int(x) for x in raw_prs.split(",") if x.strip().isdigit()][:8]
             try:
                 owner, name = parse_repo(repo)
             except ValueError as exc:
@@ -301,7 +301,11 @@ class TriageHandler(BaseHTTPRequestHandler):
                     if f.get("path") == file_path:
                         patch = f.get("patch") or ""
                         break
-                items.append({"number": n, "path": file_path, "patch": patch})
+                cap = 6000
+                raw = patch or ""
+                if len(raw) > cap:
+                    raw = raw[:cap] + "\n… truncated"
+                items.append({"number": n, "path": file_path, "patch": raw, "truncated": len(patch or "") > cap})
             self._send_json(200, {"path": file_path, "items": items})
             return
         if path == "/" or path == "/index.html":
