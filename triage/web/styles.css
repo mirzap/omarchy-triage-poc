@@ -703,3 +703,24 @@ button.user-shape:hover { color: var(--text); }
   max-height: 220px;
   overflow: auto;
 }
+
+
+.pill-help {
+  margin-top: 8px;
+  font-size: 12px;
+  line-height: 1.4;
+  max-width: 52rem;
+}
+.label-key {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.label-key summary { cursor: pointer; }
+.label-key dl { margin: 8px 0 0; }
+.label-key dt {
+  font-family: var(--mono);
+  color: var(--text);
+  margin-top: 6px;
+}
+.label-key dd { margin: 2px 0 0; }

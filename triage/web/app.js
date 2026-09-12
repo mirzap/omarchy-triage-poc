@@ -316,11 +316,11 @@
         <span class="muted">${(g.pr_numbers || []).length} PRs</span>
       </div>
       <div class="row" style="margin-top:4px">
-        <span class="pill ${escapeHtml(decision)}">${escapeHtml(decision)}</span>
+        <span class="pill ${escapeHtml(decision)}" title="${escapeHtml(labelHelp(decision))}">${escapeHtml(decision)}</span>
         ${
           rule
-            ? `<span class="pill ${escapeHtml(rule.decision)}">${escapeHtml(
-                rule.decision === "approve" ? "blessed" : "rejected"
+            ? `<span class="pill ${escapeHtml(rule.decision)}" title="${escapeHtml(labelHelp(ruleLabel(rule.decision)) || labelHelp(rule.decision))}">${escapeHtml(
+                ruleLabel(rule.decision)
               )}</span>`
             : `<span class="muted">unreviewed</span>`
         }
@@ -926,10 +926,39 @@
     });
   }
 
+  const LABEL_HELP = {
+    unique: "One PR. No twin with the same file-set.",
+    duplicate: "Same files and same hunk headers. Likely the same change.",
+    "related-theme": "Same files, different hunks. Related work, not the same patch.",
+    "needs-look": "No keyword hit. Read it; nothing classified it further.",
+    hardware: "Title or path mentions hardware (gpu, wifi, fingerprint, …).",
+    "update-path": "Looks like an upgrade/migrate. Can break updates.",
+    docs: "Only docs or markdown.",
+    cosmetic: "Theme, font, wallpaper, or CSS.",
+    junk: "Invite, typo, or lockfile noise.",
+    blessed: "You marked this shape as trusted.",
+    rejected: "You rejected this shape.",
+    approve: "You marked this shape as trusted.",
+    reject: "You rejected this shape.",
+    upgrade: "You marked this as can-break-upgrade.",
+  };
+
+  function labelHelp(name) {
+    return LABEL_HELP[name] || "";
+  }
+
+  function ruleLabel(decision) {
+    if (decision === "approve") return "blessed";
+    if (decision === "reject") return "rejected";
+    return decision || "";
+  }
+
   function makePill(text, cls) {
     const el = document.createElement("span");
     el.className = "pill " + (cls || text);
     el.textContent = text;
+    const tip = labelHelp(cls || text) || labelHelp(text);
+    if (tip) el.title = tip;
     return el;
   }
 
@@ -996,6 +1025,15 @@
             ? "rejected"
             : rule.decision;
       pills.appendChild(makePill(label, rule.decision === "approve" ? "blessed" : rule.decision));
+    }
+    const help = $("pillHelp");
+    if (help) {
+      const bits = [cls, decision].concat(rule ? [ruleLabel(rule.decision)] : []);
+      help.textContent = bits
+        .filter(Boolean)
+        .map((k) => k + ": " + (labelHelp(k) || ""))
+        .filter((line) => line.indexOf(": ") > 0 && !line.endsWith(": "))
+        .join(" · ");
     }
     const titles = (g.title_variants || []).filter((t) => t && t !== firstTitle);
     if (titles.length) {
