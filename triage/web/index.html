@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Omarchy triage</title>
-  <link rel="stylesheet" href="/styles.css?v=12" />
+  <link rel="stylesheet" href="/styles.css?v=13" />
 </head>
 <body>
   <header class="topbar">
@@ -56,6 +56,10 @@
             <button id="upgradeBtn" type="button" class="btn warn">Can break upgrade</button>
             <button id="rejectBtn" type="button" class="btn danger">Reject</button>
           </div>
+        </div>
+        <div class="block" id="prBodyBlock">
+          <h3 id="prBodyHead">What this does</h3>
+          <div id="prBody" class="pr-body muted"></div>
         </div>
         <div class="block" id="membersBlock">
           <h3 id="membersHead">PRs in this shape</h3>
@@ -110,6 +114,6 @@
   </main>
 
   <script src="/vendor/virtual.js"></script>
-  <script src="/app.js?v=12"></script>
+  <script src="/app.js?v=13"></script>
 </body>
 </html>

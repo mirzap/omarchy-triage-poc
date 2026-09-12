@@ -44,6 +44,7 @@
   const $ = (id) => document.getElementById(id);
 
   let writingUrl = false;
+  let alignSidebar = true;
 
   function readUrl() {
     const q = new URLSearchParams(location.search);
@@ -178,6 +179,32 @@
     });
   }
 
+  function scrollSidebarToSelection() {
+    if (!alignSidebar) return;
+    const gid = state.selectedGroupId;
+    const prn = state.selectedPr;
+    requestAnimationFrame(() => {
+      try {
+        if (state.leftTab === "queue" && queueVirtualizer) {
+          const rows = queueRows();
+          const idx = rows.findIndex(
+            (r) => r.kind === "group" && r.group && r.group.group_id === gid
+          );
+          if (idx >= 0) queueVirtualizer.scrollToIndex(idx, { align: "center" });
+        } else if (state.leftTab === "groups" && groupVirtualizer) {
+          const groups = sortedGroups();
+          const idx = groups.findIndex((g) => g.group_id === gid);
+          if (idx >= 0) groupVirtualizer.scrollToIndex(idx, { align: "center" });
+        } else if (state.leftTab === "allprs" && allPrVirtualizer && prn) {
+          const prs = sortedAllPrs();
+          const idx = prs.findIndex((p) => p.number === prn);
+          if (idx >= 0) allPrVirtualizer.scrollToIndex(idx, { align: "center" });
+        }
+      } catch (_) {}
+      alignSidebar = false;
+    });
+  }
+
   function renderLeftHeader() {
     const hdr = $("groupListHeader");
     const q = state.queue || {};
@@ -231,6 +258,7 @@
     }
     groupVirtualizer._willUpdate();
     paintGroupVirtual();
+    scrollSidebarToSelection();
   }
 
   function paintGroupVirtual() {
@@ -341,6 +369,7 @@
     }
     allPrVirtualizer._willUpdate();
     paintAllPrVirtual();
+    scrollSidebarToSelection();
   }
 
   function paintAllPrVirtual() {
@@ -410,6 +439,7 @@
   }
 
   function setLeftTab(tab, fromUrl) {
+    if (tab !== state.leftTab) alignSidebar = true;
     state.leftTab = tab;
     const qTab = $("tabQueue");
     const groupsTab = $("tabGroups");
@@ -537,6 +567,7 @@
     }
     queueVirtualizer._willUpdate();
     paintQueueVirtual();
+    scrollSidebarToSelection();
   }
 
   function paintQueueVirtual() {
@@ -975,11 +1006,74 @@
     if (mh) mh.textContent = "PRs in this shape · " + n;
 
     renderMembers(g);
+    renderPrBodies(g);
     renderOverlap(g);
     renderDiffs(g);
     renderFileQueue();
     const qPr = state.selectedPr || (g.pr_numbers || [])[0];
     loadRelated(qPr, state.selectedFile || null);
+  }
+
+  let bodyGen = 0;
+  const bodyCache = {};
+
+  async function loadPrBody(num) {
+    if (bodyCache[num]) return bodyCache[num];
+    const repo = state.repo || "omacom/omarchy";
+    const data = await api(
+      "/api/pr?number=" + encodeURIComponent(num) + "&repo=" + encodeURIComponent(repo)
+    );
+    bodyCache[num] = data;
+    return data;
+  }
+
+  function renderPrBodies(g) {
+    const root = $("prBody");
+    const head = $("prBodyHead");
+    if (!root) return;
+    const selected = state.selectedPr;
+    const nums = selected
+      ? [selected]
+      : (g.pr_numbers || []).slice(0, 6);
+    if (head) {
+      head.textContent = selected
+        ? "What this PR does"
+        : "What these PRs do";
+    }
+    if (!nums.length) {
+      root.className = "pr-body muted";
+      root.textContent = "No PRs.";
+      return;
+    }
+    const gen = ++bodyGen;
+    root.className = "pr-body muted";
+    root.textContent = "Loading description…";
+    Promise.all(nums.map((n) => loadPrBody(n).catch((err) => ({ number: n, error: err.message }))))
+      .then((items) => {
+        if (gen !== bodyGen) return;
+        root.className = "pr-body";
+        root.innerHTML = "";
+        items.forEach((it) => {
+          const box = document.createElement("div");
+          box.className = "pr-body-item";
+          const who = document.createElement("div");
+          who.className = "who muted";
+          const pr = prByNumber(it.number) || it;
+          who.textContent =
+            "#" +
+            (it.number || "") +
+            " " +
+            (pr.user || it.user || "") +
+            (it.error ? " · " + it.error : "");
+          const text = document.createElement("div");
+          text.className = "pr-body-text";
+          const body = (it.body || "").trim();
+          text.textContent = body || "(no description)";
+          box.appendChild(who);
+          box.appendChild(text);
+          root.appendChild(box);
+        });
+      });
   }
 
   function renderMembers(g) {
@@ -1733,6 +1827,7 @@
   });
   window.addEventListener("popstate", () => {
     if (writingUrl) return;
+    alignSidebar = true;
     readUrl();
     setLeftTab(state.leftTab, true);
     renderDetail();

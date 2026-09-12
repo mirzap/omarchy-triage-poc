@@ -19,8 +19,8 @@ def suggest_decision(group: Group, prs_by_number: dict[int, PullRequest]) -> str
     shared = set.intersection(*path_sets) if len(path_sets) > 1 else path_sets[0]
     union = set.union(*path_sets)
     overlap = len(shared) / len(union) if union else 0.0
-    # Exact fingerprint collapse or high file overlap => duplicate
-    if len(set(m.fingerprint for m in members)) == 1 or overlap >= 0.8:
+    # Same fingerprint = same hunks. Shared files alone is not a duplicate fix.
+    if len(set(m.fingerprint for m in members if m.fingerprint)) == 1 and members:
         return "duplicate"
     if overlap >= 0.3:
         return "related-theme"

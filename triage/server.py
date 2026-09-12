@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from triage.gh import cached_pr_files
+from triage.gh import cached_pr_files, cached_pr_meta
 from triage.github import parse_repo
 from triage.pipeline import ingest, run_pipeline
 from triage.rank import related
@@ -261,6 +261,26 @@ class TriageHandler(BaseHTTPRequestHandler):
                 self._send_json(200, overlap_for_group(group_id, path=self.store_path))
             except KeyError as exc:
                 self._send_json(404, {"error": str(exc)})
+            return
+        if path == "/api/pr":
+            qs = parse_qs(parsed.query)
+            raw = (qs.get("number") or [""])[0]
+            if not raw.isdigit():
+                self._send_json(400, {"error": "number required"})
+                return
+            repo = (qs.get("repo") or [""])[0] or (
+                load_store(self.store_path).get("repo") or "omacom/omarchy"
+            )
+            try:
+                owner, name = parse_repo(repo)
+            except ValueError as exc:
+                self._send_json(400, {"error": str(exc)})
+                return
+            meta = cached_pr_meta(owner, name, int(raw))
+            if not meta:
+                self._send_json(404, {"error": "pr not in cache"})
+                return
+            self._send_json(200, meta)
             return
         if path == "/api/file":
             qs = parse_qs(parsed.query)

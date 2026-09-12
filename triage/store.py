@@ -188,6 +188,9 @@ def _slim_group_for_ui(
     card = classify_group(titles, paths)
     out["card_class"] = card["card_class"]
     out["card_note"] = card["card_note"]
+    fps = [f for f in (out.get("fingerprints") or []) if f]
+    if out.get("suggested_decision") == "duplicate" and len(set(fps)) > 1:
+        out["suggested_decision"] = "related-theme"
     if len(titles) > MAX_STATE_TITLES:
         out["title_variants"] = titles[:MAX_STATE_TITLES]
     return out

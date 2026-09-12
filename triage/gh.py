@@ -407,3 +407,38 @@ def cached_pr_files(
             }
         )
     return out
+
+
+_pulls_index: dict[tuple[str, str], dict[int, dict]] = {}
+
+
+def cached_pr_meta(
+    owner: str,
+    repo: str,
+    number: int,
+    cache_dir: Path | None = None,
+) -> dict[str, str] | None:
+    """Title/body/user from cached pulls.json. No network."""
+    key = (owner, repo)
+    if key not in _pulls_index:
+        raw = _load_json(_cache_root(owner, repo, cache_dir) / "pulls.json")
+        idx: dict[int, dict] = {}
+        if isinstance(raw, list):
+            for item in raw:
+                if not isinstance(item, dict) or "number" not in item:
+                    continue
+                user = ""
+                u = item.get("user")
+                if isinstance(u, dict):
+                    user = u.get("login") or ""
+                elif isinstance(u, str):
+                    user = u
+                idx[int(item["number"])] = {
+                    "number": int(item["number"]),
+                    "title": item.get("title") or "",
+                    "body": item.get("body") or "",
+                    "user": user,
+                    "html_url": item.get("html_url") or "",
+                }
+        _pulls_index[key] = idx
+    return _pulls_index[key].get(int(number))
