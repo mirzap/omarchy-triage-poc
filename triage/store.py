@@ -303,7 +303,7 @@ def prs_for_path(file_path: str, path: Path = DEFAULT_STORE_PATH, limit: int = 4
         owner, name = "omacom", "omarchy"
     shown = hits[:limit]
     by_sha: dict[str, list[int]] = defaultdict(list)
-    for hit in shown:
+    for hit in hits:
         files = cached_pr_files(owner, name, int(hit["number"] or 0))
         patch = ""
         for f in files:
