@@ -25,6 +25,9 @@ html, body {
   font-size: 13px;
 }
 button, input, select { font: inherit; color: inherit; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
 
 .topbar {
   display: flex;
@@ -536,3 +539,16 @@ pre.diff .hunk { color: #71717a; }
 .actions { flex-wrap: wrap; justify-content: flex-end; }
 .detail-head { flex-wrap: wrap; }
 .same-patch-list { font-family: var(--mono); font-size: 11px; margin: 4px 0 8px; }
+
+.queue-toggle {
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  padding: 0;
+  cursor: pointer;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  font-weight: 600;
+}
+.queue-toggle:hover { color: var(--text); }

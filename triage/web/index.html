@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Omarchy triage</title>
-  <link rel="stylesheet" href="/styles.css" />
+  <link rel="stylesheet" href="/styles.css?v=4" />
 </head>
 <body>
   <header class="topbar">
@@ -56,22 +56,6 @@
           </div>
         </div>
         <div class="block">
-          <h3>Agent card</h3>
-          <div id="agentCard" class="agent-card">
-            <div id="agentClass" class="pill"></div>
-            <div id="agentNote" class="card-title"></div>
-            <div id="agentHint" class="muted"></div>
-          </div>
-        </div>
-        <div class="block">
-          <h3>Related by patch</h3>
-          <div id="relatedList" class="related-list muted">Needs an OpenRouter key.</div>
-        </div>
-        <div class="block">
-          <h3>Suggested</h3>
-          <div id="detailDecision" class="pill"></div>
-        </div>
-        <div class="block">
           <h3>Overlap</h3>
           <div id="overlapSummary" class="overlap-summary muted"></div>
           <div class="overlap-legend">
@@ -84,15 +68,32 @@
             <table id="overlapMatrix" class="overlap-matrix"></table>
           </div>
         </div>
+        <div class="block" id="diffBlock">
+          <h3>Diff</h3>
+          <div id="diffMeta" class="muted diff-hint"></div>
+          <div id="diffPanels" class="diff-panels">
+            <div class="muted diff-hint">Click a file in the matrix.</div>
+          </div>
+        </div>
         <div class="block" id="fileQueueBlock">
-          <h3>PRs on this file</h3>
-          <div id="fileQueue" class="file-queue muted">Click a hotspot or a file row.</div>
+          <button type="button" id="fileQueueToggle" class="queue-toggle">Other PRs on this file</button>
+          <div id="fileQueue" class="file-queue muted hidden">Click a file row.</div>
         </div>
         <div class="block">
-          <h3>Diff</h3>
-          <div id="diffPanels" class="diff-panels">
-            <div class="muted diff-hint">Click a file to see patches.</div>
+          <h3>Agent card</h3>
+          <div id="agentCard" class="agent-card">
+            <div id="agentClass" class="pill"></div>
+            <div id="agentNote" class="card-title"></div>
+            <div id="agentHint" class="muted"></div>
           </div>
+        </div>
+        <div class="block">
+          <h3>Related by patch</h3>
+          <div id="relatedList" class="related-list muted">Embedding idle.</div>
+        </div>
+        <div class="block">
+          <h3>Suggested</h3>
+          <div id="detailDecision" class="pill"></div>
         </div>
         <div class="block">
           <h3>Title variants</h3>
@@ -119,6 +120,6 @@
   </main>
 
   <script src="/vendor/virtual.js"></script>
-  <script src="/app.js"></script>
+  <script src="/app.js?v=4"></script>
 </body>
 </html>

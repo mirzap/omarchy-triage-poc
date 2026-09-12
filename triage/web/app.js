@@ -27,6 +27,7 @@
     queue: {},
     new_pr_numbers: [],
     fileQueue: null,
+    fileQueueOpen: false,
     related: null,
     relatedKey: "",
     fetching: false,
@@ -550,6 +551,16 @@
   function renderFileQueue() {
     const root = $("fileQueue");
     if (!root) return;
+    const toggle = $("fileQueueToggle");
+    const fq = state.fileQueue;
+    const count = (fq && (fq.pr_count || (fq.prs || []).length)) || 0;
+    if (toggle) {
+      toggle.textContent = count
+        ? "Other PRs on this file · " + count
+        : "Other PRs on this file";
+    }
+    root.classList.toggle("hidden", !state.fileQueueOpen);
+    if (!state.fileQueueOpen) return;
     const fq = state.fileQueue;
     const path = state.selectedFile;
     if (!path) {
@@ -888,6 +899,12 @@
       return;
     }
     const gen = ++diffGen;
+    const meta = $("diffMeta");
+    if (meta) meta.textContent = path + " · " + nums.length + " PRs in this group";
+    const block = $("diffBlock");
+    if (block && block.scrollIntoView) {
+      block.scrollIntoView({ block: "start" });
+    }
     if (!root.querySelector(".diff-panel")) {
       root.innerHTML = '<div class="muted diff-hint">Loading patches…</div>';
     }
@@ -1339,6 +1356,13 @@
   }
 
   $("fetchBtn").addEventListener("click", doFetch);
+  const fqToggle = $("fileQueueToggle");
+  if (fqToggle) {
+    fqToggle.addEventListener("click", () => {
+      state.fileQueueOpen = !state.fileQueueOpen;
+      renderFileQueue();
+    });
+  }
   $("blessBtn").addEventListener("click", () => doDecide("approve"));
   $("hardwareBtn").addEventListener("click", () => doDecide("hardware"));
   $("upgradeBtn").addEventListener("click", () => doDecide("upgrade"));
