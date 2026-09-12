@@ -55,11 +55,9 @@ def test_static_exact_fingerprint_collapse(fixture_prs: list[PullRequest]) -> No
         changed_files=[ChangedFile(path=f.path, patch=f.patch) for f in a.changed_files],
         created_at="2026-09-01T00:00:00Z",
     )
-    # normalize_title strips punct and case — but fingerprint includes normalized title
-    # Same normalized title + same files => same fingerprint
-    twin.title = a.title  # exact same after we want exact collapse on files+title
+    # Title is not part of the fingerprint — same files+hunks collapse.
+    twin.title = "completely different title"
     apply_fingerprints([a, twin])
-    # Force identical normalized title via same raw title
     assert compute_fingerprint(a) == compute_fingerprint(twin)
 
     apply_fingerprints(fixture_prs)

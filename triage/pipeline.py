@@ -78,6 +78,13 @@ def files_overlap(pr_paths: list[str], rule_files: list[str]) -> bool:
     return bool(set(pr_paths) & set(rule_files))
 
 
+def _overlap_coefficient(a: list[str], b: list[str]) -> float:
+    sa, sb = set(a), set(b)
+    if not sa or not sb:
+        return 0.0
+    return len(sa & sb) / float(min(len(sa), len(sb)))
+
+
 def match_rule(
     pr: PullRequest,
     vector: list[float],
@@ -86,9 +93,13 @@ def match_rule(
 ) -> TrustedRule | None:
     """
     Match APPROVED rules: exact fingerprint OR
-    (cosine >= auto_threshold AND overlapping file-set).
-    Rejected rules are remembered so they do not auto-approve.
+    (cosine >= auto_threshold AND overlapping file-set) OR
+    (SimHash Hamming <= 3 AND files overlap / overlap coeff > 0).
+    Rejected fingerprints still block auto-approve.
+    Missing rule.simhash skips the SimHash clause (back-compat).
     """
+    from triage.simhash import SIMHASH_MAX_HAMMING, hamming
+
     approved = [r for r in rules if r.decision == "approve"]
     rejected = [r for r in rules if r.decision == "reject"]
 
@@ -107,6 +118,13 @@ def match_rule(
             overlap = file_set_signature(pr.paths) == r.file_set_signature
         if sim >= auto_threshold and overlap:
             return r
+        # SimHash near-dup + file overlap
+        rule_sh = getattr(r, "simhash", 0) or 0
+        pr_sh = getattr(pr, "simhash", 0) or 0
+        if rule_sh and pr_sh:
+            ov_coeff = _overlap_coefficient(pr.paths, r.shared_files)
+            if hamming(pr_sh, rule_sh) <= SIMHASH_MAX_HAMMING and (overlap or ov_coeff > 0):
+                return r
     return None
 
 

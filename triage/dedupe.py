@@ -39,12 +39,11 @@ def file_fingerprint_parts(files: Iterable[ChangedFile]) -> list[str]:
 
 def compute_fingerprint(pr: PullRequest) -> str:
     """
-    Stable fingerprint = hash of sorted changed paths + normalized hunk headers
-    + normalized title. Exact matches collapse into the same static group.
+    Stable fingerprint = hash of sorted changed paths + normalized hunk headers.
+    Title is excluded: agents write unique titles for the same shape.
     """
-    title_norm = normalize_title(pr.title)
     parts = file_fingerprint_parts(pr.changed_files)
-    payload = title_norm + "\n" + "\n".join(parts)
+    payload = "\n".join(parts)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
 
 
@@ -54,9 +53,18 @@ def file_set_signature(paths: Iterable[str]) -> str:
     return hashlib.sha256(joined.encode("utf-8")).hexdigest()[:24]
 
 
+def compute_simhash(pr: PullRequest) -> int:
+    """64-bit SimHash over the same shingles used for MinHash."""
+    from triage.minhash import shingles_for_pr
+    from triage.simhash import simhash
+
+    return simhash(shingles_for_pr(pr))
+
+
 def apply_fingerprints(prs: list[PullRequest]) -> list[PullRequest]:
     for pr in prs:
         pr.fingerprint = compute_fingerprint(pr)
+        pr.simhash = compute_simhash(pr)
     return prs
 
 
@@ -66,5 +74,7 @@ def static_groups(prs: list[PullRequest]) -> dict[str, list[PullRequest]]:
     for pr in prs:
         if not pr.fingerprint:
             pr.fingerprint = compute_fingerprint(pr)
+        if not pr.simhash:
+            pr.simhash = compute_simhash(pr)
         groups.setdefault(pr.fingerprint, []).append(pr)
     return groups

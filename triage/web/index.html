@@ -12,8 +12,7 @@
     <label class="field">
       <span>source</span>
       <select id="source">
-        <option value="fixtures">fixtures</option>
-        <option value="gh">gh</option>
+        <option value="gh" selected>gh</option>
       </select>
     </label>
     <label class="field grow">
@@ -40,7 +39,7 @@
     </aside>
 
     <section class="pane center">
-      <div id="detailEmpty" class="empty">Select a group</div>
+      <div id="detailEmpty" class="empty-state">Select a group</div>
       <div id="detail" class="detail hidden">
         <div class="detail-head">
           <div>
@@ -59,6 +58,12 @@
         <div class="block">
           <h3>Overlap</h3>
           <div id="overlapSummary" class="overlap-summary muted"></div>
+          <div class="overlap-legend">
+            <span class="item"><span class="sq shared"></span> all PRs</span>
+            <span class="item"><span class="sq partial"></span> some PRs</span>
+            <span class="item"><span class="sq unique"></span> one PR</span>
+            <span class="item"><span class="sq miss"></span> this PR skips it</span>
+          </div>
           <div id="overlapMatrixWrap" class="overlap-matrix-wrap">
             <table id="overlapMatrix" class="overlap-matrix"></table>
           </div>

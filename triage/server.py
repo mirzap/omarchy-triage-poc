@@ -10,13 +10,16 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
+from triage.gh import cached_pr_files
+from triage.github import parse_repo
 from triage.pipeline import ingest, run_pipeline
 from triage.store import (
     DEFAULT_STORE_PATH,
     decide_group,
     load_store,
+    overlap_for_group,
     ui_state,
 )
 
@@ -56,20 +59,8 @@ def _set_progress(**fields: Any) -> None:
 
 
 def ensure_initial_fixtures(store_path: Path = DEFAULT_STORE_PATH) -> None:
-    """On first load with empty store, auto-run fixtures so the UI is not blank."""
-    data = load_store(store_path)
-    if data.get("last_groups") or data.get("last_prs"):
-        return
-    print("[serve] empty store — loading fixtures ...")
-    prs = ingest(source="fixtures")
-    run_pipeline(
-        prs,
-        persist=True,
-        store_path=store_path,
-        apply_rules=True,
-        source="fixtures",
-        repo="omacom/omarchy",
-    )
+    """Do not seed fixtures. Real gh cache/store only."""
+    return
 
 
 def run_fetch(
@@ -257,6 +248,39 @@ class TriageHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/progress":
             self._send_json(200, get_fetch_progress())
+            return
+        if path == "/api/overlap":
+            qs = parse_qs(parsed.query)
+            group_id = (qs.get("group_id") or [""])[0]
+            if not group_id:
+                self._send_json(400, {"error": "group_id required"})
+                return
+            try:
+                self._send_json(200, overlap_for_group(group_id, path=self.store_path))
+            except KeyError as exc:
+                self._send_json(404, {"error": str(exc)})
+            return
+        if path == "/api/patches":
+            qs = parse_qs(parsed.query)
+            repo = (qs.get("repo") or [""])[0] or (load_store(self.store_path).get("repo") or "omacom/omarchy")
+            file_path = (qs.get("path") or [""])[0]
+            raw_prs = (qs.get("prs") or [""])[0]
+            numbers = [int(x) for x in raw_prs.split(",") if x.strip().isdigit()][:40]
+            try:
+                owner, name = parse_repo(repo)
+            except ValueError as exc:
+                self._send_json(400, {"error": str(exc)})
+                return
+            items = []
+            for n in numbers:
+                files = cached_pr_files(owner, name, n)
+                patch = ""
+                for f in files:
+                    if f.get("path") == file_path:
+                        patch = f.get("patch") or ""
+                        break
+                items.append({"number": n, "path": file_path, "patch": patch})
+            self._send_json(200, {"path": file_path, "items": items})
             return
         if path == "/" or path == "/index.html":
             self._serve_file(WEB_DIR / "index.html")

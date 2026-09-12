@@ -242,7 +242,7 @@ button, input, select { font: inherit; color: inherit; }
   text-overflow: ellipsis;
 }
 
-.empty {
+.empty-state {
   color: var(--muted);
   padding: 40px 0;
   text-align: center;
@@ -394,18 +394,33 @@ button, input, select { font: inherit; color: inherit; }
 }
 .sq {
   display: inline-block;
-  width: 12px;
-  height: 12px;
+  width: 10px;
+  height: 10px;
   border-radius: 2px;
   vertical-align: middle;
+  flex: none;
+  padding: 0;
 }
 .sq.shared { background: #f59e0b; }
 .sq.partial { background: #fb7185; }
 .sq.unique { background: #71717a; }
-.sq.empty {
+.sq.miss {
   background: transparent;
   border: 1px solid #3f3f46;
 }
+.overlap-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  margin: 0 0 8px;
+  font-size: 11px;
+  color: var(--muted);
+}
+.overlap-legend .item { display: inline-flex; align-items: center; gap: 5px; }
+.overlap-matrix-wrap { max-height: 420px; overflow: auto; }
+.overlap-matrix th,
+.overlap-matrix td { height: 22px; padding: 2px 6px; }
 .same-label {
   margin-left: 6px;
   font-size: 10px;

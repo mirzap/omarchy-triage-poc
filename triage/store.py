@@ -138,24 +138,117 @@ def decide_group(
         file_set_signature=match.file_set_signature,
         shared_files=list(match.shared_files),
         created_from_prs=list(match.pr_numbers),
+        simhash=int(getattr(match, "simhash", 0) or 0),
     )
     upsert_rule(rule, path)
     return rule
 
 
-def ui_state(path: Path = DEFAULT_STORE_PATH) -> dict[str, Any]:
-    """State payload for the local dashboard API."""
-    data = load_store(path)
-    overlap = data.get("last_overlap") or {}
-    if not overlap and data.get("last_groups") and data.get("last_prs"):
-        from triage.overlap import overlap_from_store_payload
+MAX_STATE_TITLES = 4
 
-        overlap = overlap_from_store_payload(data["last_groups"], data["last_prs"])
+
+def _slim_group_for_ui(g: dict[str, Any]) -> dict[str, Any]:
+    out = dict(g)
+    out["centroid"] = []
+    titles = out.get("title_variants") or []
+    if len(titles) > MAX_STATE_TITLES:
+        out["title_variants"] = titles[:MAX_STATE_TITLES]
+    return out
+
+
+def _overlap_summary(ov: dict[str, Any]) -> dict[str, Any]:
+    shared = ov.get("shared") or []
+    unique = ov.get("unique") or []
+    matrix = ov.get("matrix") or []
     return {
-        "groups": data.get("last_groups", []),
-        "prs": data.get("last_prs", []),
-        "edges": data.get("last_edges", []),
-        "group_edges": data.get("last_group_edges", []),
+        "jaccard": ov.get("jaccard"),
+        "shared": shared[:8],
+        "partial": [],
+        "unique": [],
+        "matrix": [],
+        "shared_n": len(shared),
+        "unique_n": len(unique),
+        "matrix_n": len(matrix),
+        "lazy": True,
+    }
+
+
+def overlap_for_group(
+    group_id: str,
+    path: Path = DEFAULT_STORE_PATH,
+    max_prs: int = 24,
+    max_rows: int = 80,
+) -> dict[str, Any]:
+    """Capped overlap payload for one group. Avoids million-cell matrices."""
+    data = load_store(path)
+    groups = data.get("last_groups") or []
+    g = next((x for x in groups if x.get("group_id") == group_id), None)
+    if g is None:
+        raise KeyError(f"group not found: {group_id}")
+    ov = (data.get("last_overlap") or {}).get(group_id) or {}
+    pr_numbers = list(g.get("pr_numbers") or [])
+    shown = pr_numbers[:max_prs]
+    shown_set = {str(n) for n in shown}
+    matrix_in = ov.get("matrix") or []
+    matrix = []
+    for row in matrix_in[:max_rows]:
+        prs = row.get("prs") or {}
+        matrix.append(
+            {
+                "path": row.get("path", ""),
+                "kind": row.get("kind", ""),
+                "same_patch": bool(row.get("same_patch")),
+                "prs": {k: v for k, v in prs.items() if k in shown_set},
+            }
+        )
+    return {
+        "group_id": group_id,
+        "jaccard": ov.get("jaccard"),
+        "shared": (ov.get("shared") or [])[:40],
+        "partial": (ov.get("partial") or [])[:40],
+        "unique": (ov.get("unique") or [])[:40],
+        "matrix": matrix,
+        "shared_n": len(ov.get("shared") or []),
+        "unique_n": len(ov.get("unique") or []),
+        "matrix_n": len(matrix_in),
+        "pr_numbers": shown,
+        "pr_truncated": max(0, len(pr_numbers) - len(shown)),
+        "row_truncated": max(0, len(matrix_in) - len(matrix)),
+        "lazy": False,
+    }
+
+
+
+def _slim_pr_for_ui(pr: dict[str, Any]) -> dict[str, Any]:
+    paths = pr.get("paths") or []
+    if not paths:
+        files = pr.get("files") or []
+        if files and isinstance(files[0], dict):
+            paths = [f.get("path", "") for f in files if f.get("path")]
+        elif files and isinstance(files[0], str):
+            paths = list(files)
+    return {
+        "number": pr.get("number"),
+        "title": pr.get("title") or "",
+        "user": pr.get("user") or "",
+        "label": pr.get("label") or "needs-human",
+        "group_id": pr.get("group_id") or "",
+        "html_url": pr.get("html_url") or "",
+        "paths": paths[:40],
+        "created_at": pr.get("created_at") or "",
+    }
+
+
+def ui_state(path: Path = DEFAULT_STORE_PATH) -> dict[str, Any]:
+    """Slim dashboard payload. Full overlap matrices are lazy via overlap_for_group."""
+    data = load_store(path)
+    raw_ov = data.get("last_overlap") or {}
+    overlap = {gid: _overlap_summary(ov) for gid, ov in raw_ov.items()}
+    return {
+        "groups": [_slim_group_for_ui(g) for g in data.get("last_groups", [])],
+        "prs": [_slim_pr_for_ui(pr) for pr in data.get("last_prs", [])],
+        "edges": [],
+        "group_edges": [],
         "rules": data.get("trusted_rules", []),
         "overlap": overlap,
         "source": data.get("source", ""),

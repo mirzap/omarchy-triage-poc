@@ -59,7 +59,7 @@
     state.overlap = data.overlap || {};
     state.source = data.source || "";
     state.repo = data.repo || "";
-    if (data.source) $("source").value = data.source === "github" ? "gh" : data.source;
+    if (data.source) $("source").value = "gh";
     if (data.repo) $("repo").value = data.repo;
     if (
       state.selectedGroupId &&
@@ -70,7 +70,13 @@
       state.selectedFile = null;
     }
     if (!state.selectedGroupId && state.groups.length) {
-      state.selectedGroupId = sortedGroups()[0].group_id;
+      const gs = sortedGroups();
+      const pick =
+        gs.find((g) => {
+          const n = (g.pr_numbers || []).length;
+          return n >= 2 && n <= 24;
+        }) || gs.find((g) => (g.pr_numbers || []).length <= 24);
+      state.selectedGroupId = pick ? pick.group_id : null;
       state.selectedFile = null;
     }
     render();
@@ -480,22 +486,45 @@
     return entry ? entry.patch || "" : "";
   }
 
-  function renderOverlap(g) {
-    const ov = (state.overlap && state.overlap[g.group_id]) || null;
+  async function renderOverlap(g) {
     const summary = $("overlapSummary");
     const table = $("overlapMatrix");
     table.innerHTML = "";
+    let ov = (state.overlap && state.overlap[g.group_id]) || null;
+    const n = (g.pr_numbers || []).length;
+    if (ov && ov.lazy) {
+      summary.textContent =
+        "jaccard " +
+        (typeof ov.jaccard === "number" ? ov.jaccard.toFixed(2) : "?") +
+        " · " +
+        (ov.shared_n || 0) +
+        " shared · " +
+        (ov.unique_n || 0) +
+        " unique" +
+        (n > 24 ? " · " + n + " PRs (matrix capped)" : "");
+      try {
+        ov = await api("/api/overlap?group_id=" + encodeURIComponent(g.group_id));
+        state.overlap[g.group_id] = ov;
+      } catch (err) {
+        summary.textContent = "overlap error: " + err.message;
+        return;
+      }
+      if (state.selectedGroupId !== g.group_id) return;
+    }
     if (!ov) {
       summary.textContent = "no overlap data";
       return;
     }
-    const sharedN = (ov.shared || []).length;
-    const uniqueN = (ov.unique || []).length;
-    const j = typeof ov.jaccard === "number" ? ov.jaccard.toFixed(2) : "?";
+    const sharedN = ov.shared_n != null ? ov.shared_n : (ov.shared || []).length;
+    const uniqueN = ov.unique_n != null ? ov.unique_n : (ov.unique || []).length;
+    const jacc = typeof ov.jaccard === "number" ? ov.jaccard.toFixed(2) : "?";
+    let extra = "";
+    if (ov.pr_truncated) extra += " · +" + ov.pr_truncated + " PRs hidden";
+    if (ov.row_truncated) extra += " · +" + ov.row_truncated + " files hidden";
     summary.textContent =
-      "jaccard " + j + " · " + sharedN + " shared · " + uniqueN + " unique";
+      "jaccard " + jacc + " · " + sharedN + " shared · " + uniqueN + " unique" + extra;
 
-    const members = g.pr_numbers || [];
+    const members = ov.pr_numbers || (g.pr_numbers || []).slice(0, 24);
     const thead = document.createElement("thead");
     const hr = document.createElement("tr");
     const thPath = document.createElement("th");
@@ -525,27 +554,20 @@
         td.className = "cell";
         const hit = !!(row.prs && row.prs[String(num)]);
         const sq = document.createElement("span");
-        sq.className = "sq " + (hit ? row.kind || "unique" : "empty");
+        sq.className = "sq " + (hit ? row.kind || "unique" : "miss");
         td.appendChild(sq);
         tr.appendChild(td);
       });
       tr.addEventListener("click", () => {
         state.selectedFile = row.path;
-        renderDetail();
+        renderOverlap(g);
+        renderDiffs(g);
       });
       tbody.appendChild(tr);
     });
-    if (!(ov.matrix || []).length) {
-      const tr = document.createElement("tr");
-      const td = document.createElement("td");
-      td.colSpan = members.length + 1;
-      td.className = "muted";
-      td.textContent = "(no files)";
-      tr.appendChild(td);
-      tbody.appendChild(tr);
-    }
     table.appendChild(tbody);
   }
+
 
   function colorizeDiff(patch) {
     const lines = String(patch || "").split("\n");
@@ -566,7 +588,9 @@
       .join("\n");
   }
 
-  function renderDiffs(g) {
+  let diffGen = 0;
+
+  async function renderDiffs(g) {
     const root = $("diffPanels");
     root.innerHTML = "";
     const path = state.selectedFile;
@@ -574,25 +598,62 @@
       root.innerHTML = '<div class="muted diff-hint">Click a file to see patches.</div>';
       return;
     }
-    const members = (g.pr_numbers || [])
-      .map((n) => prByNumber(n))
-      .filter(Boolean)
-      .filter((pr) => prFileEntries(pr).some((f) => f.path === path));
-    if (!members.length) {
+    const nums = (g.pr_numbers || []).slice();
+    if (!nums.length) {
       root.innerHTML =
         '<div class="muted diff-hint">No patches for ' +
         escapeHtml(path) +
         ".</div>";
       return;
     }
-    const firstPatch = patchFor(members[0], path);
-    members.forEach((pr) => {
-      const patch = patchFor(pr, path);
+    const gen = ++diffGen;
+    root.innerHTML = '<div class="muted diff-hint">Loading patches…</div>';
+    const repo = state.repo || "omacom/omarchy";
+    let data;
+    try {
+      data = await api(
+        "/api/patches?repo=" +
+          encodeURIComponent(repo) +
+          "&prs=" +
+          nums.join(",") +
+          "&path=" +
+          encodeURIComponent(path)
+      );
+    } catch (err) {
+      if (gen !== diffGen) return;
+      root.innerHTML =
+        '<div class="muted diff-hint">Could not load patches: ' +
+        escapeHtml(err.message) +
+        "</div>";
+      return;
+    }
+    if (gen !== diffGen) return;
+    const items = data.items || [];
+    items.forEach((it) => {
+      const pr = prByNumber(it.number);
+      if (!pr) return;
+      const files = prFileEntries(pr);
+      const idx = files.findIndex((f) => f.path === path);
+      if (idx >= 0) files[idx].patch = it.patch || "";
+      else files.push({ path: path, patch: it.patch || "" });
+      pr.files = files;
+    });
+    root.innerHTML = "";
+    const withPatch = items.filter((it) => (it.patch || "").length);
+    if (!items.length) {
+      root.innerHTML =
+        '<div class="muted diff-hint">No patches for ' +
+        escapeHtml(path) +
+        ".</div>";
+      return;
+    }
+    const firstPatch = (items[0] && items[0].patch) || "";
+    items.forEach((it) => {
+      const pr = prByNumber(it.number) || { number: it.number, user: "" };
+      const patch = it.patch || "";
       const same = patch === firstPatch;
       const panel = document.createElement("div");
       panel.className = "diff-panel";
-      const tagClass = same ? "same" : "diff";
-      const tagText = same ? "same hunk" : "different";
       panel.innerHTML =
         '<div class="diff-panel-head">' +
         '<span><span class="mono">#' +
@@ -601,15 +662,21 @@
         escapeHtml(pr.user || "") +
         "</span>" +
         '<span class="diff-tag ' +
-        tagClass +
+        (same ? "same" : "diff") +
         '">' +
-        tagText +
+        (patch ? (same ? "same hunk" : "different") : "no patch") +
         "</span></div>" +
         '<pre class="diff">' +
         colorizeDiff(patch || "(empty patch)") +
         "</pre>";
       root.appendChild(panel);
     });
+    if (!withPatch.length) {
+      const hint = document.createElement("div");
+      hint.className = "muted diff-hint";
+      hint.textContent = "Cached files have no patch for this path (binary or too large for GitHub).";
+      root.prepend(hint);
+    }
   }
 
   function escapeHtml(s) {
@@ -911,7 +978,7 @@
   }
 
   async function doFetch() {
-    const source = $("source").value;
+    const source = "gh";
     const repo = $("repo").value.trim() || "omacom/omarchy";
     const limit = Number($("limit").value);
     const limitVal = Number.isFinite(limit) ? limit : 0;

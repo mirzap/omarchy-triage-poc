@@ -384,3 +384,26 @@ def gh_available() -> bool:
         return True
     except GhError:
         return False
+
+
+def cached_pr_files(
+    owner: str,
+    repo: str,
+    number: int,
+    cache_dir: Path | None = None,
+) -> list[dict[str, str]]:
+    """Read cached pull files (path + patch). Empty list on cache miss. No network."""
+    raw = _load_json(_cache_root(owner, repo, cache_dir) / "files" / f"{number}.json")
+    if not isinstance(raw, list):
+        return []
+    out: list[dict[str, str]] = []
+    for f in raw:
+        if not isinstance(f, dict):
+            continue
+        out.append(
+            {
+                "path": f.get("filename") or f.get("path") or "",
+                "patch": f.get("patch") or "",
+            }
+        )
+    return out

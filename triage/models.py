@@ -30,6 +30,7 @@ class PullRequest:
     fingerprint: str = ""
     label: str = "needs-human"
     html_url: str = ""
+    simhash: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -42,11 +43,20 @@ class PullRequest:
             "fingerprint": self.fingerprint,
             "label": self.label,
             "html_url": self.html_url,
+            "simhash": self.simhash,
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> PullRequest:
         files = [ChangedFile.from_dict(f) for f in data.get("changed_files", [])]
+        raw_sh = data.get("simhash", 0)
+        if isinstance(raw_sh, str):
+            try:
+                simhash_val = int(raw_sh, 16) if not raw_sh.isdigit() else int(raw_sh)
+            except ValueError:
+                simhash_val = 0
+        else:
+            simhash_val = int(raw_sh or 0)
         return cls(
             number=int(data["number"]),
             title=data.get("title", ""),
@@ -57,6 +67,7 @@ class PullRequest:
             fingerprint=data.get("fingerprint", ""),
             label=data.get("label", "needs-human"),
             html_url=data.get("html_url", "") or "",
+            simhash=simhash_val,
         )
 
     @property
@@ -82,13 +93,24 @@ class Group:
     centroid: list[float] = field(default_factory=list)
     file_set_signature: str = ""
     summary: str = ""
+    simhash: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Group:
-        return cls(**{k: data[k] for k in cls.__dataclass_fields__ if k in data})
+        kwargs = {k: data[k] for k in cls.__dataclass_fields__ if k in data}
+        if "simhash" in kwargs and isinstance(kwargs["simhash"], str):
+            try:
+                kwargs["simhash"] = (
+                    int(kwargs["simhash"], 16)
+                    if not str(kwargs["simhash"]).isdigit()
+                    else int(kwargs["simhash"])
+                )
+            except ValueError:
+                kwargs["simhash"] = 0
+        return cls(**kwargs)
 
 
 @dataclass
@@ -101,10 +123,23 @@ class TrustedRule:
     file_set_signature: str
     shared_files: list[str]
     created_from_prs: list[int]
+    simhash: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> TrustedRule:
-        return cls(**{k: data[k] for k in cls.__dataclass_fields__ if k in data})
+        kwargs = {k: data[k] for k in cls.__dataclass_fields__ if k in data}
+        if "simhash" in kwargs and isinstance(kwargs["simhash"], str):
+            try:
+                kwargs["simhash"] = (
+                    int(kwargs["simhash"], 16)
+                    if not str(kwargs["simhash"]).isdigit()
+                    else int(kwargs["simhash"])
+                )
+            except ValueError:
+                kwargs["simhash"] = 0
+        # Back-compat: missing simhash → 0 (clause skipped)
+        kwargs.setdefault("simhash", 0)
+        return cls(**kwargs)
