@@ -27,6 +27,8 @@
     queue: {},
     new_pr_numbers: [],
     fileQueue: null,
+    related: null,
+    relatedKey: "",
     fetching: false,
   };
 
@@ -433,6 +435,93 @@
     });
   }
 
+
+  let relatedGen = 0;
+
+  async function loadRelated(pr, path) {
+    if (!pr) {
+      state.related = null;
+      state.relatedKey = "";
+      renderRelated();
+      return;
+    }
+    const key = pr + "|" + (path || "");
+    if (state.relatedKey === key && state.related && !state.related.loading) {
+      renderRelated();
+      return;
+    }
+    const gen = ++relatedGen;
+    state.relatedKey = key;
+    state.related = { loading: true };
+    renderRelated();
+    try {
+      let url = "/api/related?pr=" + encodeURIComponent(pr);
+      if (path) url += "&path=" + encodeURIComponent(path);
+      const data = await api(url);
+      if (gen !== relatedGen) return;
+      state.related = data;
+      renderRelated();
+    } catch (err) {
+      if (gen !== relatedGen) return;
+      state.related = { enabled: false, reason: err.message, related: [] };
+      renderRelated();
+    }
+  }
+
+  function renderRelated() {
+    const root = $("relatedList");
+    if (!root) return;
+    const data = state.related;
+    if (!data) {
+      root.className = "related-list muted";
+      root.textContent = "Pick a PR.";
+      return;
+    }
+    if (data.loading) {
+      root.className = "related-list muted";
+      root.textContent = "Ranking patches…";
+      return;
+    }
+    if (!data.enabled) {
+      root.className = "related-list muted";
+      root.textContent = data.reason || "OpenRouter key not set.";
+      return;
+    }
+    const items = data.related || [];
+    if (!items.length) {
+      root.className = "related-list muted";
+      root.textContent = data.reason || "No near-patch neighbors.";
+      return;
+    }
+    root.className = "related-list";
+    root.innerHTML = "";
+    items.forEach((it) => {
+      const row = document.createElement("div");
+      row.className = "related-row";
+      row.innerHTML =
+        '<a class="mono" href="' +
+        escapeHtml(it.html_url || "#") +
+        '" target="_blank" rel="noopener">#' +
+        it.number +
+        '</a><span title="' +
+        escapeHtml(it.title || "") +
+        '">' +
+        escapeHtml(it.title || "") +
+        '</span><span class="muted">' +
+        escapeHtml(it.group_id || "") +
+        '</span><span class="score">' +
+        Number(it.score || 0).toFixed(2) +
+        "</span>";
+      row.addEventListener("click", (ev) => {
+        if (ev.target.tagName === "A") return;
+        if (it.group_id) state.selectedGroupId = it.group_id;
+        state.selectedPr = it.number;
+        render();
+      });
+      root.appendChild(row);
+    });
+  }
+
   async function openFileQueue(path) {
     state.selectedFile = path;
     state.fileQueue = { path: path, prs: [], loading: true };
@@ -540,6 +629,8 @@
 
     renderOverlap(g);
     renderDiffs(g);
+    const qPr = state.selectedPr || (g.pr_numbers || [])[0];
+    loadRelated(qPr, state.selectedFile || null);
 
     const titles = $("detailTitles");
     titles.innerHTML = "";

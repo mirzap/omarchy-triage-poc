@@ -505,3 +505,7 @@ pre.diff .hunk { color: #71717a; }
 .pill.cosmetic { color: #c4b5fd; border-color: #5b21b6; }
 .pill.junk { color: #a1a1aa; border-color: #3f3f46; }
 .pill.needs-look { color: #60a5fa; border-color: #1e3a8a; }
+
+.related-list { display: flex; flex-direction: column; gap: 6px; }
+.related-row { display: grid; grid-template-columns: 64px 1fr auto auto; gap: 8px; align-items: center; font-size: 13px; }
+.related-row .score { font-variant-numeric: tabular-nums; color: #a1a1aa; }

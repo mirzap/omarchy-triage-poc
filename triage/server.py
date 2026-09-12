@@ -15,6 +15,7 @@ from urllib.parse import parse_qs, urlparse
 from triage.gh import cached_pr_files
 from triage.github import parse_repo
 from triage.pipeline import ingest, run_pipeline
+from triage.embed import related
 from triage.store import (
     DEFAULT_STORE_PATH,
     decide_group,
@@ -268,6 +269,18 @@ class TriageHandler(BaseHTTPRequestHandler):
                 self._send_json(400, {"error": "path required"})
                 return
             self._send_json(200, prs_for_path(file_path, path=self.store_path))
+            return
+        if path == "/api/related":
+            qs = parse_qs(parsed.query)
+            raw_pr = (qs.get("pr") or [""])[0]
+            if not raw_pr.isdigit():
+                self._send_json(400, {"error": "pr required"})
+                return
+            file_path = (qs.get("path") or [""])[0] or None
+            self._send_json(
+                200,
+                related(int(raw_pr), file_path=file_path, store_path=self.store_path),
+            )
             return
         if path == "/api/patches":
             qs = parse_qs(parsed.query)
