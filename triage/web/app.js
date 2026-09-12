@@ -493,6 +493,11 @@
     return !!(state.filterQuery || "").trim() || !!state.filterLabel;
   }
 
+  function pileHas(pile, groupId) {
+    const ids = (state.queue && state.queue[pile]) || [];
+    return ids.indexOf(groupId) >= 0;
+  }
+
   function groupMatches(g) {
     if (!g) return false;
     const rule = ruleFor(g.group_id);
@@ -500,7 +505,15 @@
     if (label === "unreviewed") {
       if (rule) return false;
     } else if (label === "blessed") {
-      if (!rule || rule.decision !== "approve") return false;
+      // Known pile: Bless shape + auto-approved. Not just a stored approve rule.
+      const approved = rule && rule.decision === "approve";
+      if (!approved && !pileHas("known", g.group_id)) return false;
+    } else if (label === "junk") {
+      // Junk pile: Reject + singleton noise. Keyword class is extra, not the pile.
+      const rejected = rule && rule.decision === "reject";
+      if (!rejected && !pileHas("junk", g.group_id) && (g.card_class || "") !== "junk") {
+        return false;
+      }
     } else if (label === "rejected") {
       if (!rule || rule.decision !== "reject") return false;
     } else if (label === "hardware") {
@@ -737,6 +750,9 @@
         el.dataset.index = String(vi.index);
         el.appendChild(buildQueueItem(row));
         inner.appendChild(el);
+      } else if (row.kind === "head") {
+        const h = el.firstChild;
+        if (h) h.textContent = row.label + " · " + row.count;
       } else if (row.kind === "group") {
         const card = el.firstChild;
         if (card) {
@@ -1073,8 +1089,8 @@
     "update-path": "upgrade / migrate",
     docs: "docs only",
     cosmetic: "theme / CSS",
-    junk: "noise",
-    blessed: "you trusted this",
+    junk: "Junk pile — rejected or noise",
+    blessed: "Known pile — blessed or auto-approved",
     rejected: "you rejected this",
     approve: "you trusted this",
     reject: "you rejected this",
