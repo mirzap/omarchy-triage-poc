@@ -117,7 +117,7 @@ class Group:
 class TrustedRule:
     rule_id: str
     group_id: str
-    decision: str  # approve | reject
+    decision: str  # approve | reject | hardware | upgrade
     fingerprints: list[str]
     centroid: list[float]
     file_set_signature: str

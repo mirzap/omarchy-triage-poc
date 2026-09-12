@@ -219,10 +219,14 @@ def related(
     try:
         vecs = ensure_vectors(jobs, key)
     except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")[:240]
+        if exc.code == 402:
+            reason = "OpenRouter needs credits — https://openrouter.ai/settings/credits"
+        else:
+            detail = exc.read().decode("utf-8", errors="replace")[:180]
+            reason = f"openrouter {exc.code}: {detail}"
         return {
             "enabled": True,
-            "reason": f"openrouter {exc.code}: {detail}",
+            "reason": reason,
             "query": pr_number,
             "related": [],
         }

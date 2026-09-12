@@ -350,8 +350,15 @@ class TriageHandler(BaseHTTPRequestHandler):
                     decision = "approve"
                 elif decision in ("reject",):
                     decision = "reject"
+                elif decision in ("hardware", "needs-hardware"):
+                    decision = "hardware"
+                elif decision in ("upgrade", "can-break-upgrade"):
+                    decision = "upgrade"
                 else:
-                    self._send_json(400, {"error": "decision must be approve|reject"})
+                    self._send_json(
+                        400,
+                        {"error": "decision must be approve|reject|hardware|upgrade"},
+                    )
                     return
                 decide_group(group_id, decision, path=self.store_path)
                 self._send_json(200, ui_state(self.store_path))

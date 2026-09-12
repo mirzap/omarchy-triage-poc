@@ -41,6 +41,8 @@ def build_queue(
     needs: list[str] = []
     known: list[str] = []
     junk: list[str] = []
+    hardware: list[str] = []
+    upgrade: list[str] = []
 
     for g in groups:
         members = [by_num[n] for n in g.pr_numbers if n in by_num]
@@ -50,6 +52,12 @@ def build_queue(
             continue
         if rule and rule.decision == "reject":
             junk.append(g.group_id)
+            continue
+        if rule and rule.decision == "hardware":
+            hardware.append(g.group_id)
+            continue
+        if rule and rule.decision == "upgrade":
+            upgrade.append(g.group_id)
             continue
         if members and all(m.label == "auto:approved-shape" for m in members):
             known.append(g.group_id)
@@ -80,12 +88,16 @@ def build_queue(
         "needs_you": needs,
         "known": known,
         "junk": junk,
+        "hardware": hardware,
+        "upgrade": upgrade,
         "hotspots": hotspots[:40],
         "new_pr_numbers": sorted(new_set, reverse=True),
         "counts": {
             "needs_you": len(needs),
             "known": len(known),
             "junk": len(junk),
+            "hardware": len(hardware),
+            "upgrade": len(upgrade),
             "hotspots": len(hotspots),
             "new": len(new_set),
         },

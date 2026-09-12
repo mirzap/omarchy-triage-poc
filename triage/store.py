@@ -134,8 +134,10 @@ def decide_group(
     decision: str,
     path: Path = DEFAULT_STORE_PATH,
 ) -> TrustedRule:
-    if decision not in ("approve", "reject"):
-        raise ValueError(f"decision must be approve|reject, got {decision!r}")
+    if decision not in ("approve", "reject", "hardware", "upgrade"):
+        raise ValueError(
+            f"decision must be approve|reject|hardware|upgrade, got {decision!r}"
+        )
     groups = load_groups(path)
     match = next((g for g in groups if g.group_id == group_id), None)
     if match is None:
@@ -157,7 +159,7 @@ def decide_group(
 
 
 def _refresh_queue(path: Path = DEFAULT_STORE_PATH) -> None:
-    """Rebuild last_queue after a bless/reject so the Queue tab moves."""
+    """Rebuild last_queue after a local decision so the Queue tab moves."""
     from triage.overlap import slim_to_pr
     from triage.queue import build_queue
 
@@ -174,11 +176,15 @@ def _refresh_queue(path: Path = DEFAULT_STORE_PATH) -> None:
 MAX_STATE_TITLES = 4
 
 
-def _slim_group_for_ui(g: dict[str, Any]) -> dict[str, Any]:
+def _slim_group_for_ui(
+    g: dict[str, Any],
+    member_paths: list[str] | None = None,
+) -> dict[str, Any]:
     out = dict(g)
     out["centroid"] = []
     titles = out.get("title_variants") or []
-    card = classify_group(titles, out.get("shared_files") or [])
+    paths = list(member_paths or out.get("shared_files") or [])
+    card = classify_group(titles, paths)
     out["card_class"] = card["card_class"]
     out["card_note"] = card["card_note"]
     if len(titles) > MAX_STATE_TITLES:
@@ -298,8 +304,20 @@ def ui_state(path: Path = DEFAULT_STORE_PATH) -> dict[str, Any]:
     data = load_store(path)
     raw_ov = data.get("last_overlap") or {}
     overlap = {gid: _overlap_summary(ov) for gid, ov in raw_ov.items()}
+    paths_by_gid: dict[str, list[str]] = {}
+    for pr in data.get("last_prs") or []:
+        gid = pr.get("group_id") or ""
+        if not gid:
+            continue
+        bucket = paths_by_gid.setdefault(gid, [])
+        for path in pr.get("paths") or []:
+            if path and path not in bucket:
+                bucket.append(path)
     return {
-        "groups": [_slim_group_for_ui(g) for g in data.get("last_groups", [])],
+        "groups": [
+            _slim_group_for_ui(g, paths_by_gid.get(g.get("group_id") or ""))
+            for g in data.get("last_groups", [])
+        ],
         "prs": [_slim_pr_for_ui(pr) for pr in data.get("last_prs", [])],
         "edges": [],
         "group_edges": [],

@@ -136,7 +136,8 @@
     } else if (state.leftTab === "queue") {
       hdr.textContent =
         (c.needs_you || 0) + " need you · " +
-        (c.known || 0) + " known · " +
+        (c.hardware || 0) + " hw · " +
+        (c.upgrade || 0) + " upgrade · " +
         (c.hotspots || 0) + " hotspots";
     } else {
       hdr.textContent = state.groups.length + " groups · " + state.prs.length + " PRs";
@@ -388,6 +389,8 @@
     root.innerHTML = "";
     const piles = [
       ["Needs you", q.needs_you || []],
+      ["Needs hardware", q.hardware || []],
+      ["Can break upgrade", q.upgrade || []],
       ["Known shape", q.known || []],
       ["Junk", q.junk || []],
     ];
@@ -482,15 +485,22 @@
       root.textContent = "Ranking patches…";
       return;
     }
-    if (!data.enabled) {
+    if (!data.enabled || !(data.related || []).length) {
       root.className = "related-list muted";
-      root.textContent = data.reason || "OpenRouter key not set.";
-      return;
-    }
-    const items = data.related || [];
-    if (!items.length) {
-      root.className = "related-list muted";
-      root.textContent = data.reason || "No near-patch neighbors.";
+      const reason = data.reason || (data.enabled ? "No near-patch neighbors." : "OpenRouter key not set.");
+      root.textContent = "";
+      if (reason.indexOf("https://") >= 0) {
+        const [before, url] = [reason.split("https://")[0], "https://" + reason.split("https://", 1)[1]];
+        root.appendChild(document.createTextNode(before));
+        const a = document.createElement("a");
+        a.href = url.split(" ")[0];
+        a.target = "_blank";
+        a.rel = "noopener";
+        a.textContent = a.href;
+        root.appendChild(a);
+      } else {
+        root.textContent = reason;
+      }
       return;
     }
     root.className = "related-list";
@@ -1290,6 +1300,8 @@
 
   $("fetchBtn").addEventListener("click", doFetch);
   $("blessBtn").addEventListener("click", () => doDecide("approve"));
+  $("hardwareBtn").addEventListener("click", () => doDecide("hardware"));
+  $("upgradeBtn").addEventListener("click", () => doDecide("upgrade"));
   $("rejectBtn").addEventListener("click", () => doDecide("reject"));
   $("groupGraphToggle").addEventListener("change", (e) => {
     state.showGroupGraph = !!e.target.checked;

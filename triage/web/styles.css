@@ -509,3 +509,7 @@ pre.diff .hunk { color: #71717a; }
 .related-list { display: flex; flex-direction: column; gap: 6px; }
 .related-row { display: grid; grid-template-columns: 64px 1fr auto auto; gap: 8px; align-items: center; font-size: 13px; }
 .related-row .score { font-variant-numeric: tabular-nums; color: #a1a1aa; }
+
+.btn.warn { color: #fbbf24; border-color: #92400e; }
+.pill.hardware { color: #fbbf24; border-color: #92400e; }
+.pill.upgrade { color: #f87171; border-color: #7f1d1d; }
