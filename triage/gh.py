@@ -10,7 +10,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 from triage.models import ChangedFile, PullRequest
 
@@ -655,7 +655,7 @@ def gh_available() -> bool:
         return False
 
 
-_PathSignature = tuple[int, int, int, int] | None
+_PathSignature = Optional[tuple[int, int, int, int]]
 _pulls_index: dict[
     tuple[str, str, str],
     tuple[
