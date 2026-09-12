@@ -523,6 +523,16 @@
     $("detailMeta").textContent = rule
       ? `rule: ${rule.decision} (${rule.rule_id})`
       : "no rule yet";
+    const cls = g.card_class || "needs-look";
+    const ac = $("agentClass");
+    ac.textContent = cls;
+    ac.className = "pill " + cls;
+    $("agentNote").textContent = g.card_note || (g.title_variants || [])[0] || "";
+    const n = (g.pr_numbers || []).length;
+    $("agentHint").textContent = n >= 2
+      ? n + " PRs, same file-set. Bless once if the shape is safe."
+      : "Singleton. Read it or wait for a twin.";
+
     const decision = g.suggested_decision || "unique";
     const pill = $("detailDecision");
     pill.textContent = decision;

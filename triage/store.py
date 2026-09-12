@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from triage.classify import classify_group
 from triage.models import Group, TrustedRule
 
 DEFAULT_STORE_DIR = Path(".triage")
@@ -177,6 +178,9 @@ def _slim_group_for_ui(g: dict[str, Any]) -> dict[str, Any]:
     out = dict(g)
     out["centroid"] = []
     titles = out.get("title_variants") or []
+    card = classify_group(titles, out.get("shared_files") or [])
+    out["card_class"] = card["card_class"]
+    out["card_note"] = card["card_note"]
     if len(titles) > MAX_STATE_TITLES:
         out["title_variants"] = titles[:MAX_STATE_TITLES]
     return out

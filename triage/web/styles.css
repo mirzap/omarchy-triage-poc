@@ -497,3 +497,11 @@ pre.diff .hunk { color: #71717a; }
 .hotspot-row:hover { border-color: #52525b; }
 .hotspot-row .mono { font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .left-tabs .tab { font-size: 12px; padding: 8px 6px; }
+
+.agent-card { display: flex; flex-direction: column; gap: 6px; }
+.pill.hardware { color: #fbbf24; border-color: #92400e; }
+.pill.update-path { color: #f87171; border-color: #7f1d1d; }
+.pill.docs { color: #93c5fd; border-color: #1e3a8a; }
+.pill.cosmetic { color: #c4b5fd; border-color: #5b21b6; }
+.pill.junk { color: #a1a1aa; border-color: #3f3f46; }
+.pill.needs-look { color: #60a5fa; border-color: #1e3a8a; }
