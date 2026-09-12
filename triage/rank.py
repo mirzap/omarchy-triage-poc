@@ -19,13 +19,16 @@ from triage.store import DEFAULT_STORE_PATH, load_store
 PROVIDERS = {
     "together": {
         "url": "https://api.together.xyz/v1/embeddings",
-        "model": "togethercomputer/m2-bert-80M-8k-retrieval",
-        "dim": 768,
+        "model": "intfloat/multilingual-e5-large-instruct",
+        "dim": 1024,
         "env": "TOGETHER_API_KEY",
         "keyfile": "together.key",
-        "max_chars": 2000,
+        "max_chars": 600,
         "payload_extra": {},
-        "headers_extra": {},
+        "headers_extra": {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+            "Accept": "application/json",
+        },
     },
     "openrouter": {
         "url": "https://openrouter.ai/api/v1/embeddings",
@@ -145,7 +148,13 @@ def save_cache(data: dict[str, Any], path: Path | None = None) -> None:
 
 def _post_embed(texts: list[str], key: str) -> list[list[float]]:
     cfg = provider()
-    body = {"model": cfg["model"], "input": texts}
+    texts_out = list(texts)
+    if "e5" in str(cfg.get("model") or "").lower():
+        texts_out = [
+            t if t.lower().startswith(("query:", "passage:", "instruct:")) else ("passage: " + t)
+            for t in texts
+        ]
+    body = {"model": cfg["model"], "input": texts_out}
     body.update(cfg.get("payload_extra") or {})
     payload = json.dumps(body).encode("utf-8")
     headers = {
