@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Omarchy triage</title>
-  <link rel="stylesheet" href="/styles.css?v=16" />
+  <link rel="stylesheet" href="/styles.css?v=17" />
 </head>
 <body>
   <header class="topbar">
@@ -34,7 +34,11 @@
         <button type="button" class="tab" id="tabGroups" data-tab="groups" role="tab" aria-selected="false">Groups</button>
         <button type="button" class="tab" id="tabAllPrs" data-tab="allprs" role="tab" aria-selected="false">All PRs</button>
       </div>
-      <div id="groupListHeader" class="list-header muted"></div>
+      <div class="list-filters">
+        <input id="listFilter" type="search" placeholder="Filter #, author, file, title…" autocomplete="off" />
+        <div id="labelFilters" class="label-filters"></div>
+        <div id="groupListHeader" class="list-header muted"></div>
+      </div>
       <div id="queueList" class="virt-scroll" role="list"></div>
       <div id="groupList" class="virt-scroll hidden" role="list"></div>
       <div id="allPrList" class="virt-scroll hidden" role="list"></div>
@@ -118,6 +122,6 @@
   </main>
 
   <script src="/vendor/virtual.js"></script>
-  <script src="/app.js?v=16"></script>
+  <script src="/app.js?v=17"></script>
 </body>
 </html>

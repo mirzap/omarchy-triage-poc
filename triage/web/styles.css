@@ -738,3 +738,42 @@ button.user-shape:hover { color: var(--text); }
 }
 .label-key .label-stack { margin-top: 8px; }
 .label-key .label-row { grid-template-columns: 7.5rem 1fr; }
+
+
+.list-filters {
+  flex-shrink: 0;
+  border-bottom: 1px solid #27272a;
+  padding: 8px 8px 0;
+  background: #0c0c0e;
+}
+.list-filters input[type="search"] {
+  width: 100%;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 6px 8px;
+  color: var(--text);
+}
+.list-filters input[type="search"]:focus {
+  outline: none;
+  border-color: var(--accent-dim);
+}
+.label-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin: 8px 0;
+}
+.label-filters .pill {
+  cursor: pointer;
+  opacity: 0.55;
+}
+.label-filters .pill:hover { opacity: 0.9; }
+.label-filters .pill.on {
+  opacity: 1;
+  box-shadow: inset 0 0 0 1px currentColor;
+}
+.list-filters .list-header {
+  border-bottom: none;
+  padding: 0 2px 8px;
+}

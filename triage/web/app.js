@@ -32,6 +32,8 @@
     related: null,
     relatedKey: "",
     fetching: false,
+    filterQuery: "",
+    filterLabel: "",
   };
 
   let groupVirtualizer = null;
@@ -61,6 +63,8 @@
     const user = q.get("user");
     if (user) state.selectedUser = user;
     else if (q.has("user")) state.selectedUser = null;
+    state.filterQuery = q.get("q") || "";
+    state.filterLabel = q.get("label") || "";
   }
 
   function writeUrl(push) {
@@ -70,6 +74,8 @@
     if (state.selectedPr) q.set("pr", String(state.selectedPr));
     if (state.selectedFile) q.set("file", state.selectedFile);
     if (state.selectedUser) q.set("user", state.selectedUser);
+    if (state.filterQuery) q.set("q", state.filterQuery);
+    if (state.filterLabel) q.set("label", state.filterLabel);
     const next = "?" + q.toString();
     if (next === location.search) return;
     writingUrl = true;
@@ -210,21 +216,26 @@
     const q = state.queue || {};
     const c = q.counts || {};
     if (state.leftTab === "allprs") {
-      hdr.textContent = state.prs.length + " PRs";
+      const n = visibleAllPrs().length;
+      hdr.textContent = hasListFilter() ? n + " of " + state.prs.length + " PRs" : state.prs.length + " PRs";
     } else if (state.leftTab === "queue") {
       hdr.textContent =
         (c.needs_you || 0) + " need you · " +
         (c.hardware || 0) + " hw · " +
         (c.upgrade || 0) + " upgrade · " +
         (c.hotspots || 0) + " hotspots";
+      if (hasListFilter()) hdr.textContent += " · filtered";
     } else {
-      hdr.textContent = state.groups.length + " groups · " + state.prs.length + " PRs";
+      const n = visibleGroups().length;
+      hdr.textContent = hasListFilter()
+        ? n + " of " + state.groups.length + " groups"
+        : state.groups.length + " groups · " + state.prs.length + " PRs";
     }
   }
 
   function renderGroupList() {
     const root = $("groupList");
-    const groups = sortedGroups();
+    const groups = visibleGroups();
     renderLeftHeader();
 
     if (!groups.length) {
@@ -263,7 +274,7 @@
 
   function paintGroupVirtual() {
     const root = $("groupList");
-    const groups = sortedGroups();
+    const groups = visibleGroups();
     if (!groupVirtualizer || !groups.length) return;
     const items = groupVirtualizer.getVirtualItems();
     const total = groupVirtualizer.getTotalSize();
@@ -339,7 +350,7 @@
 
   function renderAllPrList() {
     const root = $("allPrList");
-    const prs = sortedAllPrs();
+    const prs = visibleAllPrs();
     renderLeftHeader();
 
     if (!prs.length) {
@@ -374,7 +385,7 @@
 
   function paintAllPrVirtual() {
     const root = $("allPrList");
-    const prs = sortedAllPrs();
+    const prs = visibleAllPrs();
     if (!allPrVirtualizer || !prs.length) return;
     const items = allPrVirtualizer.getVirtualItems();
     const total = allPrVirtualizer.getTotalSize();
@@ -464,6 +475,120 @@
     return state.groups.find((g) => g.group_id === id) || null;
   }
 
+  const FILTER_CHIPS = [
+    "related-theme",
+    "duplicate",
+    "unique",
+    "needs-look",
+    "hardware",
+    "update-path",
+    "docs",
+    "cosmetic",
+    "junk",
+    "blessed",
+    "unreviewed",
+  ];
+
+  function hasListFilter() {
+    return !!(state.filterQuery || "").trim() || !!state.filterLabel;
+  }
+
+  function groupMatches(g) {
+    if (!g) return false;
+    const rule = ruleFor(g.group_id);
+    const label = state.filterLabel;
+    if (label === "unreviewed") {
+      if (rule) return false;
+    } else if (label === "blessed") {
+      if (!rule || rule.decision !== "approve") return false;
+    } else if (label === "rejected") {
+      if (!rule || rule.decision !== "reject") return false;
+    } else if (label === "hardware") {
+      const marked = rule && rule.decision === "hardware";
+      if (g.card_class !== "hardware" && !marked) return false;
+    } else if (label === "unique" || label === "duplicate" || label === "related-theme") {
+      if ((g.suggested_decision || "unique") !== label) return false;
+    } else if (label) {
+      if ((g.card_class || "needs-look") !== label) return false;
+    }
+    const q = (state.filterQuery || "").trim().toLowerCase();
+    if (!q) return true;
+    if ((g.group_id || "").toLowerCase().includes(q)) return true;
+    if ((g.title_variants || []).some((t) => (t || "").toLowerCase().includes(q))) return true;
+    const nums = g.pr_numbers || [];
+    if (nums.some((n) => String(n).includes(q))) return true;
+    for (const n of nums) {
+      const pr = prByNumber(n);
+      if (!pr) continue;
+      if ((pr.user || "").toLowerCase().includes(q)) return true;
+      if ((pr.title || "").toLowerCase().includes(q)) return true;
+      if ((pr.paths || []).some((p) => (p || "").toLowerCase().includes(q))) return true;
+    }
+    return false;
+  }
+
+  function prMatches(pr) {
+    if (!pr) return false;
+    if (state.filterLabel) {
+      const g = groupById(pr.group_id);
+      if (!g || !groupMatches(g)) return false;
+      const q = (state.filterQuery || "").trim().toLowerCase();
+      if (!q) return true;
+    }
+    const q = (state.filterQuery || "").trim().toLowerCase();
+    if (!q) return !state.filterLabel || groupMatches(groupById(pr.group_id) || { group_id: pr.group_id, pr_numbers: [pr.number], title_variants: [pr.title], suggested_decision: "unique", card_class: "needs-look" });
+    if (String(pr.number).includes(q)) return true;
+    if ((pr.title || "").toLowerCase().includes(q)) return true;
+    if ((pr.user || "").toLowerCase().includes(q)) return true;
+    if ((pr.group_id || "").toLowerCase().includes(q)) return true;
+    if ((pr.paths || []).some((p) => (p || "").toLowerCase().includes(q))) return true;
+    if (state.filterLabel) {
+      const g = groupById(pr.group_id);
+      return !!(g && groupMatches(g));
+    }
+    return false;
+  }
+
+  function visibleGroups() {
+    return sortedGroups().filter(groupMatches);
+  }
+
+  function visibleAllPrs() {
+    return sortedAllPrs().filter(prMatches);
+  }
+
+  function applyListFilter() {
+    queueRowsCache = null;
+    const inp = $("listFilter");
+    if (inp && inp.value !== state.filterQuery) inp.value = state.filterQuery;
+    paintLabelFilters();
+    if (state.leftTab === "queue") renderQueue();
+    else if (state.leftTab === "groups") renderGroupList();
+    else renderAllPrList();
+    writeUrl(false);
+  }
+
+  function paintLabelFilters() {
+    const root = $("labelFilters");
+    if (!root) return;
+    if (!root.dataset.ready) {
+      root.innerHTML = "";
+      FILTER_CHIPS.forEach((name) => {
+        const el = makePill(name);
+        el.dataset.label = name;
+        el.addEventListener("click", () => {
+          state.filterLabel = state.filterLabel === name ? "" : name;
+          applyListFilter();
+        });
+        root.appendChild(el);
+      });
+      root.dataset.ready = "1";
+    }
+    [...root.querySelectorAll(".pill")].forEach((el) => {
+      el.classList.toggle("on", el.dataset.label === state.filterLabel);
+    });
+  }
+
   function queueRows() {
     if (queueRowsCache) return queueRowsCache;
     const q = state.queue || {};
@@ -475,21 +600,34 @@
       ["Known shape", q.known || []],
       ["Junk", q.junk || []],
     ];
+    const filtering = hasListFilter();
     for (const [label, ids] of piles) {
-      rows.push({ kind: "head", key: "hd:" + label, label: label, count: ids.length, size: 34 });
-      if (!ids.length) {
+      const groups = [];
+      for (const id of ids) {
+        const g = groupById(id);
+        if (g && groupMatches(g)) groups.push(g);
+      }
+      if (filtering && !groups.length) continue;
+      rows.push({ kind: "head", key: "hd:" + label, label: label, count: groups.length, size: 34 });
+      if (!groups.length) {
         rows.push({ kind: "empty", key: "e:" + label, size: 30 });
         continue;
       }
-      for (const id of ids) {
-        const g = groupById(id);
-        if (g) rows.push({ kind: "group", key: "g:" + g.group_id, group: g, size: 78 });
+      for (const g of groups) {
+        rows.push({ kind: "group", key: "g:" + g.group_id, group: g, size: 78 });
       }
     }
-    const spots = q.hotspots || [];
-    rows.push({ kind: "head", key: "hd:hotspots", label: "File hotspots", count: spots.length, size: 34 });
-    for (const hs of spots) {
-      rows.push({ kind: "hotspot", key: "h:" + hs.path, hotspot: hs, size: 40 });
+    const qtext = (state.filterQuery || "").trim().toLowerCase();
+    const spots = (q.hotspots || []).filter((hs) => {
+      if (state.filterLabel) return false;
+      if (!qtext) return true;
+      return (hs.path || "").toLowerCase().includes(qtext);
+    });
+    if (!filtering || spots.length) {
+      rows.push({ kind: "head", key: "hd:hotspots", label: "File hotspots", count: spots.length, size: 34 });
+      for (const hs of spots) {
+        rows.push({ kind: "hotspot", key: "h:" + hs.path, hotspot: hs, size: 40 });
+      }
     }
     queueRowsCache = rows;
     return rows;
@@ -1892,5 +2030,14 @@
   });
 
   readUrl();
+  const filterInp = $("listFilter");
+  if (filterInp) {
+    filterInp.value = state.filterQuery || "";
+    filterInp.addEventListener("input", () => {
+      state.filterQuery = filterInp.value;
+      applyListFilter();
+    });
+  }
+  paintLabelFilters();
   loadState();
 })();
