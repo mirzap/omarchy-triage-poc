@@ -243,7 +243,9 @@
         try { groupVirtualizer._willUpdate = () => {}; } catch (_) {}
         groupVirtualizer = null;
       }
-      root.innerHTML = '<div class="empty">No groups — Fetch</div>';
+      root.innerHTML = hasListFilter()
+        ? '<div class="empty">No groups match</div>'
+        : '<div class="empty">No groups — Fetch</div>';
       return;
     }
 
@@ -286,29 +288,30 @@
       root.appendChild(inner);
     }
     inner.style.height = total + "px";
-    // Remove stale absolute children not in current range
-    const keep = new Set(items.map((i) => String(i.index)));
+    const keep = new Set(
+      items.map((i) => groups[i.index] && groups[i.index].group_id).filter(Boolean)
+    );
     [...inner.querySelectorAll(".virt-item")].forEach((el) => {
-      if (!keep.has(el.dataset.index)) el.remove();
+      if (!keep.has(el.dataset.gid)) el.remove();
     });
     for (const vi of items) {
-      let el = inner.querySelector('.virt-item[data-index="' + vi.index + '"]');
+      const g = groups[vi.index];
+      if (!g) continue;
+      let el = inner.querySelector('.virt-item[data-gid="' + g.group_id + '"]');
       if (!el) {
         el = document.createElement("div");
         el.className = "virt-item";
-        el.dataset.index = String(vi.index);
-        const g = groups[vi.index];
-        const card = buildGroupCard(g);
-        el.appendChild(card);
+        el.dataset.gid = g.group_id;
+        el.appendChild(buildGroupCard(g));
         inner.appendChild(el);
       } else {
-        const g = groups[vi.index];
         const card = el.firstChild;
         if (card) {
           card.className =
             "group-card" + (g.group_id === state.selectedGroupId ? " selected" : "");
         }
       }
+      el.dataset.index = String(vi.index);
       el.style.transform = "translateY(" + vi.start + "px)";
       el.style.height = vi.size + "px";
     }
@@ -355,7 +358,9 @@
 
     if (!prs.length) {
       allPrVirtualizer = null;
-      root.innerHTML = '<div class="empty">No PRs — Fetch</div>';
+      root.innerHTML = hasListFilter()
+        ? '<div class="empty">No PRs match</div>'
+        : '<div class="empty">No PRs — Fetch</div>';
       return;
     }
 
@@ -397,17 +402,20 @@
       root.appendChild(inner);
     }
     inner.style.height = total + "px";
-    const keep = new Set(items.map((i) => String(i.index)));
+    const keep = new Set(
+      items.map((i) => prs[i.index] && String(prs[i.index].number)).filter(Boolean)
+    );
     [...inner.querySelectorAll(".virt-item")].forEach((el) => {
-      if (!keep.has(el.dataset.index)) el.remove();
+      if (!keep.has(el.dataset.pr)) el.remove();
     });
     for (const vi of items) {
-      let el = inner.querySelector('.virt-item[data-index="' + vi.index + '"]');
       const pr = prs[vi.index];
+      if (!pr) continue;
+      let el = inner.querySelector('.virt-item[data-pr="' + pr.number + '"]');
       if (!el) {
         el = document.createElement("div");
         el.className = "virt-item";
-        el.dataset.index = String(vi.index);
+        el.dataset.pr = String(pr.number);
         el.appendChild(buildPrRow(pr));
         inner.appendChild(el);
       } else {
@@ -417,6 +425,7 @@
             "pr-row" + (state.selectedPr === pr.number ? " selected" : "");
         }
       }
+      el.dataset.index = String(vi.index);
       el.style.transform = "translateY(" + vi.start + "px)";
       el.style.height = vi.size + "px";
     }
