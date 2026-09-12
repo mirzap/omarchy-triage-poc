@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Omarchy triage</title>
-  <link rel="stylesheet" href="/styles.css?v=22" />
+  <link rel="stylesheet" href="/styles.css?v=23" />
 </head>
 <body>
   <header class="topbar">
@@ -13,6 +13,7 @@
       <span>source</span>
       <select id="source">
         <option value="gh" selected>gh</option>
+        <option value="fixtures">local fixtures</option>
       </select>
     </label>
     <label class="field grow">
@@ -20,11 +21,14 @@
       <input id="repo" type="text" value="omacom/omarchy" spellcheck="false" />
     </label>
     <label class="field narrow">
-      <span>limit</span>
-      <input id="limit" type="number" value="0" min="0" placeholder="0 = all" title="0 = all open PRs" />
+      <span>file cap</span>
+      <input id="limit" type="number" value="0" min="0" max="5000" placeholder="0 = 5000" title="Limits file-evidence downloads; the open-PR list is not truncated" />
     </label>
-    <button id="fetchBtn" type="button" class="btn primary">Fetch</button>
-    <div id="status" class="status">idle</div>
+    <label class="refresh-toggle" title="Revalidate the open-PR list and changed revisions">
+      <input id="refresh" type="checkbox" checked /> refresh
+    </label>
+    <button id="fetchBtn" type="button" class="btn primary">Sync</button>
+    <div class="status-wrap"><div id="status" class="status">idle</div><div id="syncMeta" class="sync-meta"></div></div>
   </header>
 
   <main class="layout">
@@ -60,12 +64,13 @@
             </details>
           </div>
           <div class="actions">
-            <button id="blessBtn" type="button" class="btn accent">Bless shape</button>
+            <button id="blessBtn" type="button" class="btn accent">Approve reviewed revisions</button>
             <button id="hardwareBtn" type="button" class="btn">Needs hardware</button>
             <button id="upgradeBtn" type="button" class="btn warn">Can break upgrade</button>
             <button id="rejectBtn" type="button" class="btn danger">Reject</button>
           </div>
         </div>
+        <div id="decisionWarning" class="decision-warning" role="status"></div>
         <div class="block" id="membersBlock">
           <h3 id="membersHead">PRs in this shape</h3>
           <div id="detailMembersWrap" class="member-wrap">
@@ -102,7 +107,11 @@
         </details>
         <details class="block more-block" id="relatedBlock">
           <summary class="queue-toggle">Related by patch</summary>
-          <div id="relatedList" class="related-list muted">Embedding idle.</div>
+          <div id="relatedList" class="related-list muted">Open to load local/cached ranking.</div>
+          <div class="external-enrichment">
+            <p id="enrichDisclosure" class="muted">Optional external ranking sends bounded patch content for this repository to the configured embedding provider.</p>
+            <button id="enrichBtn" type="button" class="btn">Send up to 24 candidates for external ranking</button>
+          </div>
         </details>
       </div>
     </section>
@@ -123,6 +132,6 @@
   </main>
 
   <script src="/vendor/virtual.js"></script>
-  <script src="/app.js?v=25"></script>
+  <script src="/app.js?v=29"></script>
 </body>
 </html>

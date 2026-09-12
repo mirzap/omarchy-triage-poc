@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 from typing import Any
 
-from triage.models import ChangedFile, Group, PullRequest
+from triage.models import ChangedFile, Group, PullRequest, unified_patch_line_counts
 
 PATCH_HASH_LEN = 12
 
@@ -33,14 +33,15 @@ def file_overlap(members: list[PullRequest]) -> dict[str, Any]:
         }
 
     n = len(members)
-    # path -> list of (pr_number, patch)
-    by_path: dict[str, list[tuple[int, str]]] = {}
+    # path -> complete file records. Display hashes may describe incomplete
+    # bytes, but equality claims below are made only from canonical evidence.
+    by_path: dict[str, list[tuple[int, ChangedFile]]] = {}
     sets: list[set[str]] = []
     for pr in members:
         paths = set()
         for f in pr.changed_files:
             paths.add(f.path)
-            by_path.setdefault(f.path, []).append((pr.number, f.patch or ""))
+            by_path.setdefault(f.path, []).append((pr.number, f))
         sets.append(paths)
 
     union: set[str] = set()
@@ -64,10 +65,10 @@ def file_overlap(members: list[PullRequest]) -> dict[str, Any]:
     for path in sorted(by_path.keys()):
         entries = by_path[path]
         # de-dupe by PR number (keep first patch)
-        seen: dict[int, str] = {}
-        for num, patch in entries:
+        seen: dict[int, ChangedFile] = {}
+        for num, changed in entries:
             if num not in seen:
-                seen[num] = patch
+                seen[num] = changed
         count = len(seen)
         if count == n and n >= 1:
             kind = "shared"
@@ -80,9 +81,22 @@ def file_overlap(members: list[PullRequest]) -> dict[str, Any]:
             unique.append(path)
 
         prs_flag = {str(num): True for num in seen}
-        patch_hashes = {str(num): hash_patch(patch) for num, patch in seen.items()}
-        hashes = list(patch_hashes.values())
-        same_patch = bool(hashes) and len(set(hashes)) == 1
+        patch_hashes = {str(num): hash_patch(changed.patch) for num, changed in seen.items()}
+        complete: dict[int, bool] = {}
+        for num, changed in seen.items():
+            counts = unified_patch_line_counts(changed.patch)
+            complete[num] = bool(
+                changed.patch_complete
+                and counts[0] is not None
+                and (changed.additions is None or changed.additions == counts[0])
+                and (changed.deletions is None or changed.deletions == counts[1])
+            )
+        hashes = [patch_hashes[str(num)] for num in seen]
+        evidence_complete = len(seen) >= 2 and all(complete.values())
+        same_patch = evidence_complete and len(set(hashes)) == 1
+        same_patch_status = (
+            "same" if same_patch else "different" if evidence_complete else "unknown"
+        )
 
         matrix.append(
             {
@@ -91,6 +105,8 @@ def file_overlap(members: list[PullRequest]) -> dict[str, Any]:
                 "kind": kind,
                 "patch_hashes": patch_hashes,
                 "same_patch": same_patch,
+                "same_patch_status": same_patch_status,
+                "patch_evidence_complete": {str(num): value for num, value in complete.items()},
             }
         )
 
@@ -114,9 +130,7 @@ def slim_to_pr(slim: dict[str, Any]) -> PullRequest:
     else:
         for f in files_raw:
             if isinstance(f, dict):
-                changed.append(
-                    ChangedFile(path=str(f.get("path", "")), patch=str(f.get("patch", "") or ""))
-                )
+                changed.append(ChangedFile.from_dict(f))
             elif isinstance(f, str):
                 changed.append(ChangedFile(path=f, patch=""))
     if not changed:

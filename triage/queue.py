@@ -15,15 +15,28 @@ def _repo_key(repo: str) -> str:
 
 
 def rule_applies_to_group(rule: TrustedRule, group: Group, repo: str = "") -> bool:
-    """A decision applies only to its repository and reviewed membership."""
+    """A decision applies only to its exact repository/revision snapshot."""
     active_repo = _repo_key(repo or group.repo)
     if not active_repo or _repo_key(group.repo) != active_repo:
         return False
     if _repo_key(rule.repo) != active_repo or rule.group_id != group.group_id:
         return False
-    reviewed = rule.reviewed_members
-    current = {int(n) for n in group.pr_numbers}
-    return bool(current) and current.issubset(reviewed)
+    reviewed = {item.pr_number: item for item in rule.reviewed_revisions}
+    current = {item.pr_number: item for item in group.member_revisions}
+    members = {int(n) for n in group.pr_numbers}
+    if not members or set(reviewed) != members or set(current) != members:
+        return False
+    if rule.snapshot_digest != group.snapshot_digest or reviewed != current:
+        return False
+    # Approvals are fail-closed. Other explicit dispositions can be recorded
+    # against incomplete evidence, but still apply only to the exact snapshot.
+    if rule.decision == "approve":
+        return bool(
+            rule.evidence_complete
+            and group.evidence_complete
+            and all(item.evidence_complete for item in reviewed.values())
+        )
+    return True
 
 
 def build_queue(
@@ -34,7 +47,6 @@ def build_queue(
     hotspot_min: int = HOTSPOT_MIN,
     repo: str = "",
 ) -> dict[str, Any]:
-    by_num = {p.number: p for p in prs}
     new_set = set(new_pr_numbers or [])
     active_repo = _repo_key(repo)
     if not active_repo:
@@ -54,7 +66,6 @@ def build_queue(
     upgrade: list[str] = []
 
     for g in groups:
-        members = [by_num[n] for n in g.pr_numbers if n in by_num]
         candidate = rule_by_gid.get(g.group_id)
         rule = (
             candidate

@@ -1,4 +1,4 @@
-/* Omarchy triage dashboard — vanilla JS + SVG force layout + TanStack Virtual */
+/* Omarchy triage dashboard — local-first vanilla JS + TanStack Virtual */
 (function () {
   "use strict";
 
@@ -13,8 +13,6 @@
   const state = {
     groups: [],
     prs: [],
-    edges: [],
-    group_edges: [],
     rules: [],
     overlap: {},
     source: "",
@@ -22,7 +20,9 @@
     selectedGroupId: null,
     selectedPr: null,
     selectedFile: null,
-    showGroupGraph: false,
+    storeVersion: 0,
+    snapshotVersion: 0,
+    sync: null,
     leftTab: "queue", // queue | groups | allprs
     queue: {},
     new_pr_numbers: [],
@@ -35,14 +35,15 @@
     filterQuery: "",
     filterLabel: "",
     queuePile: "needs_you",
+    examinedMembers: new Set(),
   };
 
   const QUEUE_PILES = [
     { id: "needs_you", label: "Needs you", hint: "No decision yet — the actual triage work" },
     { id: "hardware", label: "Hardware", hint: "You marked Needs hardware" },
     { id: "upgrade", label: "Upgrade", hint: "You marked Can break upgrade" },
-    { id: "known", label: "Known", hint: "Blessed or auto-approved shape" },
-    { id: "junk", label: "Junk", hint: "Rejected or singleton noise" },
+    { id: "known", label: "Known", hint: "Explicitly reviewed revisions" },
+    { id: "junk", label: "Junk", hint: "Explicitly rejected revisions" },
     { id: "hotspots", label: "Hotspots", hint: "Files touched by 20+ open PRs" },
   ];
 
@@ -50,6 +51,7 @@
   let allPrVirtualizer = null;
   let queueVirtualizer = null;
   let memberVirtualizer = null;
+  const virtualizerCleanup = { group: null, all: null, queue: null, member: null };
   let queueRowsCache = null;
   let fetchPollTimer = null;
   let stateLoadGen = 0;
@@ -59,15 +61,32 @@
   let bodyGen = 0;
   let overlapGen = 0;
   let diffGen = 0;
+  let diffScrollSerial = 0;
+  let pendingDiffScroll = null;
+  let pendingDiffScrollFrame = null;
   let lastBodyPr = null;
   const bodyCache = {};
+  const resourceRequests = new Map();
+  const patchPanelState = new WeakMap();
+  const indexes = { groups: new Map(), prs: new Map(), rules: new Map() };
+  const selectorCache = new Map();
+  const decisionRetries = new Map();
+  let csrfToken = "";
+  let sessionPromise = null;
+  let enrichmentRequest = null;
 
   const $ = (id) => document.getElementById(id);
 
   let writingUrl = false;
   let alignSidebar = true;
 
+  const URL_DEFAULTS = {
+    leftTab: "queue", selectedGroupId: null, selectedPr: null, selectedFile: null,
+    selectedUser: null, filterQuery: "", filterLabel: "", queuePile: "needs_you",
+  };
+
   function readUrl() {
+    Object.assign(state, URL_DEFAULTS);
     const q = new URLSearchParams(location.search);
     const tab = q.get("tab");
     if (tab === "queue" || tab === "groups" || tab === "allprs") state.leftTab = tab;
@@ -110,8 +129,52 @@
     $("status").textContent = msg;
   }
 
+  function renderSyncMeta() {
+    const root = $("syncMeta");
+    if (!root) return;
+    const sync = state.sync;
+    if (!sync) {
+      root.textContent = state.source === "fixtures" ? "offline fixture workspace" : "no cached sync metadata";
+      return;
+    }
+    const when = sync.fetched_at ? new Date(sync.fetched_at).toLocaleString() : "time unknown";
+    const open = sync.open_count == null ? "?" : sync.open_count;
+    const downloaded = sync.selected_count == null ? "?" : sync.selected_count;
+    root.textContent = "cached " + when + " · " + open + " open PRs · file evidence " +
+      downloaded + "/" + open + (sync.evidence_complete ? " complete" : " incomplete") +
+      (sync.list_complete === false ? " · open list partial" : " · all-open list complete") +
+      (sync.limited ? " · file cap applied" : "") +
+      (sync.cache_status ? " · " + sync.cache_status : "");
+  }
+
+  async function bootstrapSession(force) {
+    if (force) {
+      csrfToken = "";
+      sessionPromise = null;
+    }
+    if (csrfToken) return csrfToken;
+    if (!sessionPromise) {
+      sessionPromise = fetch("/api/session", { headers: { Accept: "application/json" } })
+        .then(async (res) => {
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok || !data.csrf_token) throw new Error(data.error || "session bootstrap failed");
+          csrfToken = data.csrf_token;
+          return csrfToken;
+        })
+        .finally(() => { sessionPromise = null; });
+    }
+    return sessionPromise;
+  }
+
   async function api(path, opts) {
-    const res = await fetch(path, opts);
+    const options = { ...(opts || {}) };
+    const method = (options.method || "GET").toUpperCase();
+    if (method !== "GET" && method !== "HEAD") {
+      const token = await bootstrapSession(false);
+      options.headers = { ...(options.headers || {}), "Content-Type": "application/json",
+                          "X-CSRF-Token": token };
+    }
+    const res = await fetch(path, options);
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
       const err = new Error(data.error || res.statusText || "request failed");
@@ -122,8 +185,36 @@
     return data;
   }
 
+  function requestOnce(kind, identity, path) {
+    const key = kind + "|" + identity;
+    const existing = resourceRequests.get(key);
+    if (existing) return existing.promise;
+    for (const [priorKey, entry] of resourceRequests.entries()) {
+      if (priorKey.startsWith(kind + "|")) {
+        entry.controller.abort();
+        resourceRequests.delete(priorKey);
+      }
+    }
+    const controller = new AbortController();
+    const promise = api(path, { signal: controller.signal })
+      .catch((error) => {
+        resourceRequests.delete(key);
+        throw error;
+      });
+    resourceRequests.set(key, { controller, promise });
+    return promise;
+  }
+
+  function rebuildIndexes() {
+    indexes.groups = new Map(state.groups.map((group) => [group.group_id, group]));
+    indexes.prs = new Map(state.prs.map((pr) => [pr.number, pr]));
+    indexes.rules = new Map(state.rules.map((rule) => [rule.group_id, rule]));
+    selectorCache.clear();
+  }
+
   function snapshotKey() {
-    return (state.source || "") + "|" + (state.repo || "");
+    return [state.source || "", state.repo || "", state.storeVersion,
+      state.snapshotVersion].join("|");
   }
 
   function invalidateSnapshotCaches() {
@@ -136,24 +227,34 @@
     state.fileQueue = null;
     state.related = null;
     state.relatedKey = "";
+    state.examinedMembers = new Set();
     lastBodyPr = null;
     Object.keys(bodyCache).forEach((key) => delete bodyCache[key]);
+    for (const entry of resourceRequests.values()) entry.controller.abort();
+    resourceRequests.clear();
+    if (enrichmentRequest) enrichmentRequest.controller.abort();
+    enrichmentRequest = null;
+    selectorCache.clear();
   }
 
   function applyState(data) {
     invalidateSnapshotCaches();
     state.groups = data.groups || [];
     state.prs = data.prs || [];
-    state.edges = data.edges || [];
-    state.group_edges = data.group_edges || [];
     state.rules = data.rules || [];
     state.overlap = data.overlap || {};
     state.source = data.source || "";
     state.repo = data.repo || "";
     state.queue = data.queue || {};
     state.new_pr_numbers = data.new_pr_numbers || [];
+    state.storeVersion = Number(data.store_version || 0);
+    state.snapshotVersion = Number(data.snapshot_version || 0);
+    state.sync = data.sync || null;
+    rebuildIndexes();
     queueRowsCache = null;
-    if (data.source) $("source").value = "gh";
+    if (data.source) {
+      $("source").value = ["gh", "github"].includes(data.source) ? "gh" : data.source;
+    }
     if (data.repo) $("repo").value = data.repo;
     if (
       state.selectedGroupId &&
@@ -196,21 +297,27 @@
       else openHotspot(state.selectedFile, { fromUrl: true });
     }
     renderUserDrawer();
+    renderSyncMeta();
   }
 
   function ruleFor(groupId) {
-    return state.rules.find((r) => r.group_id === groupId) || null;
+    return indexes.rules.get(groupId) || null;
+  }
+
+  function compareGroups(a, b) {
+    const sa = (a.pr_numbers || []).length;
+    const sb = (b.pr_numbers || []).length;
+    if (sb !== sa) return sb - sa;
+    const da = DECISION_ORDER[a.suggested_decision] ?? 9;
+    const db = DECISION_ORDER[b.suggested_decision] ?? 9;
+    if (da !== db) return da - db;
+    const ga = String(a.group_id || "");
+    const gb = String(b.group_id || "");
+    return ga < gb ? -1 : ga > gb ? 1 : 0;
   }
 
   function sortedGroups() {
-    return state.groups.slice().sort((a, b) => {
-      const sa = (a.pr_numbers || []).length;
-      const sb = (b.pr_numbers || []).length;
-      if (sb !== sa) return sb - sa;
-      const da = DECISION_ORDER[a.suggested_decision] ?? 9;
-      const db = DECISION_ORDER[b.suggested_decision] ?? 9;
-      return da - db;
-    });
+    return state.groups.slice().sort(compareGroups);
   }
 
   function sortedAllPrs() {
@@ -218,7 +325,7 @@
   }
 
   function prByNumber(n) {
-    return state.prs.find((p) => p.number === n);
+    return indexes.prs.get(n) || null;
   }
 
   function makeVirtualizer(scrollEl, count, estimateSize, overscan, onChange) {
@@ -234,6 +341,24 @@
       measureElement,
       onChange: () => onChange(),
     });
+  }
+
+  function mountVirtualizer(slot, virtualizer) {
+    disposeVirtualizer(slot);
+    if (!virtualizer) return null;
+    const cleanup = virtualizer._didMount();
+    virtualizerCleanup[slot] = typeof cleanup === "function" ? cleanup : null;
+    return virtualizer;
+  }
+
+  function disposeVirtualizer(slot) {
+    const cleanup = virtualizerCleanup[slot];
+    if (cleanup) cleanup();
+    virtualizerCleanup[slot] = null;
+    if (slot === "group") groupVirtualizer = null;
+    else if (slot === "all") allPrVirtualizer = null;
+    else if (slot === "queue") queueVirtualizer = null;
+    else if (slot === "member") memberVirtualizer = null;
   }
 
   function scrollSidebarToSelection() {
@@ -295,10 +420,7 @@
     renderLeftHeader();
 
     if (!groups.length) {
-      if (groupVirtualizer) {
-        try { groupVirtualizer._willUpdate = () => {}; } catch (_) {}
-        groupVirtualizer = null;
-      }
+      disposeVirtualizer("group");
       root.innerHTML = hasListFilter()
         ? '<div class="empty">No groups match</div>'
         : '<div class="empty">No groups — Fetch</div>';
@@ -313,8 +435,9 @@
     }
 
     if (!groupVirtualizer) {
-      groupVirtualizer = makeVirtualizer(root, groups.length, () => 96, 8, paintGroupVirtual);
-      groupVirtualizer._didMount();
+      groupVirtualizer = mountVirtualizer(
+        "group", makeVirtualizer(root, groups.length, () => 96, 8, paintGroupVirtual)
+      );
     } else {
       groupVirtualizer.setOptions({
         ...groupVirtualizer.options,
@@ -359,12 +482,15 @@
         el.className = "virt-item";
         el.dataset.gid = g.group_id;
         el.appendChild(buildGroupCard(g));
+        el.dataset.version = groupContentVersion(g);
         inner.appendChild(el);
       } else {
-        const card = el.firstChild;
-        if (card) {
-          card.className =
-            "group-card" + (g.group_id === state.selectedGroupId ? " selected" : "");
+        if (el.dataset.version !== groupContentVersion(g)) {
+          el.replaceChildren(buildGroupCard(g));
+          el.dataset.version = groupContentVersion(g);
+        } else if (el.firstChild) {
+          el.firstChild.className = "group-card" +
+            (g.group_id === state.selectedGroupId ? " selected" : "");
         }
       }
       el.dataset.index = String(vi.index);
@@ -397,7 +523,7 @@
       const shown = ruleLabel(rule.decision);
       const key =
         rule.decision === "approve"
-          ? "blessed"
+          ? "approved"
           : rule.decision === "reject"
             ? "rejected"
             : rule.decision;
@@ -406,6 +532,17 @@
       parts.push('<span class="muted">unreviewed</span>');
     }
     return parts.join("");
+  }
+
+  function groupContentVersion(g) {
+    const rule = ruleFor(g.group_id);
+    return [state.storeVersion, g.snapshot_digest || "", g.evidence_complete ? 1 : 0,
+      rule ? rule.decision : "", rule ? rule.decision_event_id || "" : ""].join(":");
+  }
+
+  function prContentVersion(pr) {
+    return [state.storeVersion, pr.head_sha || "", pr.content_digest || "", pr.label || "",
+      pr.group_id || ""].join(":");
   }
 
   function buildGroupCard(g) {
@@ -437,7 +574,7 @@
     renderLeftHeader();
 
     if (!prs.length) {
-      allPrVirtualizer = null;
+      disposeVirtualizer("all");
       root.innerHTML = hasListFilter()
         ? '<div class="empty">No PRs match</div>'
         : '<div class="empty">No PRs — Fetch</div>';
@@ -451,8 +588,9 @@
     }
 
     if (!allPrVirtualizer) {
-      allPrVirtualizer = makeVirtualizer(root, prs.length, () => 36, 8, paintAllPrVirtual);
-      allPrVirtualizer._didMount();
+      allPrVirtualizer = mountVirtualizer(
+        "all", makeVirtualizer(root, prs.length, () => 36, 8, paintAllPrVirtual)
+      );
     } else {
       allPrVirtualizer.setOptions({
         ...allPrVirtualizer.options,
@@ -497,12 +635,15 @@
         el.className = "virt-item";
         el.dataset.pr = String(pr.number);
         el.appendChild(buildPrRow(pr));
+        el.dataset.version = prContentVersion(pr);
         inner.appendChild(el);
       } else {
-        const row = el.firstChild;
-        if (row) {
-          row.className =
-            "pr-row" + (state.selectedPr === pr.number ? " selected" : "");
+        if (el.dataset.version !== prContentVersion(pr)) {
+          el.replaceChildren(buildPrRow(pr));
+          el.dataset.version = prContentVersion(pr);
+        } else if (el.firstChild) {
+          el.firstChild.className = "pr-row" +
+            (state.selectedPr === pr.number ? " selected" : "");
         }
       }
       el.dataset.index = String(vi.index);
@@ -541,6 +682,9 @@
   function setLeftTab(tab, fromUrl) {
     if (tab !== state.leftTab) alignSidebar = true;
     state.leftTab = tab;
+    if (tab !== "queue") disposeVirtualizer("queue");
+    if (tab !== "groups") disposeVirtualizer("group");
+    if (tab !== "allprs") disposeVirtualizer("all");
     const qTab = $("tabQueue");
     const groupsTab = $("tabGroups");
     const allTab = $("tabAllPrs");
@@ -562,7 +706,7 @@
   }
 
   function groupById(id) {
-    return state.groups.find((g) => g.group_id === id) || null;
+    return indexes.groups.get(id) || null;
   }
 
   function normalizeSelection() {
@@ -601,7 +745,7 @@
     "docs",
     "cosmetic",
     "junk",
-    "blessed",
+    "approved",
     "unreviewed",
   ];
 
@@ -620,12 +764,12 @@
     const label = state.filterLabel;
     if (label === "unreviewed") {
       if (rule) return false;
-    } else if (label === "blessed") {
-      // Known pile: Bless shape + auto-approved. Not just a stored approve rule.
+    } else if (label === "approved") {
+      // Known pile: explicitly reviewed revisions. Not just a stored suggestion.
       const approved = rule && rule.decision === "approve";
       if (!approved && !pileHas("known", g.group_id)) return false;
     } else if (label === "junk") {
-      // Junk pile: Reject + singleton noise. Keyword class is extra, not the pile.
+      // Explicit rejection is authoritative; keyword classification is only a visible filter.
       const rejected = rule && rule.decision === "reject";
       if (!rejected && !pileHas("junk", g.group_id) && (g.card_class || "") !== "junk") {
         return false;
@@ -685,15 +829,20 @@
   }
 
   function visibleGroups() {
-    return sortedGroups().filter(groupMatches);
+    const key = ["groups", snapshotKey(), state.filterQuery, state.filterLabel].join("|");
+    if (!selectorCache.has(key)) selectorCache.set(key, sortedGroups().filter(groupMatches));
+    return selectorCache.get(key);
   }
 
   function visibleAllPrs() {
-    return sortedAllPrs().filter(prMatches);
+    const key = ["prs", snapshotKey(), state.filterQuery, state.filterLabel].join("|");
+    if (!selectorCache.has(key)) selectorCache.set(key, sortedAllPrs().filter(prMatches));
+    return selectorCache.get(key);
   }
 
   function applyListFilter() {
     queueRowsCache = null;
+    selectorCache.clear();
     const inp = $("listFilter");
     if (inp && inp.value !== state.filterQuery) inp.value = state.filterQuery;
     paintLabelFilters();
@@ -749,7 +898,7 @@
       const g = groupById(gid);
       if (g && groupMatches(g)) out.push(g);
     }
-    return out;
+    return out.sort(compareGroups);
   }
 
   function pileTotal(id) {
@@ -863,10 +1012,7 @@
     renderLeftHeader();
 
     if (!rows.length) {
-      if (queueVirtualizer) {
-        try { queueVirtualizer._willUpdate = () => {}; } catch (_) {}
-        queueVirtualizer = null;
-      }
+      disposeVirtualizer("queue");
       root.innerHTML = '<div class="empty">No queue — Fetch</div>';
       return;
     }
@@ -878,14 +1024,13 @@
     }
 
     if (!queueVirtualizer) {
-      queueVirtualizer = makeVirtualizer(
+      queueVirtualizer = mountVirtualizer("queue", makeVirtualizer(
         root,
         rows.length,
         (i) => (queueRows()[i] && queueRows()[i].size) || 40,
         8,
         paintQueueVirtual
-      );
-      queueVirtualizer._didMount();
+      ));
     } else {
       queueVirtualizer.setOptions({
         ...queueVirtualizer.options,
@@ -929,13 +1074,17 @@
         el.dataset.key = row.key;
         el.dataset.index = String(vi.index);
         el.appendChild(buildQueueItem(row));
+        if (row.kind === "group") el.dataset.version = groupContentVersion(row.group);
         inner.appendChild(el);
       } else if (row.kind === "head") {
         const h = el.firstChild;
         if (h) h.textContent = row.label + " · " + row.count;
       } else if (row.kind === "group") {
         const card = el.firstChild;
-        if (card) {
+        if (el.dataset.version !== groupContentVersion(row.group)) {
+          el.replaceChildren(buildGroupCard(row.group));
+          el.dataset.version = groupContentVersion(row.group);
+        } else if (card) {
           card.className =
             "group-card" + (row.group.group_id === state.selectedGroupId ? " selected" : "");
         }
@@ -964,10 +1113,7 @@
       return;
     }
     const key = snapshotKey() + "|" + pr + "|" + (path || "");
-    if (state.related && state.related.frozen) {
-      renderRelated();
-      return;
-    }
+    cancelEnrichmentUnless(key);
     if (state.relatedKey === key && state.related) {
       renderRelated();
       return;
@@ -979,12 +1125,10 @@
     try {
       let url = "/api/related?pr=" + encodeURIComponent(pr);
       if (path) url += "&path=" + encodeURIComponent(path);
-      const data = await api(url);
+      url += "&limit=5";
+      const data = await requestOnce("related", key, url);
       if (gen !== relatedGen) return;
-      if (data && data.frozen) data.frozen = true;
       state.related = data;
-      if (data && (data.reason || "").indexOf("credits") >= 0) state.related.frozen = true;
-      if (data && data.enabled === false) state.related.frozen = true;
       renderRelated();
     } catch (err) {
       if (gen !== relatedGen) return;
@@ -994,6 +1138,7 @@
   }
 
   function loadRelatedIfOpen(pr, path) {
+    cancelEnrichmentUnless(relatedTargetIdentity(snapshotKey(), pr, path));
     const block = $("relatedBlock");
     if (!block || !block.open) {
       relatedGen += 1;
@@ -1002,6 +1147,23 @@
       return;
     }
     loadRelated(pr, path);
+  }
+
+  function relatedTargetIdentity(snapshot, pr, path) {
+    return snapshot + "|" + (pr || "") + "|" + (path || "");
+  }
+
+  function requestContextMatches(expectedSnapshot, expectedGeneration, expectedIdentity,
+      currentSnapshot, currentGeneration, currentIdentity) {
+    return expectedSnapshot === currentSnapshot && expectedGeneration === currentGeneration &&
+      expectedIdentity === currentIdentity;
+  }
+
+  function cancelEnrichmentUnless(identity) {
+    if (!enrichmentRequest || enrichmentRequest.identity === identity) return;
+    enrichmentRequest.controller.abort();
+    enrichmentRequest = null;
+    setStatus("external ranking cancelled because the selected revision changed");
   }
 
   function currentRelatedTarget() {
@@ -1019,6 +1181,36 @@
     const root = $("relatedList");
     if (!root) return;
     const data = state.related;
+    const disclosure = $("enrichDisclosure");
+    const target = currentRelatedTarget();
+    const targetPr = target.pr ? prByNumber(target.pr) : null;
+    const enrichment = (data && data.enrichment) || null;
+    const targetIdentity = relatedTargetIdentity(snapshotKey(), target.pr, target.path);
+    const enrichmentBusy = !!(
+      enrichmentRequest && enrichmentRequest.identity === targetIdentity
+    );
+    if (disclosure) {
+      disclosure.textContent = "External action only: send normalized patch content from " +
+        (state.repo || "this repository") + " for #" + (target.pr || "?") +
+        " and up to " + ((enrichment && enrichment.max_candidates) || 24) +
+        " candidate revisions to " + ((enrichment && enrichment.provider) || "the configured provider") +
+        ((enrichment && enrichment.model) ? " (" + enrichment.model + ")" : "") +
+        (enrichment && enrichment.max_total_input_bytes
+          ? " · total input cap " + enrichment.max_total_input_bytes + " bytes."
+          : ".");
+    }
+    const enrich = $("enrichBtn");
+    if (enrich) {
+      enrich.disabled = enrichmentBusy || !targetPr || targetPr.evidence_complete !== true ||
+        !enrichment || enrichment.enabled !== true;
+      enrich.textContent = enrichmentBusy
+        ? "External ranking in progress…"
+        : "Send bounded candidates for external ranking";
+      enrich.title = enrich.disabled
+        ? ((enrichment && enrichment.reason) || "Complete evidence and a configured provider are required")
+        :
+        "This one action explicitly permits external processing";
+    }
     if (!data) {
       root.className = "related-list muted";
       root.textContent = "Pick a PR.";
@@ -1026,23 +1218,38 @@
     }
     if (data.loading) {
       root.className = "related-list muted";
-      root.textContent = "Ranking patches…";
+      root.textContent = "Loading local/cached ranking…";
       return;
     }
     if (!data.enabled || !(data.related || []).length) {
       root.className = "related-list muted";
-      root.textContent = data.reason || (data.enabled ? "No near-patch neighbors." : "Embedding key not set.");
+      root.textContent = data.reason || "No local or cached patch neighbors.";
       return;
     }
     const items = data.related || [];
     root.className = "related-list";
     root.innerHTML = "";
+    const provenance = document.createElement("div");
+    provenance.className = "related-provenance muted";
+    const truncation = data.truncation || {};
+    const omitted = truncation.omitted != null
+      ? truncation.omitted
+      : truncation.omitted_from_rerank;
+    const evidence = data.evidence || {};
+    provenance.textContent =
+      "Advisory " + (data.source || "local") + " ranking" +
+      (data.provider ? " · " + data.provider + (data.model ? "/" + data.model : "") : "") +
+      (evidence.query_complete === false ? " · query evidence incomplete" : "") +
+      (evidence.incomplete ? " · " + evidence.incomplete + " incomplete corpus items" : "") +
+      (evidence.unavailable ? " · " + evidence.unavailable + " unavailable" : "") +
+      (omitted ? " · " + omitted + " candidates omitted by displayed/bounded ranking" : "");
+    root.appendChild(provenance);
     items.forEach((it) => {
       const row = document.createElement("div");
       row.className = "related-row";
       row.innerHTML =
         '<a class="mono" href="' +
-        escapeHtml(it.html_url || "#") +
+        escapeHtml(prUrl(it)) +
         '" target="_blank" rel="noopener">#' +
         it.number +
         '</a><span title="' +
@@ -1051,9 +1258,20 @@
         escapeHtml(it.title || "") +
         '</span><span class="muted">' +
         escapeHtml(it.group_id || "") +
-        '</span><span class="score">' +
-        Number(it.score || 0).toFixed(2) +
+        '</span><span class="score" title="' +
+        escapeHtml(it.score_kind || "advisory ranking signal") + '">' +
+        (it.score == null ? "advisory" : "advisory " + Number(it.score).toFixed(2)) +
         "</span>";
+      const rowEvidence = document.createElement("div");
+      rowEvidence.className = "related-evidence muted";
+      const input = it.input_truncation || {};
+      const completeness = !it.evidence
+        ? " · evidence status unknown"
+        : it.evidence.complete === true ? " · complete evidence" : " · incomplete evidence";
+      rowEvidence.textContent = (it.score_kind || "local advisory signal") + completeness +
+        (input.omitted_bytes ? " · " + input.omitted_bytes + " input bytes omitted" : "") +
+        (input.omitted_chunks ? " · " + input.omitted_chunks + " chunks omitted" : "");
+      row.appendChild(rowEvidence);
       row.addEventListener("click", (ev) => {
         if (ev.target.tagName === "A") return;
         if (it.group_id) state.selectedGroupId = it.group_id;
@@ -1087,6 +1305,8 @@
     const gen = ++fileQueueGen;
     const fromUrl = !!(opts && opts.fromUrl);
     const fileView = !!(opts && opts.fileView) || isFileView();
+    const page = (opts && opts.page) || 1;
+    const scrollRequest = opts && opts.scroll === false ? null : beginDiffScroll(path);
     state.selectedFile = path;
     state.fileQueue = { path: path, prs: [], loading: true, same_patch: [] };
     const extra = $("fileQueueBlock");
@@ -1096,18 +1316,20 @@
     else {
       renderFileQueue();
       const g = state.groups.find((x) => x.group_id === state.selectedGroupId);
-      if (g) renderDiffs(g, { scroll: true });
+      if (g) renderDiffs(g, { scrollRequest });
     }
     try {
-      const data = await api("/api/file?path=" + encodeURIComponent(path));
+      const identity = snapshotKey() + "|" + path + "|" + page;
+      const data = await requestOnce("file", identity,
+        "/api/file?path=" + encodeURIComponent(path) + "&page=" + page + "&page_size=40");
       if (gen !== fileQueueGen || state.selectedFile !== path) return;
       state.fileQueue = data;
       if (isFileView()) {
-        renderFileDetail({ scroll: true });
+        renderFileDetail({ scrollRequest });
       } else {
         renderFileQueue();
         const g2 = state.groups.find((x) => x.group_id === state.selectedGroupId);
-        if (g2) renderDiffs(g2, { scroll: true });
+        if (g2) renderDiffs(g2, { scrollRequest });
       }
     } catch (err) {
       if (gen !== fileQueueGen || state.selectedFile !== path) return;
@@ -1149,7 +1371,7 @@
       return;
     }
     const items = (fq && fq.prs) || [];
-    const extra = fq && fq.truncated ? " · +" + fq.truncated + " hidden" : "";
+    const extra = fq && fq.truncated ? " · " + fq.truncated + " on later pages" : "";
     root.className = "file-queue";
     root.innerHTML = "";
     const head = document.createElement("div");
@@ -1162,7 +1384,9 @@
       ((fq && fq.pr_count) || items.length) +
       " PRs" +
       extra +
-      (same.length ? " · " + same.length + " identical hunks (" + sameN + " PRs)" : "");
+      (same.length
+        ? " · this evidence page has " + sameN + " identical complete patches"
+        : "");
     root.appendChild(head);
     if (same.length) {
       const box = document.createElement("div");
@@ -1171,7 +1395,7 @@
         const row = document.createElement("div");
         row.className = "muted";
         row.textContent =
-          "same hunk ×" +
+          "server-verified same complete patch ×" +
           c.count +
           "  #" +
           (c.pr_numbers || []).join(" #");
@@ -1179,13 +1403,13 @@
       });
       root.appendChild(box);
     }
-    items.slice(0, 20).forEach((pr) => {
+    items.forEach((pr) => {
       const row = document.createElement("div");
       row.className = "hotspot-row";
       if (state.selectedPr === pr.number) row.classList.add("selected");
       row.innerHTML =
         '<a class="mono" href="' +
-        escapeHtml(pr.html_url || "#") +
+        escapeHtml(prUrl(pr)) +
         '" target="_blank" rel="noopener">#' +
         pr.number +
         '</a><span title="' +
@@ -1203,6 +1427,32 @@
       });
       root.appendChild(row);
     });
+    appendFilePager(root, false);
+  }
+
+  function appendFilePager(root, listItem) {
+    const fq = state.fileQueue;
+    if (!fq || (fq.pages || 1) <= 1) return;
+    const nav = document.createElement(listItem ? "li" : "div");
+    nav.className = "file-pagination";
+    const previous = document.createElement("button");
+    previous.type = "button";
+    previous.className = "btn";
+    previous.textContent = "Previous 40";
+    previous.disabled = (fq.page || 1) <= 1;
+    previous.addEventListener("click", () => openFileQueue(fq.path, {
+      fromUrl: true, fileView: isFileView(), page: (fq.page || 1) - 1, scroll: false,
+    }));
+    const next = document.createElement("button");
+    next.type = "button";
+    next.className = "btn";
+    next.textContent = "Next 40";
+    next.disabled = !fq.next_page;
+    next.addEventListener("click", () => openFileQueue(fq.path, {
+      fromUrl: true, fileView: isFileView(), page: fq.next_page, scroll: false,
+    }));
+    nav.append(previous, next);
+    root.appendChild(nav);
   }
 
   function prsByUser(name) {
@@ -1321,7 +1571,7 @@
 
   const LABEL_HELP = {
     unique: "one PR",
-    duplicate: "same files, same hunks",
+    duplicate: "duplicate candidate; confirm complete patch evidence",
     "related-theme": "same files, different hunks",
     "needs-look": "unclassified — read it",
     hardware: "hardware keywords",
@@ -1329,7 +1579,7 @@
     docs: "docs only",
     cosmetic: "theme / CSS",
     junk: "Junk pile — rejected or noise",
-    blessed: "Known pile — blessed or auto-approved",
+    approved: "you approved these exact reviewed revisions",
     rejected: "you rejected this",
     approve: "you trusted this",
     reject: "you rejected this",
@@ -1345,7 +1595,7 @@
     "docs",
     "cosmetic",
     "junk",
-    "blessed",
+    "approved",
     "rejected",
     "upgrade",
   ];
@@ -1355,7 +1605,7 @@
   }
 
   function ruleLabel(decision) {
-    if (decision === "approve") return "blessed";
+    if (decision === "approve") return "approved";
     if (decision === "reject") return "rejected";
     return decision || "";
   }
@@ -1392,9 +1642,11 @@
     const wrap = $("detailMembersWrap");
     const members = $("detailMembers");
     members.innerHTML = "";
-    memberVirtualizer = null;
+    disposeVirtualizer("member");
     wrap.classList.remove("virt");
     wrap.style.maxHeight = "";
+    wrap.style.overflow = "";
+    wrap.scrollTop = 0;
     members.style.position = "";
     members.style.height = "";
     const fq = state.fileQueue;
@@ -1443,6 +1695,7 @@
       members.appendChild(head);
       prs.forEach((pr) => members.appendChild(buildMemberLi(pr.number)));
     }
+    appendFilePager(members, true);
   }
 
   function renderFileDetail(diffOpts) {
@@ -1463,7 +1716,8 @@
     else if (fq && fq.error) meta = "error: " + fq.error;
     else {
       meta = count + " open PRs touch this file";
-      if (same.length) meta += " · " + same.length + " identical hunks (" + sameN + " PRs)";
+      if (same.length) meta += " · this evidence page has " + sameN +
+        " identical complete patches";
     }
     $("detailMeta").textContent = meta;
     $("detailPills").innerHTML = "";
@@ -1505,6 +1759,7 @@
     const firstTitle = (g.title_variants && g.title_variants[0]) || "";
     const cls = g.card_class || "needs-look";
     const decision = g.suggested_decision || "unique";
+    renderDecisionWarning(g);
 
     if (pr) {
       $("detailKicker").textContent = g.group_id + " · " + n + " PRs in this shape";
@@ -1534,8 +1789,8 @@
       $("detailMeta").textContent = rule
         ? "marked " + rule.decision
         : n >= 2
-          ? "same file-set. Bless once if the shape is safe."
-          : "singleton. Read it or wait for a twin.";
+          ? "same file-set; review every exact revision before approval."
+          : "single-member shape; review its exact revision directly.";
     }
 
     const pills = $("detailPills");
@@ -1543,7 +1798,7 @@
     pills.appendChild(makeLabelRow(cls));
     pills.appendChild(makeLabelRow(decision));
     if (rule) {
-      pills.appendChild(makeLabelRow(ruleLabel(rule.decision), rule.decision === "approve" ? "blessed" : rule.decision));
+      pills.appendChild(makeLabelRow(ruleLabel(rule.decision), rule.decision === "approve" ? "approved" : rule.decision));
     }
     fillLabelKey();
     const titles = (g.title_variants || []).filter((t) => t && t !== firstTitle);
@@ -1570,11 +1825,20 @@
     if (bodyCache[key]) return bodyCache[key];
     const gen = snapshotGen;
     const repo = state.repo || "omacom/omarchy";
-    const data = await api(
-      "/api/pr?number=" + encodeURIComponent(num) + "&repo=" + encodeURIComponent(repo)
-    );
-    if (gen === snapshotGen) bodyCache[key] = data;
-    return data;
+    const url = "/api/pr?number=" + encodeURIComponent(num) +
+      "&repo=" + encodeURIComponent(repo);
+    const pending = typeof requestOnce === "function"
+      ? requestOnce("body", key, url)
+      : api(url);
+    bodyCache[key] = pending;
+    try {
+      const data = await pending;
+      if (gen === snapshotGen) bodyCache[key] = data;
+      return data;
+    } catch (error) {
+      delete bodyCache[key];
+      throw error;
+    }
   }
 
   function renderPrBodies(g) {
@@ -1613,6 +1877,7 @@
           selected +
           " " +
           (pr.user || it.user || "") +
+          (it.legacy_unverified ? " · unverified legacy cache preview" : "") +
           (it.error ? " · " + it.error : "");
         const text = document.createElement("div");
         text.className = "pr-body-text";
@@ -1627,14 +1892,19 @@
     const wrap = $("detailMembersWrap");
     const members = $("detailMembers");
     const nums = g.pr_numbers || [];
+    const wasVirtual = wrap.classList.contains("virt");
     members.innerHTML = "";
-    memberVirtualizer = null;
+    disposeVirtualizer("member");
 
     const useVirt = nums.length > 40 && Virtualizer;
     wrap.classList.toggle("virt", !!useVirt);
 
     if (!useVirt) {
       wrap.style.maxHeight = "";
+      wrap.style.overflow = "";
+      if (wasVirtual) wrap.scrollTop = 0;
+      members.style.position = "";
+      members.style.height = "";
       nums.forEach((num) => members.appendChild(buildMemberLi(num)));
       return;
     }
@@ -1645,10 +1915,10 @@
     members.style.position = "relative";
     members.style.height = nums.length * 36 + "px";
 
-    memberVirtualizer = makeVirtualizer(wrap, nums.length, () => 36, 8, () => {
-      paintMembers(nums);
-    });
-    memberVirtualizer._didMount();
+    memberVirtualizer = mountVirtualizer(
+      "member",
+      makeVirtualizer(wrap, nums.length, () => 36, 8, () => paintMembers(nums))
+    );
     memberVirtualizer._willUpdate();
     paintMembers(nums);
   }
@@ -1683,56 +1953,74 @@
     if (state.selectedPr === num) li.classList.add("selected");
     const labelClass =
       pr.label === "auto:approved-shape" ? "label-auto" : "label-needs";
-    const href = pr.html_url || "#";
+    const href = prUrl(pr);
+    const localRevision = state.source === "fixtures" ? "local fixture" : "missing";
+    const identity = ["head " + (pr.head_sha || localRevision),
+      "base " + (pr.base_sha || localRevision),
+      "content " + (pr.content_digest || "missing")].join(" · ");
     li.innerHTML = `
       <a href="${escapeHtml(href)}" target="_blank" rel="noopener">#${num}</a>
       <span title="${escapeHtml(pr.title || "")}">${escapeHtml(pr.title || "")}</span>
       <button type="button" class="user muted">${escapeHtml(pr.user || "")}</button>
-      <span class="${labelClass}">${escapeHtml(pr.label || "")}</span>`;
+      <span class="${labelClass}">${escapeHtml(pr.label || "")}</span>
+      <span class="revision-id" title="${escapeHtml(identity)}">${escapeHtml(identity)}</span>`;
     bindUserLink(li.querySelector(".user"), pr.user);
     li.addEventListener("click", (ev) => {
       if (ev.target.tagName === "A") return;
       state.selectedPr = num;
-      renderDetail();
+      state.examinedMembers.add(num);
+      render();
     });
     return li;
   }
 
-  function prFileEntries(pr) {
-    const files = (pr && pr.files) || [];
-    if (!files.length) {
-      return ((pr && pr.paths) || []).map((p) => ({ path: p, patch: "" }));
-    }
-    if (typeof files[0] === "string") {
-      return files.map((p) => ({ path: p, patch: "" }));
-    }
-    return files.map((f) => ({ path: f.path, patch: f.patch || "" }));
+  function renderDecisionWarning(group) {
+    const root = $("decisionWarning");
+    if (!root) return;
+    const numbers = group.pr_numbers || [];
+    const incomplete = numbers.filter((number) => {
+      const pr = prByNumber(number);
+      const revisionKnown = state.source === "fixtures" || (pr && pr.head_sha && pr.base_sha);
+      return !pr || pr.evidence_complete !== true || !revisionKnown || !pr.content_digest;
+    });
+    const unexamined = numbers.filter((number) => !state.examinedMembers.has(number));
+    const complete = group.evidence_complete === true && incomplete.length === 0;
+    root.className = "decision-warning " + (complete ? "complete" : "incomplete");
+    root.textContent = numbers.length + " exact member revision" + (numbers.length === 1 ? "" : "s") +
+      " · snapshot " + (group.snapshot_digest || "identity missing") +
+      (unexamined.length ? " · " + unexamined.length + " not individually opened" : " · all opened") +
+      (incomplete.length ? " · " + incomplete.length + " incomplete" : " · complete evidence");
+    const approve = $("blessBtn");
+    approve.disabled = !complete;
+    approve.title = complete
+      ? "Approve only these repository-bound revisions"
+      : "Approval requires complete head, base, and content evidence for every member";
   }
 
-  function patchFor(pr, path) {
-    const entry = prFileEntries(pr).find((f) => f.path === path);
-    return entry ? entry.patch || "" : "";
-  }
-
-  async function renderOverlap(g) {
+  async function renderOverlap(g, options) {
     const gen = ++overlapGen;
     const summary = $("overlapSummary");
     const table = $("overlapMatrix");
     table.innerHTML = "";
     let ov = (state.overlap && state.overlap[g.group_id]) || null;
     const n = (g.pr_numbers || []).length;
-    if (ov && ov.lazy) {
-      summary.textContent =
-        "jaccard " +
-        (typeof ov.jaccard === "number" ? ov.jaccard.toFixed(2) : "?") +
-        " · " +
-        (ov.shared_n || 0) +
-        " shared · " +
-        (ov.unique_n || 0) +
-        " unique" +
-        (n > 24 ? " · " + n + " PRs (matrix capped)" : "");
+    const memberIndex = (g.pr_numbers || []).indexOf(state.selectedPr);
+    const memberPage = (options && options.memberPage) ||
+      (memberIndex >= 0 ? Math.floor(memberIndex / 24) + 1 : 1);
+    const rowPage = (options && options.rowPage) || 1;
+    if (!ov || ov.lazy || options || ov.member_page !== memberPage || ov.row_page !== rowPage) {
+      summary.textContent = ov
+        ? "jaccard " +
+          (typeof ov.jaccard === "number" ? ov.jaccard.toFixed(2) : "?") + " · " +
+          (ov.shared_n || 0) + " shared · " + (ov.unique_n || 0) + " unique" +
+          (n > 24 ? " · member pages of 24" : "")
+        : "Loading overlap facts…";
       try {
-        ov = await api("/api/overlap?group_id=" + encodeURIComponent(g.group_id));
+        ov = await requestOnce("overlap", snapshotKey() + "|" + g.group_id +
+          "|" + memberPage + "|" + rowPage,
+          "/api/overlap?group_id=" + encodeURIComponent(g.group_id) +
+          "&member_page=" + memberPage + "&member_page_size=24&row_page=" + rowPage +
+          "&row_page_size=80");
         if (gen !== overlapGen || state.selectedGroupId !== g.group_id) return;
         state.overlap[g.group_id] = ov;
       } catch (err) {
@@ -1749,10 +2037,11 @@
     const uniqueN = ov.unique_n != null ? ov.unique_n : (ov.unique || []).length;
     const jacc = typeof ov.jaccard === "number" ? ov.jaccard.toFixed(2) : "?";
     let extra = "";
-    if (ov.pr_truncated) extra += " · +" + ov.pr_truncated + " PRs hidden";
-    if (ov.row_truncated) extra += " · +" + ov.row_truncated + " files hidden";
+    if (ov.pr_truncated) extra += " · " + ov.pr_truncated + " PRs on other member pages";
+    if (ov.row_truncated) extra += " · " + ov.row_truncated + " files on other row pages";
     summary.textContent =
-      "jaccard " + jacc + " · " + sharedN + " shared · " + uniqueN + " unique" + extra;
+      "jaccard " + jacc + " · " + sharedN + " shared · " +
+      (ov.partial_n || 0) + " partial · " + uniqueN + " unique" + extra;
 
     const members = ov.pr_numbers || (g.pr_numbers || []).slice(0, 24);
     const thead = document.createElement("thead");
@@ -1777,7 +2066,9 @@
       tdPath.className = "path-cell";
       tdPath.innerHTML =
         escapeHtml(row.path) +
-        (row.same_patch ? ' <span class="same-label">same</span>' : "");
+        (row.same_patch_status === "same"
+          ? ' <span class="same-label">same complete patch</span>'
+          : "");
       tr.appendChild(tdPath);
       members.forEach((num) => {
         const td = document.createElement("td");
@@ -1794,19 +2085,65 @@
       tbody.appendChild(tr);
     });
     table.appendChild(tbody);
+    if ((ov.member_pages || 1) > 1 || (ov.row_pages || 1) > 1) {
+      const nav = document.createElement("caption");
+      nav.className = "matrix-pagination";
+      const memberBack = document.createElement("button");
+      memberBack.type = "button";
+      memberBack.className = "btn";
+      memberBack.textContent = "Previous members";
+      memberBack.disabled = (ov.member_page || 1) <= 1;
+      memberBack.addEventListener("click", () => renderOverlap(g, {
+        memberPage: (ov.member_page || 1) - 1, rowPage: ov.row_page || 1,
+      }));
+      const memberNext = document.createElement("button");
+      memberNext.type = "button";
+      memberNext.className = "btn";
+      memberNext.textContent = "Next members";
+      memberNext.disabled = !ov.next_member_page;
+      memberNext.addEventListener("click", () => renderOverlap(g, {
+        memberPage: ov.next_member_page, rowPage: ov.row_page || 1,
+      }));
+      const rowBack = document.createElement("button");
+      rowBack.type = "button";
+      rowBack.className = "btn";
+      rowBack.textContent = "Previous files";
+      rowBack.disabled = (ov.row_page || 1) <= 1;
+      rowBack.addEventListener("click", () => renderOverlap(g, {
+        memberPage: ov.member_page || 1, rowPage: (ov.row_page || 1) - 1,
+      }));
+      const rowNext = document.createElement("button");
+      rowNext.type = "button";
+      rowNext.className = "btn";
+      rowNext.textContent = "Next files";
+      rowNext.disabled = !ov.next_row_page;
+      rowNext.addEventListener("click", () => renderOverlap(g, {
+        memberPage: ov.member_page || 1, rowPage: ov.next_row_page,
+      }));
+      nav.append(memberBack, memberNext, rowBack, rowNext);
+      table.prepend(nav);
+    }
   }
 
 
   function prUrl(pr) {
-    if (pr && pr.html_url) return pr.html_url;
     const repo = state.repo || "omacom/omarchy";
-    return "https://github.com/" + repo + "/pull/" + (pr && pr.number ? pr.number : "");
+    const fallback = "https://github.com/" + repo + "/pull/" +
+      (pr && pr.number ? pr.number : "");
+    try {
+      const candidate = new URL((pr && pr.html_url) || fallback);
+      if (candidate.protocol === "https:" && candidate.hostname === "github.com") {
+        return candidate.href;
+      }
+    } catch (_) {}
+    return fallback;
   }
 
   function colorizeDiff(patch) {
     const hunkRe = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/;
     let oldN = 0;
     let newN = 0;
+    let sawHunk = false;
     const rows = [];
     function row(oldL, newL, text, cls) {
       rows.push(
@@ -1824,17 +2161,16 @@
     String(patch || "").split("\n").forEach((line) => {
       const m = line.match(hunkRe);
       if (m) {
+        sawHunk = true;
         oldN = parseInt(m[1], 10);
         newN = parseInt(m[2], 10);
         row("", "", line, "hunk");
         return;
       }
-      if (
-        line.startsWith("+++") ||
-        line.startsWith("---") ||
-        line.startsWith("diff ") ||
-        line.startsWith("index ")
-      ) {
+      if (!sawHunk && (
+        line.startsWith("+++") || line.startsWith("---") ||
+        line.startsWith("diff ") || line.startsWith("index ")
+      )) {
         row("", "", line, "meta");
         return;
       }
@@ -1854,29 +2190,70 @@
     });
     return rows.join("");
   }
-  let lastScrolledFile = null;
+  function cancelPendingDiffScroll() {
+    if (pendingDiffScrollFrame !== null) {
+      cancelAnimationFrame(pendingDiffScrollFrame);
+      pendingDiffScrollFrame = null;
+    }
+    pendingDiffScroll = null;
+  }
 
-  function scrollToDiff() {
-    const pane = document.querySelector(".pane.center");
-    const block = $("diffBlock");
-    if (!pane || !block) return;
-    const path = state.selectedFile;
-    lastScrolledFile = path;
-    requestAnimationFrame(() => {
+  function beginDiffScroll(path) {
+    cancelPendingDiffScroll();
+    const request = {
+      id: ++diffScrollSerial,
+      path,
+      groupId: state.selectedGroupId || null,
+      pr: state.selectedPr || null,
+      snapshot: snapshotKey(),
+    };
+    pendingDiffScroll = request;
+    return request;
+  }
+
+  function diffScrollMatches(request) {
+    return pendingDiffScroll === request &&
+      state.selectedFile === request.path &&
+      (state.selectedGroupId || null) === request.groupId &&
+      (state.selectedPr || null) === request.pr &&
+      snapshotKey() === request.snapshot;
+  }
+
+  function scheduleDiffScroll(request, generation) {
+    if (!request || !diffScrollMatches(request)) return;
+    if (pendingDiffScrollFrame !== null) cancelAnimationFrame(pendingDiffScrollFrame);
+    pendingDiffScrollFrame = requestAnimationFrame(() => {
+      pendingDiffScrollFrame = null;
+      if (!diffScrollMatches(request) || generation !== diffGen) return;
+      pendingDiffScroll = null;
+      const pane = document.querySelector(".pane.center");
+      const block = $("diffBlock");
+      if (!pane || !block) return;
       const paneRect = pane.getBoundingClientRect();
       const blockRect = block.getBoundingClientRect();
       pane.scrollTo({
         top: pane.scrollTop + blockRect.top - paneRect.top - 8,
-        behavior: "smooth",
+        behavior: "auto",
       });
     });
+  }
+
+  function cancelDiffScrollForUserIntent(event) {
+    const scrollKeys = new Set([
+      "ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " ", "Spacebar",
+    ]);
+    if (event.type !== "keydown" || scrollKeys.has(event.key)) cancelPendingDiffScroll();
+  }
+
+  function scrollToDiff(request, generation) {
+    scheduleDiffScroll(request, generation);
   }
 
   async function renderDiffs(g, opts) {
     const gen = ++diffGen;
     const root = $("diffPanels");
     const path = state.selectedFile;
-    const shouldScroll = !!(opts && opts.scroll);
+    const scrollRequest = opts && opts.scrollRequest;
     if (!path) {
       root.innerHTML = '<div class="muted diff-hint">Pick a file above to compare hunks.</div>';
       return;
@@ -1885,20 +2262,18 @@
       .map((p) => p.number)
       .filter(Boolean);
     let nums;
+    let allNums;
     if (g) {
       const groupSet = new Set(g.pr_numbers || []);
-      const groupOnFile = fqNums.filter((n) => groupSet.has(n));
       const selectedGroupPr = groupSet.has(state.selectedPr) ? state.selectedPr : null;
-      nums = takeWithSelected(
-        groupOnFile.length ? groupOnFile : (g.pr_numbers || []),
-        selectedGroupPr,
-        8
-      );
+      allNums = g.pr_numbers || [];
+      nums = takeWithSelected(allNums, selectedGroupPr, 8);
     } else {
       const selected = prByNumber(state.selectedPr);
       const selectedFilePr =
         selected && (selected.paths || []).includes(path) ? selected.number : null;
-      nums = takeWithSelected(fqNums, selectedFilePr, 8);
+      allNums = filePatchTargets(fqNums, selectedFilePr);
+      nums = takeWithSelected(allNums, selectedFilePr, 8);
     }
     if (!nums.length) {
       root.innerHTML =
@@ -1916,21 +2291,26 @@
       meta.textContent =
         path + " · " + nums.length + (g ? " PRs in this group" : " PRs on this file");
     }
-    if (shouldScroll) scrollToDiff();
     if (!root.querySelector(".diff-panel")) {
       root.innerHTML = '<div class="muted diff-hint">Loading patches…</div>';
     }
     const repo = state.repo || "omacom/omarchy";
+    const pageSize = 8;
+    const selectedIndex = allNums.indexOf(state.selectedPr);
+    const defaultPage = selectedIndex >= 0 ? Math.floor(selectedIndex / pageSize) + 1 : 1;
+    const page = (opts && opts.page) || defaultPage;
+    const target = g
+      ? "&group_id=" + encodeURIComponent(g.group_id)
+      : "&prs=" + allNums.join(",");
+    const url = "/api/patches?repo=" + encodeURIComponent(repo) + target +
+      "&path=" + encodeURIComponent(path) + "&page=" + page + "&page_size=" + pageSize +
+      "&patch_offset=0&patch_limit=6000";
     let data;
     try {
-      data = await api(
-        "/api/patches?repo=" +
-          encodeURIComponent(repo) +
-          "&prs=" +
-          nums.join(",") +
-          "&path=" +
-          encodeURIComponent(path)
-      );
+      data = typeof requestOnce === "function"
+        ? await requestOnce("patch", snapshotKey() + "|" +
+            (g ? g.group_id : allNums.join(",")) + "|" + path + "|" + page, url)
+        : await api(url);
     } catch (err) {
       if (gen !== diffGen) return;
       root.innerHTML =
@@ -1941,15 +2321,6 @@
     }
     if (gen !== diffGen) return;
     const items = data.items || [];
-    items.forEach((it) => {
-      const pr = prByNumber(it.number);
-      if (!pr) return;
-      const files = prFileEntries(pr);
-      const idx = files.findIndex((f) => f.path === path);
-      if (idx >= 0) files[idx].patch = it.patch || "";
-      else files.push({ path: path, patch: it.patch || "" });
-      pr.files = files;
-    });
     root.innerHTML = "";
     const withPatch = items.filter((it) => (it.patch || "").length);
     if (!items.length) {
@@ -1959,26 +2330,28 @@
         ".</div>";
       return;
     }
-    const firstItem = items[0] || {};
-    const firstPatch = firstItem.patch || "";
-    const firstComplete = firstItem.complete === true && firstPatch.length <= 4000;
+    const comparison = data.comparison || {};
+    if (meta) {
+      meta.textContent = path + " · page " + (data.page || page) + " of " +
+        (data.total_pages || 1) + " · " + (data.total_items || items.length) +
+        " target PRs · equality " +
+        (comparison.same_complete_patch == null ? "unknown/incomplete" :
+          comparison.same_complete_patch ? "same complete patch" : "different complete patches");
+    }
     items.forEach((it) => {
       const pr = prByNumber(it.number) || { number: it.number, user: "" };
       const patch = it.patch || "";
-      const displayTruncated = patch.length > 4000;
-      const complete = it.complete === true && !displayTruncated;
-      const same = complete && firstComplete && patch === firstPatch;
-      const comparison = !patch
+      const complete = it.evidence_complete === true;
+      const label = !patch
         ? "no patch"
         : !complete
-          ? "preview only"
-          : same
-            ? "same hunk"
-            : "different";
+          ? "incomplete preview"
+          : it.next_patch_offset != null
+            ? "complete source · more chunks"
+            : "complete";
       const panel = document.createElement("div");
       panel.className = "diff-panel";
       const href = prUrl(pr);
-      const shown = displayTruncated ? patch.slice(0, 4000) + "\n… truncated" : patch;
       panel.innerHTML =
         '<div class="diff-panel-head">' +
         '<a class="pr-link" href="' +
@@ -1992,38 +2365,147 @@
         escapeHtml(pr.user || "") +
         "</button>" +
         '<span class="diff-tag ' +
-        (same ? "same" : "diff") +
+        (complete ? "same" : "diff") +
         '">' +
-        comparison +
+        label +
         "</span></div>" +
         '<div class="diff-code">' +
-        colorizeDiff(shown || "(empty patch)") +
+        colorizeDiff(patch || "(empty patch)") +
         "</div>";
+      patchPanelState.set(panel, {
+        raw: patch,
+        busy: false,
+        generation: gen,
+        item: it,
+        pageData: data,
+        group: g,
+      });
+      if (it.content_sha256) {
+        const digest = document.createElement("div");
+        digest.className = "revision-id";
+        digest.textContent = "full patch sha256 " + it.content_sha256;
+        panel.appendChild(digest);
+      } else if ((it.incomplete_reasons || []).length) {
+        const reason = document.createElement("div");
+        reason.className = "revision-id incomplete-evidence";
+        reason.textContent = it.incomplete_reasons.join(" · ");
+        panel.appendChild(reason);
+      }
+      if (it.next_patch_offset != null) {
+        const more = document.createElement("button");
+        more.type = "button";
+        more.className = "btn patch-more";
+        more.textContent = "Load next patch chunk";
+        more.addEventListener("click", () => loadNextPatchChunk(g, data, it, panel));
+        panel.appendChild(more);
+      }
       root.appendChild(panel);
       bindUserLink(panel.querySelector("[data-user]"), pr.user);
     });
-    if (shouldScroll) scrollToDiff();
+    if ((data.total_pages || 1) > 1) {
+      const nav = document.createElement("div");
+      nav.className = "diff-pagination";
+      const previous = document.createElement("button");
+      previous.type = "button";
+      previous.className = "btn";
+      previous.textContent = "Previous 8";
+      previous.disabled = (data.page || page) <= 1;
+      previous.addEventListener("click", () => renderDiffs(g, { page: (data.page || page) - 1 }));
+      const next = document.createElement("button");
+      next.type = "button";
+      next.className = "btn";
+      next.textContent = "Next 8";
+      next.disabled = !data.next_page;
+      next.addEventListener("click", () => renderDiffs(g, { page: data.next_page }));
+      nav.append(previous, next);
+      root.appendChild(nav);
+    }
+    scrollToDiff(scrollRequest, gen);
     if (!withPatch.length) {
       const hint = document.createElement("div");
       hint.className = "muted diff-hint";
       hint.textContent = "Cached files have no patch for this path (binary or too large for GitHub).";
       root.prepend(hint);
     }
-    const byPatch = {};
-    items.forEach((it) => {
-      const patch = it.patch || "";
-      if (!patch || it.complete !== true || patch.length > 4000) return;
-      if (!byPatch[patch]) byPatch[patch] = [];
-      byPatch[patch].push(it.number);
-    });
-    const same = Object.keys(byPatch)
-      .map((k) => ({ pr_numbers: byPatch[k], count: byPatch[k].length }))
-      .filter((c) => c.count >= 2)
-      .sort((a, b) => b.count - a.count);
     if (state.fileQueue && state.fileQueue.path === path) {
-      state.fileQueue.same_patch = same;
+      state.fileQueue.same_patch = comparison.same_complete_patch === true && items.length >= 2
+        ? [{ pr_numbers: items.map((item) => item.number), count: items.length,
+             server_verified: true }]
+        : [];
       renderFileQueue();
     }
+  }
+
+  async function loadNextPatchChunk(group, pageData, item, panel) {
+    const panelState = patchPanelState.get(panel);
+    if (!panelState || panelState.busy) return;
+    const offset = panelState.item.next_patch_offset;
+    if (offset == null) return;
+    const button = panel.querySelector(".patch-more");
+    panelState.busy = true;
+    if (button) {
+      button.disabled = true;
+      button.textContent = "Loading patch chunk…";
+    }
+    const repo = state.repo;
+    const target = group
+      ? "&group_id=" + encodeURIComponent(group.group_id)
+      : "&prs=" + (pageData.items || []).map((row) => row.number).join(",");
+    const targetPage = group ? (pageData.page || 1) : 1;
+    const url = "/api/patches?repo=" + encodeURIComponent(repo) + target +
+      "&path=" + encodeURIComponent(item.path) + "&page=" + targetPage +
+      "&page_size=" + (pageData.page_size || 8) + "&patch_offset=" + offset +
+      "&patch_limit=6000";
+    const identity = snapshotKey() + "|chunk|" + item.number + "|" + item.path + "|" + offset;
+    try {
+      const data = await requestOnce("patch", identity, url);
+      if (panelState.generation !== diffGen || patchPanelState.get(panel) !== panelState) return;
+      const next = (data.items || []).find((row) => row.number === item.number);
+      if (!next) throw new Error("patch chunk was missing from the response");
+      const merged = mergePatchChunk(panelState.raw, offset, next);
+      panelState.raw = merged.raw;
+      item.patch = merged.raw;
+      item.next_patch_offset = merged.nextOffset;
+      const code = panel.querySelector(".diff-code");
+      code.innerHTML = colorizeDiff(panelState.raw || "(empty patch)");
+      if (button) {
+        if (merged.nextOffset == null) button.remove();
+        else button.textContent = "Load next patch chunk";
+      }
+    } catch (error) {
+      if (panelState.generation !== diffGen || patchPanelState.get(panel) !== panelState) return;
+      if (button) {
+        button.textContent = "Retry patch chunk";
+        button.title = error.message || "patch chunk failed";
+      }
+    } finally {
+      if (patchPanelState.get(panel) === panelState) {
+        panelState.busy = false;
+        if (button && button.isConnected) button.disabled = false;
+      }
+    }
+  }
+
+  function mergePatchChunk(raw, expectedOffset, next) {
+    const prefix = String(raw || "");
+    const prefixCodePoints = Array.from(prefix).length;
+    if (!next || prefixCodePoints !== expectedOffset ||
+        next.patch_offset !== expectedOffset || typeof next.patch !== "string") {
+      throw new Error("patch chunk offset did not match the requested prefix");
+    }
+    const endOffset = expectedOffset + Array.from(next.patch).length;
+    if ((next.next_patch_offset != null && next.next_patch_offset !== endOffset) ||
+        (next.next_patch_offset == null && Number.isInteger(next.patch_length) &&
+         next.patch_length !== endOffset)) {
+      throw new Error("patch chunk length did not match the server offsets");
+    }
+    return { raw: prefix + next.patch, nextOffset: next.next_patch_offset };
+  }
+
+  function filePatchTargets(numbers, selected) {
+    const unique = [...new Set(numbers || [])].filter(Boolean);
+    if (selected) return [selected, ...unique.filter((number) => number !== selected)].slice(0, 200);
+    return unique.slice(0, 200);
   }
 
   function takeWithSelected(numbers, selected, limit) {
@@ -2043,229 +2525,9 @@
       .replace(/"/g, "&quot;");
   }
 
-  function groupColor(groupId) {
-    let h = 0;
-    for (let i = 0; i < groupId.length; i++) h = (h * 31 + groupId.charCodeAt(i)) >>> 0;
-    const hue = h % 360;
-    return `hsl(${hue} 45% 42%)`;
-  }
-
-  function neighborhoodForGroup(g) {
-    const memberSet = new Set(g.pr_numbers || []);
-    const relevant = state.edges.filter(
-      (e) => memberSet.has(e.source) || memberSet.has(e.target)
-    );
-    const outsiderScores = new Map();
-    for (const e of relevant) {
-      const other = memberSet.has(e.source) ? e.target : e.source;
-      if (memberSet.has(other)) continue;
-      const prev = outsiderScores.get(other) || 0;
-      outsiderScores.set(other, Math.max(prev, e.weight));
-    }
-    const outsiders = [...outsiderScores.entries()]
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 8)
-      .map(([n]) => n);
-    const nodeIds = new Set([...memberSet, ...outsiders]);
-    const nodes = [...nodeIds].map((n) => {
-      const pr = prByNumber(n) || { number: n, label: "needs-human", group_id: null };
-      return {
-        id: n,
-        member: memberSet.has(n),
-        label: pr.label || "needs-human",
-        group_id: pr.group_id || (memberSet.has(n) ? g.group_id : null),
-        title: pr.title || "",
-      };
-    });
-    const edges = relevant.filter(
-      (e) => nodeIds.has(e.source) && nodeIds.has(e.target)
-    );
-    return { nodes, edges };
-  }
-
-  function drawGraph() {
-    const svg = $("graphSvg");
-    while (svg.firstChild) svg.removeChild(svg.firstChild);
-    const g = state.groups.find((x) => x.group_id === state.selectedGroupId);
-    if (!g) return;
-
-    if (state.showGroupGraph) {
-      drawGroupOverview(svg);
-      return;
-    }
-
-    const { nodes, edges } = neighborhoodForGroup(g);
-    runForceAndDraw(svg, nodes, edges, {
-      idKey: "id",
-      labelFn: (n) => "#" + n.id,
-      fillFn: (n) =>
-        n.label === "auto:approved-shape" ? "#34d399" : "#60a5fa",
-      ringFn: (n) => groupColor(n.group_id || "x"),
-      onClick: (n) => {
-        state.selectedPr = n.id;
-        renderDetail();
-      },
-      selectedId: state.selectedPr,
-    });
-  }
-
-  function drawGroupOverview(svg) {
-    const nodes = state.groups.map((g) => ({
-      id: g.group_id,
-      count: (g.pr_numbers || []).length,
-      decision: g.suggested_decision || "unique",
-    }));
-    const edges = state.group_edges || [];
-    runForceAndDraw(svg, nodes, edges, {
-      idKey: "id",
-      labelFn: (n) => n.id,
-      fillFn: () => "#a1a1aa",
-      ringFn: (n) => groupColor(n.id),
-      radiusFn: (n) => 8 + Math.min(18, n.count * 2),
-      onClick: (n) => {
-        state.selectedGroupId = n.id;
-        state.selectedPr = null;
-        state.selectedFile = null;
-        state.showGroupGraph = false;
-        $("groupGraphToggle").checked = false;
-        render();
-      },
-      selectedId: state.selectedGroupId,
-    });
-  }
-
-  function runForceAndDraw(svg, nodes, edges, opts) {
-    const W = 400;
-    const H = 280;
-    const cx = W / 2;
-    const cy = H / 2;
-    const n = nodes.length;
-    if (!n) {
-      const t = svgEl("text", {
-        x: cx,
-        y: cy,
-        "text-anchor": "middle",
-        class: "node-label",
-      });
-      t.textContent = "no edges";
-      svg.appendChild(t);
-      return;
-    }
-
-    nodes.forEach((node, i) => {
-      const a = (2 * Math.PI * i) / n - Math.PI / 2;
-      const r = 70 + Math.min(40, n * 2);
-      node.x = cx + Math.cos(a) * r;
-      node.y = cy + Math.sin(a) * r;
-      node.vx = 0;
-      node.vy = 0;
-    });
-    const byId = Object.fromEntries(nodes.map((node) => [node[opts.idKey], node]));
-
-    const iterations = 80;
-    for (let iter = 0; iter < iterations; iter++) {
-      for (let i = 0; i < n; i++) {
-        for (let j = i + 1; j < n; j++) {
-          let dx = nodes[i].x - nodes[j].x;
-          let dy = nodes[i].y - nodes[j].y;
-          let dist = Math.sqrt(dx * dx + dy * dy) || 0.01;
-          const force = 400 / (dist * dist);
-          dx = (dx / dist) * force;
-          dy = (dy / dist) * force;
-          nodes[i].vx += dx;
-          nodes[i].vy += dy;
-          nodes[j].vx -= dx;
-          nodes[j].vy -= dy;
-        }
-      }
-      for (const e of edges) {
-        const a = byId[e.source];
-        const b = byId[e.target];
-        if (!a || !b) continue;
-        let dx = b.x - a.x;
-        let dy = b.y - a.y;
-        let dist = Math.sqrt(dx * dx + dy * dy) || 0.01;
-        const ideal = 90 - Math.min(40, (e.weight || 0.5) * 40);
-        const force = (dist - ideal) * 0.05;
-        dx = (dx / dist) * force;
-        dy = (dy / dist) * force;
-        a.vx += dx;
-        a.vy += dy;
-        b.vx -= dx;
-        b.vy -= dy;
-      }
-      const cooling = 0.85 - (iter / iterations) * 0.5;
-      for (const node of nodes) {
-        node.vx += (cx - node.x) * 0.01;
-        node.vy += (cy - node.y) * 0.01;
-        node.x += node.vx * cooling;
-        node.y += node.vy * cooling;
-        node.vx *= 0.6;
-        node.vy *= 0.6;
-        node.x = Math.max(18, Math.min(W - 18, node.x));
-        node.y = Math.max(18, Math.min(H - 18, node.y));
-      }
-    }
-
-    for (const e of edges) {
-      const a = byId[e.source];
-      const b = byId[e.target];
-      if (!a || !b) continue;
-      const line = svgEl("line", {
-        x1: a.x,
-        y1: a.y,
-        x2: b.x,
-        y2: b.y,
-        class: "edge",
-        "stroke-width": Math.max(0.8, (e.weight || 0.5) * 2.5),
-      });
-      svg.appendChild(line);
-    }
-
-    for (const node of nodes) {
-      const gEl = svgEl("g", {
-        class: "node" + (node[opts.idKey] === opts.selectedId ? " selected" : ""),
-      });
-      const r = opts.radiusFn ? opts.radiusFn(node) : node.member === false ? 7 : 9;
-      const ring = svgEl("circle", {
-        cx: node.x,
-        cy: node.y,
-        r: r + 3,
-        fill: "none",
-        stroke: opts.ringFn(node),
-        "stroke-width": 2,
-      });
-      const circle = svgEl("circle", {
-        cx: node.x,
-        cy: node.y,
-        r: r,
-        fill: opts.fillFn(node),
-        stroke: node[opts.idKey] === opts.selectedId ? "#f59e0b" : "#18181b",
-        "stroke-width": node[opts.idKey] === opts.selectedId ? 2.5 : 1,
-      });
-      const label = svgEl("text", {
-        x: node.x,
-        y: node.y + r + 11,
-        "text-anchor": "middle",
-        class: "node-label",
-      });
-      label.textContent = opts.labelFn(node);
-      gEl.appendChild(ring);
-      gEl.appendChild(circle);
-      gEl.appendChild(label);
-      gEl.addEventListener("click", () => opts.onClick(node));
-      svg.appendChild(gEl);
-    }
-  }
-
-  function svgEl(name, attrs) {
-    const el = document.createElementNS("http://www.w3.org/2000/svg", name);
-    for (const [k, v] of Object.entries(attrs || {})) el.setAttribute(k, String(v));
-    return el;
-  }
-
   function render() {
     normalizeSelection();
+    if (state.selectedPr) state.examinedMembers.add(state.selectedPr);
     if (state.leftTab === "allprs") renderAllPrList();
     else if (state.leftTab === "queue") renderQueue();
     else renderGroupList();
@@ -2343,10 +2605,11 @@
 
   async function doFetch() {
     stateLoadGen += 1;
-    const source = "gh";
+    const source = $("source").value;
     const repo = $("repo").value.trim() || "omacom/omarchy";
     const limit = Number($("limit").value);
     const limitVal = Number.isFinite(limit) ? limit : 0;
+    const refresh = !!$("refresh").checked;
     $("fetchBtn").disabled = true;
     state.fetching = true;
     setStatus(source === "fixtures" ? "starting fixtures…" : "starting gh fetch…");
@@ -2354,7 +2617,7 @@
       await api("/api/fetch", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ source, repo, limit: limitVal }),
+        body: JSON.stringify({ source, repo, limit: limitVal, refresh }),
       });
       await pollProgressUntilDone();
       const gen = ++stateLoadGen;
@@ -2363,7 +2626,7 @@
       applyState(data);
       setStatus(`${state.prs.length} PRs · ${state.groups.length} groups`);
     } catch (err) {
-      if (err.status === 409) {
+      if (err.status === 409 && err.data && err.data.code === "fetch_busy") {
         setStatus(formatProgress(err.data) + " (already running)");
         try {
           await pollProgressUntilDone();
@@ -2375,8 +2638,15 @@
         } catch (e2) {
           setStatus("fetch error: " + e2.message);
         }
+      } else if (err.status === 409) {
+        setStatus("sync blocked: " + err.message);
       } else {
         setStatus("fetch error: " + err.message);
+        try {
+          const cached = await api("/api/state");
+          applyState(cached);
+          setStatus("sync failed; showing the last usable cached snapshot · " + err.message);
+        } catch (_) {}
       }
     } finally {
       state.fetching = false;
@@ -2390,7 +2660,26 @@
 
   async function doDecide(decision) {
     if (!state.selectedGroupId) return;
+    const group = groupById(state.selectedGroupId);
+    const membersComplete = group && (group.pr_numbers || []).every((number) => {
+      const pr = prByNumber(number);
+      const revisionKnown = state.source === "fixtures" || (pr && pr.head_sha && pr.base_sha);
+      return pr && pr.evidence_complete === true && revisionKnown && pr.content_digest;
+    });
+    if (decision === "approve" &&
+        (!group || group.evidence_complete !== true || !membersComplete)) {
+      setStatus("approval blocked: complete evidence is required for every revision");
+      return;
+    }
     const gen = ++stateLoadGen;
+    const retryIdentity = [snapshotKey(), state.selectedGroupId, decision].join("|");
+    let idempotencyKey = decisionRetries.get(retryIdentity);
+    if (!idempotencyKey) {
+      idempotencyKey = (window.crypto && typeof window.crypto.randomUUID === "function"
+        ? window.crypto.randomUUID() :
+        "decision-" + Date.now() + "-" + Math.random().toString(16).slice(2));
+      decisionRetries.set(retryIdentity, idempotencyKey);
+    }
     setStatus(decision + "…");
     try {
       const data = await api("/api/decide", {
@@ -2399,14 +2688,76 @@
         body: JSON.stringify({
           group_id: state.selectedGroupId,
           decision,
+          repo: state.repo,
+          expected_version: state.storeVersion,
+          idempotency_key: idempotencyKey,
         }),
       });
       if (gen !== stateLoadGen) return;
-      applyState(data);
-      setStatus(`rule saved: ${decision} ${state.selectedGroupId}`);
+      decisionRetries.delete(retryIdentity);
+      applyState(data.state);
+      setStatus(`decision saved: ${decision} ${group.group_id}`);
     } catch (err) {
       if (gen !== stateLoadGen) return;
-      setStatus("decide error: " + err.message);
+      if (err.status === 409) {
+        setStatus("decision not saved: evidence changed; reloading the current revisions");
+        await loadState();
+      } else {
+        setStatus("decide error: " + err.message + " · retry keeps the same request key");
+      }
+    }
+  }
+
+  async function doEnrich() {
+    const target = currentRelatedTarget();
+    if (!target.pr || !state.repo || enrichmentRequest) return;
+    const expectedSnapshot = snapshotKey();
+    const expectedRelatedGen = relatedGen;
+    const expectedVersion = state.storeVersion;
+    const identity = relatedTargetIdentity(expectedSnapshot, target.pr, target.path);
+    const advertised = state.related && state.related.enrichment;
+    const limit = Math.min(24, Math.max(1, Number((advertised && advertised.max_candidates) || 24)));
+    const request = { identity, controller: new AbortController() };
+    enrichmentRequest = request;
+    renderRelated();
+    setStatus("sending bounded patch evidence to the configured provider…");
+    try {
+      const result = await api("/api/enrich", {
+        method: "POST", signal: request.controller.signal, body: JSON.stringify({
+        repo: state.repo, pr: target.pr, path: target.path || undefined, limit,
+        allow_external: true, expected_version: expectedVersion,
+      }) });
+      const current = currentRelatedTarget();
+      if (enrichmentRequest !== request || !requestContextMatches(
+        expectedSnapshot, expectedRelatedGen, identity,
+        snapshotKey(), relatedGen,
+        relatedTargetIdentity(snapshotKey(), current.pr, current.path)
+      )) return;
+      state.related = result;
+      renderRelated();
+      setStatus("external ranking cached for this exact repository revision");
+    } catch (err) {
+      if (enrichmentRequest !== request || err.name === "AbortError") return;
+      const current = currentRelatedTarget();
+      if (!requestContextMatches(
+        expectedSnapshot, expectedRelatedGen, identity,
+        snapshotKey(), relatedGen,
+        relatedTargetIdentity(snapshotKey(), current.pr, current.path)
+      )) return;
+      if (err.status === 409) {
+        setStatus("enrichment cancelled: repository evidence changed; reloading");
+        await loadState();
+      } else {
+        setStatus("enrichment error: " + err.message);
+      }
+    } finally {
+      if (enrichmentRequest === request) {
+        enrichmentRequest = null;
+        const current = currentRelatedTarget();
+        if (relatedTargetIdentity(snapshotKey(), current.pr, current.path) === identity) {
+          renderRelated();
+        }
+      }
     }
   }
 
@@ -2415,6 +2766,7 @@
   $("hardwareBtn").addEventListener("click", () => doDecide("hardware"));
   $("upgradeBtn").addEventListener("click", () => doDecide("upgrade"));
   $("rejectBtn").addEventListener("click", () => doDecide("reject"));
+  $("enrichBtn").addEventListener("click", doEnrich);
   $("tabQueue").addEventListener("click", () => setLeftTab("queue"));
   $("tabGroups").addEventListener("click", () => setLeftTab("groups"));
   $("tabAllPrs").addEventListener("click", () => setLeftTab("allprs"));
@@ -2434,18 +2786,38 @@
     });
   }
   document.addEventListener("keydown", (e) => {
+    cancelDiffScrollForUserIntent(e);
     if (e.key === "Escape" && state.selectedUser) closeUserDrawer();
   });
+  const centerPane = document.querySelector(".pane.center");
+  if (centerPane) {
+    centerPane.addEventListener("wheel", cancelDiffScrollForUserIntent, { passive: true });
+    centerPane.addEventListener("touchstart", cancelDiffScrollForUserIntent, { passive: true });
+    centerPane.addEventListener("pointerdown", cancelDiffScrollForUserIntent, { passive: true });
+  }
   window.addEventListener("popstate", () => {
     if (writingUrl) return;
     alignSidebar = true;
     readUrl();
+    if ($("listFilter")) $("listFilter").value = state.filterQuery;
+    selectorCache.clear();
+    queueRowsCache = null;
+    paintLabelFilters();
     normalizeSelection();
     setLeftTab(state.leftTab, true);
     renderDetail();
     writeUrl(false);
     if (state.selectedFile) openFileQueue(state.selectedFile, { fromUrl: true });
     renderUserDrawer();
+  });
+  window.addEventListener("pagehide", () => {
+    cancelPendingDiffScroll();
+    ["group", "all", "queue", "member"].forEach(disposeVirtualizer);
+    for (const entry of resourceRequests.values()) entry.controller.abort();
+    resourceRequests.clear();
+  });
+  window.addEventListener("pageshow", (event) => {
+    if (event.persisted) render();
   });
 
   readUrl();
@@ -2459,5 +2831,5 @@
   }
   paintLabelFilters();
   paintPileNav();
-  loadState();
+  bootstrapSession(false).then(loadState).catch((error) => setStatus("session error: " + error.message));
 })();

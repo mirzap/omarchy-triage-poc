@@ -8,11 +8,11 @@
     "changed_files": [
       {
         "path": "config/hypr/bindings.conf",
-        "patch": "@@ -12,7 +12,7 @@\n-bind = SUPER, 1, workspace, 1\n+bind = SUPER, 1, workspace, 1, exact\n@@ -20,3 +20,4 @@\n+exec-once = hyprctl reload\n"
+        "patch": "@@ -12 +12 @@\n-bind = SUPER, 1, workspace, 1\n+bind = SUPER, 1, workspace, 1, exact\n@@ -20,0 +21 @@\n+exec-once = hyprctl reload\n"
       },
       {
         "path": "config/hypr/hyprland.conf",
-        "patch": "@@ -5,3 +5,4 @@\n+source = ./bindings.conf\n"
+        "patch": "@@ -5,0 +6 @@\n+source = ./bindings.conf\n"
       }
     ]
   },
@@ -25,11 +25,11 @@
     "changed_files": [
       {
         "path": "config/hypr/bindings.conf",
-        "patch": "@@ -12,7 +12,7 @@\n-bind = SUPER, 1, workspace, 1\n+bind = SUPER, 1, workspace, 1, exact\n@@ -20,3 +20,4 @@\n+exec-once = hyprctl reload\n"
+        "patch": "@@ -12 +12 @@\n-bind = SUPER, 1, workspace, 1\n+bind = SUPER, 1, workspace, 1, exact\n@@ -20,0 +21 @@\n+exec-once = hyprctl reload\n"
       },
       {
         "path": "config/hypr/hyprland.conf",
-        "patch": "@@ -5,3 +5,4 @@\n+source = ./bindings.conf\n"
+        "patch": "@@ -5,0 +6 @@\n+source = ./bindings.conf\n"
       }
     ]
   },
@@ -42,11 +42,11 @@
     "changed_files": [
       {
         "path": "config/hypr/bindings.conf",
-        "patch": "@@ -12,7 +12,7 @@\n-bind = SUPER, 1, workspace, 1\n+bind = SUPER, 1, workspace, 1, exact\n@@ -20,3 +20,4 @@\n+exec-once = hyprctl reload\n"
+        "patch": "@@ -12 +12 @@\n-bind = SUPER, 1, workspace, 1\n+bind = SUPER, 1, workspace, 1, exact\n@@ -20,0 +21 @@\n+exec-once = hyprctl reload\n"
       },
       {
         "path": "config/hypr/hyprland.conf",
-        "patch": "@@ -5,3 +5,4 @@\n+source = ./bindings.conf\n"
+        "patch": "@@ -5,0 +6 @@\n+source = ./bindings.conf\n"
       }
     ]
   },
@@ -59,11 +59,11 @@
     "changed_files": [
       {
         "path": "config/environment.d/nvidia.conf",
-        "patch": "@@ -1,3 +1,5 @@\n+GBM_BACKEND=nvidia-drm\n+__GLX_VENDOR_LIBRARY_NAME=nvidia\n"
+        "patch": "@@ -1,0 +1,2 @@\n+GBM_BACKEND=nvidia-drm\n+__GLX_VENDOR_LIBRARY_NAME=nvidia\n"
       },
       {
         "path": "config/hypr/nvidia.conf",
-        "patch": "@@ -1,2 +1,3 @@\n+env = WLR_NO_HARDWARE_CURSORS,1\n"
+        "patch": "@@ -1,0 +1 @@\n+env = WLR_NO_HARDWARE_CURSORS,1\n"
       }
     ]
   },
@@ -76,11 +76,11 @@
     "changed_files": [
       {
         "path": "config/environment.d/nvidia.conf",
-        "patch": "@@ -1,3 +1,5 @@\n+GBM_BACKEND=nvidia-drm\n+__GLX_VENDOR_LIBRARY_NAME=nvidia\n"
+        "patch": "@@ -1,0 +1,2 @@\n+GBM_BACKEND=nvidia-drm\n+__GLX_VENDOR_LIBRARY_NAME=nvidia\n"
       },
       {
         "path": "config/hypr/nvidia.conf",
-        "patch": "@@ -1,2 +1,3 @@\n+env = WLR_NO_HARDWARE_CURSORS,1\n"
+        "patch": "@@ -1,0 +1 @@\n+env = WLR_NO_HARDWARE_CURSORS,1\n"
       }
     ]
   },
@@ -93,11 +93,11 @@
     "changed_files": [
       {
         "path": "config/walker/themes/dark.css",
-        "patch": "@@ -0,0 +1,12 @@\n+window { background: #1a1a1a; color: #eee; }\n"
+        "patch": "@@ -0,0 +1 @@\n+window { background: #1a1a1a; color: #eee; }\n"
       },
       {
         "path": "config/walker/config.toml",
-        "patch": "@@ -3,2 +3,3 @@\n+theme = \"dark\"\n"
+        "patch": "@@ -3,0 +3 @@\n+theme = \"dark\"\n"
       }
     ]
   },
@@ -110,11 +110,11 @@
     "changed_files": [
       {
         "path": "config/walker/themes/omarchy-dark.css",
-        "patch": "@@ -0,0 +1,10 @@\n+.launcher { background: #111; }\n"
+        "patch": "@@ -0,0 +1 @@\n+.launcher { background: #111; }\n"
       },
       {
         "path": "config/walker/config.toml",
-        "patch": "@@ -3,2 +3,4 @@\n+theme = \"omarchy-dark\"\n+opacity = 0.95\n"
+        "patch": "@@ -3,0 +3,2 @@\n+theme = \"omarchy-dark\"\n+opacity = 0.95\n"
       }
     ]
   },
@@ -127,11 +127,11 @@
     "changed_files": [
       {
         "path": "hardware/framework/fprintd.conf",
-        "patch": "@@ -0,0 +1,5 @@\n+[fprintd]\n+enabled=true\n"
+        "patch": "@@ -0,0 +1,2 @@\n+[fprintd]\n+enabled=true\n"
       },
       {
         "path": "hardware/framework/pam.d/sudo",
-        "patch": "@@ -1,2 +1,3 @@\n+auth sufficient pam_fprintd.so\n"
+        "patch": "@@ -1,0 +1 @@\n+auth sufficient pam_fprintd.so\n"
       }
     ]
   },
@@ -144,11 +144,11 @@
     "changed_files": [
       {
         "path": "install.sh",
-        "patch": "@@ -40,6 +40,12 @@\n+if [[ \"${DRY_RUN:-}\" == 1 ]]; then echo dry-run; exit 0; fi\n"
+        "patch": "@@ -40,0 +40 @@\n+if [[ \"${DRY_RUN:-}\" == 1 ]]; then echo dry-run; exit 0; fi\n"
       },
       {
         "path": "scripts/bootstrap-arch.sh",
-        "patch": "@@ -10,3 +10,6 @@\n+curl -fsSL https://archlinux.org/mirrorlist/ >/dev/null || exit 1\n"
+        "patch": "@@ -10,0 +10 @@\n+curl -fsSL https://archlinux.org/mirrorlist/ >/dev/null || exit 1\n"
       }
     ]
   },
@@ -187,7 +187,7 @@
     "changed_files": [
       {
         "path": "package-lock.json",
-        "patch": "@@ -100,2 +100,2 @@\n-    \"left-pad\": \"1.0.0\"\n+    \"left-pad\": \"1.3.0\"\n"
+        "patch": "@@ -100 +100 @@\n-    \"left-pad\": \"1.0.0\"\n+    \"left-pad\": \"1.3.0\"\n"
       }
     ]
   }

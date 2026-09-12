@@ -1,0 +1,88 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  offline-contracts-and-wheel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GITHUB_TOKEN: ""
+      TOGETHER_API_KEY: ""
+      OPENROUTER_API_KEY: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - name: Install Python development tools
+        run: |
+          python -m pip install build pytest wheel
+          python -m pip install --no-deps -e .
+      - name: Run offline Python contracts
+        run: python -m pytest -q
+      - name: Check shipped JavaScript syntax
+        run: find triage/web -type f -name '*.js' -print0 | xargs -0 -n1 node --check
+      - name: Build wheel
+        run: python -m build --wheel --no-isolation
+      - name: Verify wheel assets and installed demo outside checkout
+        shell: bash
+        run: |
+          python - <<'PY'
+          import glob
+          import zipfile
+
+          wheel = glob.glob("dist/*.whl")
+          assert len(wheel) == 1, wheel
+          with zipfile.ZipFile(wheel[0]) as archive:
+              names = set(archive.namelist())
+          required = {
+              "triage/fixtures/prs.json",
+              "triage/fixtures/newcomers.json",
+              "triage/web/index.html",
+              "triage/web/app.js",
+              "triage/web/styles.css",
+              "triage/web/vendor/virtual.js",
+          }
+          assert required <= names, required - names
+          PY
+          python -m venv "$RUNNER_TEMP/wheel-env"
+          "$RUNNER_TEMP/wheel-env/bin/python" -m pip install --no-deps --no-index \
+            --disable-pip-version-check dist/*.whl
+          mkdir "$RUNNER_TEMP/outside-checkout"
+          cd "$RUNNER_TEMP/outside-checkout"
+          "$RUNNER_TEMP/wheel-env/bin/python" -I -m triage demo \
+            --store "$RUNNER_TEMP/outside-checkout/demo/store.json"
+          "$RUNNER_TEMP/wheel-env/bin/python" -I - <<'PY'
+          from pathlib import Path
+          import triage
+
+          root = Path(triage.__file__).parent
+          for relative in (
+              "fixtures/prs.json",
+              "fixtures/newcomers.json",
+              "web/index.html",
+              "web/app.js",
+              "web/styles.css",
+              "web/vendor/virtual.js",
+          ):
+              assert (root / relative).is_file(), relative
+          PY
+      - name: Rebuild locked frontend bundle and reject drift
+        shell: bash
+        run: |
+          cp triage/web/vendor/virtual.js "$RUNNER_TEMP/virtual.js.before"
+          npm ci
+          npm run build
+          cmp "$RUNNER_TEMP/virtual.js.before" triage/web/vendor/virtual.js
+          git diff --exit-code -- triage/web/vendor/virtual.js package.json package-lock.json

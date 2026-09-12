@@ -5,13 +5,21 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "omarchy-triage"
 version = "0.1.0"
-description = "POC for Omarchy PR group-triage: cluster lookalikes, bless groups, auto-classify matching shapes"
+description = "Local-first, revision-bound review queues for file-set PR groups"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = []
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0"]
+dev = ["build>=1.2", "pytest>=7.0"]
 
 [project.scripts]
 triage = "triage.cli:main"
@@ -26,4 +34,10 @@ pythonpath = ["."]
 
 
 [tool.setuptools.package-data]
-triage = ["web/*"]
+triage = [
+  "fixtures/*.json",
+  "web/*.css",
+  "web/*.html",
+  "web/*.js",
+  "web/vendor/*.js",
+]

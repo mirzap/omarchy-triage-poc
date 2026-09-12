@@ -88,16 +88,24 @@ a:hover { text-decoration: underline; }
 }
 .btn.danger { color: var(--danger); border-color: #7f1d1d; }
 .btn:disabled { opacity: 0.45; cursor: default; }
-.status {
-  margin-left: auto;
+.refresh-toggle {
+  display: flex;
+  align-items: center;
+  gap: 5px;
   color: var(--muted);
   padding-bottom: 7px;
+  white-space: nowrap;
+}
+.status-wrap { margin-left: auto; min-width: 0; text-align: right; }
+.status {
+  color: var(--muted);
   max-width: 420px;
   text-align: right;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
+.sync-meta { color: var(--muted); font-size: 10px; margin-top: 3px; }
 
 .layout {
   display: grid;
@@ -252,7 +260,7 @@ a:hover { text-decoration: underline; }
 .pill.duplicate { color: var(--accent); border-color: var(--accent-dim); }
 .pill.related-theme { color: #fda4af; border-color: #9f1239; }
 .pill.unique { color: var(--muted); }
-.pill.approve, .pill.blessed { color: var(--ok); border-color: #065f46; }
+.pill.approve, .pill.approved { color: var(--ok); border-color: #065f46; }
 .pill.reject, .pill.rejected { color: var(--danger); border-color: #7f1d1d; }
 .card-title {
   margin-top: 4px;
@@ -276,6 +284,28 @@ a:hover { text-decoration: underline; }
 }
 .detail-head .mono { font-size: 18px; }
 .actions { display: flex; gap: 8px; }
+.decision-warning {
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  background: #1c1917;
+  color: var(--muted);
+  padding: 8px 10px;
+  margin: -6px 0 14px;
+  border-radius: 4px;
+}
+.decision-warning.complete { border-left-color: var(--ok); }
+.decision-warning.incomplete { border-left-color: var(--danger); color: #fecaca; }
+.revision-id { font-family: var(--mono); color: var(--muted); font-size: 10px; }
+.external-enrichment { border-top: 1px solid var(--border); margin-top: 8px; padding-top: 8px; }
+.external-enrichment p { margin: 0 0 8px; max-width: 720px; }
+.file-pagination, .diff-pagination, .matrix-pagination {
+  display: flex;
+  gap: 8px;
+  padding: 8px 0;
+}
+.matrix-pagination { caption-side: bottom; text-align: left; }
+.patch-more { margin: 8px; }
+.incomplete-evidence { color: var(--danger); padding: 6px 8px; }
 .block { margin-bottom: 14px; }
 .block h3 {
   margin: 0 0 6px;
@@ -306,6 +336,11 @@ a:hover { text-decoration: underline; }
   border-radius: 4px;
   align-items: center;
 }
+.member-list li .revision-id {
+  grid-column: 2 / -1;
+  overflow-wrap: anywhere;
+  padding-bottom: 3px;
+}
 .member-list li:hover { background: var(--bg-elev); }
 .member-list li.selected {
   border-color: var(--accent-dim);
@@ -319,38 +354,6 @@ a:hover { text-decoration: underline; }
 .member-list a:hover { text-decoration: underline; }
 .label-needs { color: var(--needs); }
 .label-auto { color: var(--auto); }
-
-.graph-block { margin-top: 8px; }
-.graph-head {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-}
-.toggle {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  color: var(--muted);
-  font-size: 12px;
-}
-.graph {
-  width: 100%;
-  max-width: 520px;
-  height: 280px;
-  background: #0c0c0e;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  display: block;
-}
-.graph .edge { stroke: #52525b; stroke-opacity: 0.7; }
-.graph .node-label {
-  fill: #a1a1aa;
-  font-family: var(--mono);
-  font-size: 10px;
-  pointer-events: none;
-}
-.graph .node { cursor: pointer; }
-.graph .node.selected { stroke: var(--accent); stroke-width: 2.5; }
 
 @media (max-width: 1100px) {
   .layout { grid-template-columns: 240px 1fr; }
@@ -534,6 +537,8 @@ pre.diff .hunk { color: #71717a; }
 .related-list { display: flex; flex-direction: column; gap: 6px; }
 .related-row { display: grid; grid-template-columns: 64px 1fr auto auto; gap: 8px; align-items: center; font-size: 13px; }
 .related-row .score { font-variant-numeric: tabular-nums; color: #a1a1aa; }
+.related-provenance { padding-bottom: 4px; }
+.related-evidence { grid-column: 2 / -1; font-size: 10px; overflow-wrap: anywhere; }
 
 .btn.warn { color: #fbbf24; border-color: #92400e; }
 .pill.hardware { color: #fbbf24; border-color: #92400e; }
@@ -824,6 +829,7 @@ button.user-shape:hover { color: var(--text); }
 
 
 .detail.file-view .actions,
+.detail.file-view #decisionWarning,
 .detail.file-view .label-key,
 .detail.file-view #overlapBlock,
 .detail.file-view #fileQueueBlock {

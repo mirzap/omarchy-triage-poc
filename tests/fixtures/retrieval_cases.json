@@ -1,0 +1,24 @@
+{
+  "label": "CURATED SYNTHETIC retrieval regression cases; not maintainer-labeled production validation",
+  "k": 3,
+  "cases": [
+    {
+      "name": "exact numeric constant beats same-path hard negative",
+      "query": {"number": 1, "path": "config/server.toml", "patch": "@@ -1 +1 @@\n-port=1024\n+port=4096"},
+      "candidates": [
+        {"number": 2, "path": "config/server.toml", "patch": "@@ -1 +1 @@\n-port=1024\n+port=8192"},
+        {"number": 3, "path": "deploy/server.toml", "previous_path": "config/server.toml", "patch": "@@ -1 +1 @@\n-port=1024\n+port=4096"}
+      ],
+      "relevant": [3]
+    },
+    {
+      "name": "relocation recovered from changed content",
+      "query": {"number": 10, "path": "src/auth/session.py", "patch": "@@ -1 +1 @@\n-return legacy_cookie\n+return rotate_session_nonce"},
+      "candidates": [
+        {"number": 11, "path": "lib/security/token.py", "patch": "@@ -1 +1 @@\n-return legacy_cookie\n+return rotate_session_nonce"},
+        {"number": 12, "path": "src/auth/session.py", "patch": "@@ -1 +1 @@\n-timeout=10\n+timeout=20"}
+      ],
+      "relevant": [11]
+    }
+  ]
+}

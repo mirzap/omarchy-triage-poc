@@ -8,11 +8,11 @@
     "changed_files": [
       {
         "path": "config/hypr/bindings.conf",
-        "patch": "@@ -12,7 +12,7 @@\n-bind = SUPER, 1, workspace, 1\n+bind = SUPER, 1, workspace, 1, exact\n@@ -20,3 +20,4 @@\n+exec-once = hyprctl reload\n"
+        "patch": "@@ -12 +12 @@\n-bind = SUPER, 1, workspace, 1\n+bind = SUPER, 1, workspace, 1, exact\n@@ -20,0 +21 @@\n+exec-once = hyprctl reload\n"
       },
       {
         "path": "config/hypr/hyprland.conf",
-        "patch": "@@ -5,3 +5,4 @@\n+source = ./bindings.conf\n"
+        "patch": "@@ -5,0 +6 @@\n+source = ./bindings.conf\n"
       }
     ]
   },
@@ -25,11 +25,11 @@
     "changed_files": [
       {
         "path": "config/waybar/modules/bluetooth-battery.sh",
-        "patch": "@@ -0,0 +1,8 @@\n+#!/bin/bash\n+echo battery\n"
+        "patch": "@@ -0,0 +1,2 @@\n+#!/bin/bash\n+echo battery\n"
       },
       {
         "path": "config/waybar/config.jsonc",
-        "patch": "@@ -15,0 +16,3 @@\n+\"custom/bt-battery\": { \"exec\": \"bluetooth-battery.sh\" }\n"
+        "patch": "@@ -15,0 +16 @@\n+\"custom/bt-battery\": { \"exec\": \"bluetooth-battery.sh\" }\n"
       }
     ]
   }

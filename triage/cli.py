@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import argparse
 import sys
+import uuid
 from pathlib import Path
 
-from triage.dedupe import apply_fingerprints
-from triage.embed import Embedder
+from triage.gh import GhError
+from triage.github import GitHubError
 from triage.pipeline import (
     FIXTURES_DIR,
-    NEEDS_HUMAN_LABEL,
     format_groups,
     ingest,
     load_prs_from_json,
@@ -18,12 +18,15 @@ from triage.pipeline import (
 )
 from triage.store import (
     DEFAULT_STORE_PATH,
+    StoreConflictError,
+    StoreCorruptionError,
+    backup_store,
     decide_group,
     load_groups,
     load_rules,
     load_store,
+    restore_store,
 )
-
 
 DEMO_STORE_PATH = DEFAULT_STORE_PATH.with_name("demo-store.json")
 
@@ -68,6 +71,44 @@ def _isolated_store(args: argparse.Namespace, command: str) -> Path | None:
     return store
 
 
+def _normalized_source(source: str) -> str:
+    normalized = source.strip().lower()
+    return "github" if normalized in {"gh", "github"} else normalized
+
+
+def _workspace_matches_store(store: Path, repo: str, source: str) -> bool:
+    if not store.exists():
+        return True
+    data = load_store(store)
+    current = str(data.get("repo") or "").strip().strip("/").lower()
+    wanted = repo.strip().strip("/").lower()
+    current_source = _normalized_source(str(data.get("source") or ""))
+    wanted_source = _normalized_source(source)
+    populated = bool(
+        data.get("last_prs")
+        or data.get("last_groups")
+        or data.get("trusted_rules")
+        or current
+        or current_source
+    )
+    if current and current != wanted:
+        print(
+            f"Error: {store} contains repository {current}, not {wanted}. "
+            "Choose a separate --store for the other repository.",
+            file=sys.stderr,
+        )
+        return False
+    if populated and current_source != wanted_source:
+        print(
+            f"Error: {store} contains source {current_source or 'unknown'}, "
+            f"not {wanted_source}. "
+            "Choose a separate --store for the other source.",
+            file=sys.stderr,
+        )
+        return False
+    return True
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     if args.source == "fixtures":
         store = _isolated_store(args, "fixture run")
@@ -77,31 +118,57 @@ def cmd_run(args: argparse.Namespace) -> int:
         raw_store = getattr(args, "store", None)
         store = Path(raw_store).expanduser() if raw_store else DEFAULT_STORE_PATH
 
-    prs = ingest(source=args.source, repo=args.repo, limit=args.limit)
-    result = run_pipeline(
-        prs,
-        use_llm=args.llm,
-        persist=True,
-        store_path=store,
-        source=args.source,
-        repo=args.repo,
-    )
+    try:
+        if args.source == "fixtures" and (args.refresh or args.cached):
+            raise ValueError("--refresh/--cached apply only to GitHub sources")
+        if not _workspace_matches_store(store, args.repo, args.source):
+            return 2
+        progress: dict = {}
+        prs = ingest(
+            source=args.source,
+            repo=args.repo,
+            limit=args.limit,
+            refresh=bool(args.refresh),
+            progress=progress,
+        )
+        result = run_pipeline(
+            prs,
+            persist=True,
+            store_path=store,
+            source=args.source,
+            repo=args.repo,
+        )
+    except (
+        GhError,
+        GitHubError,
+        StoreConflictError,
+        StoreCorruptionError,
+        ValueError,
+    ) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
     print(f"Ingested {len(result['prs'])} PRs from {args.source}")
+    if args.source in {"gh", "github"}:
+        status = progress.get("cache_status") or "cached"
+        fetched_at = progress.get("fetched_at") or "unknown time"
+        print(f"Snapshot status: {status}; fetched at {fetched_at}")
     print(format_groups(result["groups"], result["prs"]))
     print(f"Stored groups in {store}")
     return 0
 
 
-def cmd_list_groups(_args: argparse.Namespace) -> int:
-    groups = load_groups()
+def cmd_list_groups(args: argparse.Namespace) -> int:
+    store = Path(args.store).expanduser()
+    groups = load_groups(store)
     if not groups:
         print("No groups in store. Run `triage run` or `triage demo` first.")
         return 0
-    data = load_store()
+    data = load_store(store)
     print(f"Last run PR numbers: {data.get('last_pr_numbers', [])}")
     # Reconstruct minimal PR stubs for labels if needed
     print(format_groups(groups))
-    rules = load_rules()
+    rules = load_rules(store)
     if rules:
         print("Trusted rules:")
         for r in rules:
@@ -113,9 +180,19 @@ def cmd_list_groups(_args: argparse.Namespace) -> int:
 
 
 def cmd_decide(args: argparse.Namespace) -> int:
+    store = Path(args.store).expanduser()
     try:
-        rule = decide_group(args.group_id, args.decision)
-    except (KeyError, ValueError) as exc:
+        state = load_store(store)
+        rule = decide_group(
+            args.group_id,
+            args.decision,
+            path=store,
+            expected_repo=str(state.get("repo") or ""),
+            expected_version=int(state.get("store_version", 0)),
+            idempotency_key=args.idempotency_key or f"cli-{uuid.uuid4()}",
+            actor=args.actor,
+        )
+    except (KeyError, ValueError, StoreConflictError, StoreCorruptionError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
     print(
@@ -130,12 +207,17 @@ def cmd_replay(args: argparse.Namespace) -> int:
     store = _isolated_store(args, "fixture replay")
     if store is None:
         return 2
+    try:
+        if not _workspace_matches_store(store, "omacom/omarchy", "fixtures"):
+            return 2
+    except (OSError, ValueError, StoreCorruptionError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
     base = load_prs_from_json(FIXTURES_DIR / "prs.json")
     newcomers = load_prs_from_json(FIXTURES_DIR / "newcomers.json")
     all_prs = base + newcomers
     result = run_pipeline(
         all_prs,
-        use_llm=args.llm,
         persist=True,
         store_path=store,
         apply_rules=True,
@@ -153,10 +235,7 @@ def cmd_replay(args: argparse.Namespace) -> int:
 
 
 def cmd_demo(args: argparse.Namespace) -> int:
-    """
-    Wow path: fixtures pipeline, human-approve largest duplicate group,
-    then queue two newcomers for manual review. Offline, zero env.
-    """
+    """Run the real local workflow against isolated fixtures."""
     store = _isolated_store(args, "demo")
     if store is None:
         return 2
@@ -169,6 +248,14 @@ def cmd_demo(args: argparse.Namespace) -> int:
         )
         return 2
     if store.exists():
+        try:
+            if not _workspace_matches_store(
+                store, "omacom/omarchy", "fixtures"
+            ):
+                return 2
+        except (OSError, ValueError, StoreCorruptionError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
         if not reset:
             print(
                 f"Error: demo store already exists: {store}. "
@@ -179,7 +266,9 @@ def cmd_demo(args: argparse.Namespace) -> int:
         if store.is_dir():
             print(f"Error: demo store path is a directory: {store}", file=sys.stderr)
             return 2
+        saved = backup_store(store)
         store.unlink()
+        print(f"Backed up previous demo store to {saved}")
     store.parent.mkdir(parents=True, exist_ok=True)
 
     print("=== Omarchy PR group-triage DEMO ===")
@@ -187,7 +276,6 @@ def cmd_demo(args: argparse.Namespace) -> int:
     prs = ingest(source="fixtures")
     result = run_pipeline(
         prs,
-        use_llm=args.llm,
         persist=True,
         store_path=store,
         apply_rules=False,
@@ -198,42 +286,21 @@ def cmd_demo(args: argparse.Namespace) -> int:
     print(f"Loaded {len(prs)} PRs; formed {len(groups)} groups\n")
     print(format_groups(groups, result["prs"]))
 
-    # Pick largest duplicate (or largest) group to bless
-    dupes = [g for g in groups if g.suggested_decision == "duplicate"]
-    if not dupes:
-        dupes = sorted(groups, key=lambda g: len(g.pr_numbers), reverse=True)
-    target = max(dupes, key=lambda g: len(g.pr_numbers))
-    print(f"Stage 2: human gate — approve largest duplicate group {target.group_id}")
-    print(f"  titles: {target.title_variants}")
-    print(f"  PRs: {target.pr_numbers}")
-    rule = decide_group(target.group_id, "approve", path=store)
-    print(f"  persisted {rule.rule_id}\n")
-
-    print("Stage 3: second ingest — 2 newcomers; auto-approval disabled")
+    print("Stage 2: second ingest — newcomers remain at the human gate")
     newcomers = load_prs_from_json(FIXTURES_DIR / "newcomers.json")
-    # Keep the stored rule centroid reproducible in a joint fixture corpus,
-    # while leaving every newcomer queued for the human gate.
-    combined = apply_fingerprints(list(prs) + list(newcomers))
-    docs = [p.text_for_embed for p in combined]
-    embedder = Embedder(n=3)
-    vectors = embedder.fit_transform(docs)
-
-    # Recompute blessed centroid in the joint space from the approved group's PRs
-    approved_nums = set(rule.created_from_prs)
-    member_vecs = [
-        vectors[i] for i, p in enumerate(combined) if p.number in approved_nums
-    ]
-    if member_vecs:
-        from triage.embed import mean_centroid
-
-        rule.centroid = mean_centroid(member_vecs)
-        from triage.store import upsert_rule
-
-        upsert_rule(rule, store)
+    second = run_pipeline(
+        list(prs) + list(newcomers),
+        persist=True,
+        store_path=store,
+        apply_rules=True,
+        source="fixtures",
+        repo="omacom/omarchy",
+    )
 
     print("Newcomer results:")
-    for pr in newcomers:
-        pr.label = NEEDS_HUMAN_LABEL
+    by_number = {pr.number: pr for pr in second["prs"]}
+    for newcomer in newcomers:
+        pr = by_number[newcomer.number]
         print(f"  #{pr.number} {pr.title!r}")
         print(f"    label={pr.label}  => NEEDS-HUMAN (manual review required)")
 
@@ -253,6 +320,60 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_backup(args: argparse.Namespace) -> int:
+    store = Path(args.store).expanduser()
+    destination = Path(args.output).expanduser() if args.output else None
+    try:
+        saved = backup_store(store, destination)
+    except (OSError, ValueError, StoreCorruptionError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    print(f"Validated backup written to {saved}")
+    return 0
+
+
+def cmd_restore(args: argparse.Namespace) -> int:
+    store = Path(args.store).expanduser()
+    source = Path(args.source).expanduser()
+    if args.confirm_restore != str(store):
+        print(
+            "Error: --confirm-restore must exactly match the --store target.",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        previous = restore_store(store, source)
+    except (OSError, ValueError, StoreCorruptionError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    print(f"Restored {source} to {store}; prior target retained at {previous}")
+    return 0
+
+
+def cmd_history(args: argparse.Namespace) -> int:
+    try:
+        data = load_store(Path(args.store).expanduser())
+    except StoreCorruptionError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    events = data.get("decision_events") or []
+    legacy = data.get("legacy_decision_history") or []
+    for event in events:
+        print(
+            f"{event.get('decided_at', '')} {event.get('actor', '')} "
+            f"{event.get('repo', '')} {event.get('group_id', '')} "
+            f"{event.get('decision', '')} {event.get('snapshot_digest', '')}"
+        )
+    for rule in legacy:
+        print(
+            f"legacy-unverified {rule.get('repo', '')} "
+            f"{rule.get('group_id', '')} {rule.get('decision', '')}"
+        )
+    if not events and not legacy:
+        print("No decision history.")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="triage",
@@ -261,7 +382,6 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_demo = sub.add_parser("demo", help="Offline wow path with fixtures + newcomers")
-    p_demo.add_argument("--llm", action="store_true", help="Enable LLM stub note")
     p_demo.add_argument(
         "--store",
         help=f"Isolated store path (default: {DEMO_STORE_PATH})",
@@ -284,9 +404,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--limit",
         type=int,
         default=0,
-        help="Max open PRs to fetch (0 = all, default).",
+        help="Max PR file scopes to refresh (0 = all); all open PRs remain visible.",
     )
-    p_run.add_argument("--llm", action="store_true")
+    cache_mode = p_run.add_mutually_exclusive_group()
+    cache_mode.add_argument(
+        "--refresh",
+        action="store_true",
+        help="Explicitly refresh GitHub; cached mode is the default.",
+    )
+    cache_mode.add_argument(
+        "--cached",
+        action="store_true",
+        help="Use local cache only (default); never contacts GitHub.",
+    )
     p_run.add_argument(
         "--store",
         help=(
@@ -297,30 +427,55 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.set_defaults(func=cmd_run)
 
     p_list = sub.add_parser("list-groups", help="Show last run groups")
+    p_list.add_argument("--store", default=str(DEFAULT_STORE_PATH))
     p_list.set_defaults(func=cmd_list_groups)
 
     p_decide = sub.add_parser("decide", help="Approve or reject a group")
     p_decide.add_argument("group_id")
-    p_decide.add_argument("decision", choices=["approve", "reject"])
+    p_decide.add_argument(
+        "decision", choices=["approve", "reject", "hardware", "upgrade"]
+    )
+    p_decide.add_argument("--store", default=str(DEFAULT_STORE_PATH))
+    p_decide.add_argument("--actor", default="local-cli")
+    p_decide.add_argument("--idempotency-key")
     p_decide.set_defaults(func=cmd_decide)
 
     p_replay = sub.add_parser(
         "replay",
         help="Re-run fixtures + newcomers against persisted rules",
     )
-    p_replay.add_argument("--llm", action="store_true")
     p_replay.add_argument(
         "--store",
         help=f"Isolated store path (default: {DEMO_STORE_PATH})",
     )
     p_replay.set_defaults(func=cmd_replay)
 
-    p_serve = sub.add_parser("serve", help="Local group-queue + neighborhood dashboard")
+    p_serve = sub.add_parser("serve", help="Local group-review dashboard")
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8741)
     p_serve.add_argument("--no-open", action="store_true", help="Do not open browser")
     p_serve.add_argument("--store", default=str(DEFAULT_STORE_PATH))
     p_serve.set_defaults(func=cmd_serve)
+
+    p_backup = sub.add_parser("backup", help="Create a validated store backup")
+    p_backup.add_argument("--store", default=str(DEFAULT_STORE_PATH))
+    p_backup.add_argument("--output")
+    p_backup.set_defaults(func=cmd_backup)
+
+    p_restore = sub.add_parser("restore", help="Restore a validated store backup")
+    p_restore.add_argument("source")
+    p_restore.add_argument("--store", required=True, help="Explicit restore target")
+    p_restore.add_argument(
+        "--confirm-restore",
+        required=True,
+        metavar="TARGET",
+        help="Must exactly repeat the --store target",
+    )
+    p_restore.set_defaults(func=cmd_restore)
+
+    p_history = sub.add_parser("history", help="Show immutable decision history")
+    p_history.add_argument("--store", default=str(DEFAULT_STORE_PATH))
+    p_history.set_defaults(func=cmd_history)
 
     return parser
 

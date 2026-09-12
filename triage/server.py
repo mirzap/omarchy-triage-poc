@@ -1,24 +1,32 @@
-"""Local stdlib dashboard server for Omarchy triage (read-only re: GitHub)."""
+"""Secure loopback-only stdlib server for the local triage dashboard."""
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import ipaddress
 import json
 import mimetypes
+import re
+import secrets
+import socket
 import threading
+import time
 import traceback
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote_to_bytes, urlsplit
 
-from triage.gh import cached_pr_files, cached_pr_meta
+from triage import gh as gh_module
+from triage import rank as rank_module
+from triage import store as store_module
 from triage.github import parse_repo
+from triage.models import ChangedFile, PullRequest
 from triage.pipeline import ingest, run_pipeline
-from triage.rank import related
 from triage.store import (
     DEFAULT_STORE_PATH,
-    decide_group,
     load_store,
     overlap_for_group,
     prs_for_path,
@@ -26,33 +34,150 @@ from triage.store import (
 )
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
+MAX_BODY_BYTES = 64 * 1024
+MAX_URL_BYTES = 8 * 1024
+MAX_FETCH_LIMIT = 5_000
+MAX_ENRICH_CANDIDATES = 24
+MAX_PATCH_PRS = 200
+MAX_PATCH_PAGE_SIZE = 8
+MAX_PATCH_CHUNK = 16_384
+BODY_TIMEOUT_SECONDS = 2.0
+RESPONSE_WRITE_TIMEOUT_SECONDS = 5.0
+MAX_REQUEST_THREADS = 16
+_GROUP_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
+_IDEMPOTENCY_KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{7,127}\Z")
 
-# Shared async-fetch progress (module-level so handler instances share it)
+
+class RequestProblem(Exception):
+    def __init__(self, status: int, code: str, message: str) -> None:
+        super().__init__(message)
+        self.status, self.code, self.message = status, code, message
+
+
+class RequestDeadlineExceeded(Exception):
+    """The absolute request-ingress deadline expired."""
+
+
+class _DeadlineReader:
+    """Small socket reader whose deadline cannot be extended by byte drips."""
+
+    def __init__(self, connection: socket.socket) -> None:
+        self.connection = connection
+        self.buffer = bytearray()
+        self.deadline: float | None = None
+        self.closed = False
+
+    def set_deadline(self, deadline: float | None) -> None:
+        self.deadline = deadline
+
+    def _recv(self) -> bytes:
+        if self.deadline is None:
+            raise RuntimeError("request deadline is not active")
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise RequestDeadlineExceeded
+        self.connection.settimeout(remaining)
+        try:
+            return self.connection.recv(8192)
+        except TimeoutError as exc:
+            raise RequestDeadlineExceeded from exc
+
+    def readline(self, limit: int = -1) -> bytes:
+        while True:
+            bounded = len(self.buffer) if limit < 0 else min(len(self.buffer), limit)
+            newline = self.buffer.find(b"\n", 0, bounded)
+            if newline >= 0:
+                end = newline + 1
+                result = bytes(self.buffer[:end])
+                del self.buffer[:end]
+                return result
+            if limit >= 0 and len(self.buffer) >= limit:
+                result = bytes(self.buffer[:limit])
+                del self.buffer[:limit]
+                return result
+            chunk = self._recv()
+            if not chunk:
+                result = bytes(self.buffer)
+                self.buffer.clear()
+                return result
+            self.buffer.extend(chunk)
+
+    def read(self, size: int = -1) -> bytes:
+        if size < 0:
+            chunks = [bytes(self.buffer)]
+            self.buffer.clear()
+            while True:
+                chunk = self._recv()
+                if not chunk:
+                    return b"".join(chunks)
+                chunks.append(chunk)
+        while len(self.buffer) < size:
+            chunk = self._recv()
+            if not chunk:
+                break
+            self.buffer.extend(chunk)
+        result = bytes(self.buffer[:size])
+        del self.buffer[:size]
+        return result
+
+    def close(self) -> None:
+        self.closed = True
+        self.buffer.clear()
+
+
+class BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    """Thread-per-connection server with a hard active-handler ceiling."""
+
+    def __init__(self, *args: Any, max_request_threads: int = MAX_REQUEST_THREADS,
+                 **kwargs: Any) -> None:
+        if max_request_threads < 1:
+            raise ValueError("max_request_threads must be positive")
+        self.max_request_threads = max_request_threads
+        self._request_slots = threading.BoundedSemaphore(max_request_threads)
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request: socket.socket, client_address: Any) -> None:
+        if not self._request_slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._request_slots.release()
+            raise
+
+    def process_request_thread(self, request: socket.socket, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._request_slots.release()
+
+
 _fetch_lock = threading.Lock()
 _fetch_progress: dict[str, Any] = {
-    "running": False,
-    "phase": "",
-    "done": 0,
-    "total": 0,
-    "error": None,
-    "ready": False,
-    "message": "",
+    "running": False, "phase": "", "done": 0, "total": 0, "error": None,
+    "ready": False, "message": "", "repo": "", "refresh": False,
 }
 _fetch_thread: threading.Thread | None = None
 
 
+def _progress_unlocked() -> dict[str, Any]:
+    return {
+        "running": bool(_fetch_progress["running"]),
+        "phase": _fetch_progress.get("phase") or "",
+        "done": int(_fetch_progress.get("done") or 0),
+        "total": int(_fetch_progress.get("total") or 0),
+        "error": _fetch_progress.get("error"),
+        "ready": bool(_fetch_progress.get("ready")),
+        "message": _fetch_progress.get("message") or "",
+        "repo": _fetch_progress.get("repo") or "",
+        "refresh": bool(_fetch_progress.get("refresh")),
+    }
+
+
 def get_fetch_progress() -> dict[str, Any]:
-    """Snapshot of current fetch progress for GET /api/progress."""
     with _fetch_lock:
-        return {
-            "running": bool(_fetch_progress["running"]),
-            "phase": _fetch_progress.get("phase") or "",
-            "done": int(_fetch_progress.get("done") or 0),
-            "total": int(_fetch_progress.get("total") or 0),
-            "error": _fetch_progress.get("error"),
-            "ready": bool(_fetch_progress.get("ready")),
-            "message": _fetch_progress.get("message") or "",
-        }
+        return _progress_unlocked()
 
 
 def _set_progress(**fields: Any) -> None:
@@ -60,27 +185,13 @@ def _set_progress(**fields: Any) -> None:
         _fetch_progress.update(fields)
 
 
-def ensure_initial_fixtures(store_path: Path = DEFAULT_STORE_PATH) -> None:
-    """Do not seed fixtures. Real gh cache/store only."""
-    return
-
-
-def run_fetch(
-    source: str,
-    repo: str,
-    limit: int,
-    store_path: Path = DEFAULT_STORE_PATH,
-    progress: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Synchronous fetch + pipeline. Used by unit tests and the background worker."""
-    print(f"[serve] fetch source={source} repo={repo} limit={limit}", flush=True)
+def run_fetch(source: str, repo: str, limit: int,
+              store_path: Path = DEFAULT_STORE_PATH,
+              progress: dict[str, Any] | None = None, *, refresh: bool = False) -> dict[str, Any]:
+    """Synchronously ingest and recompute; used by the worker and unit tests."""
+    print(f"[serve] fetch source={source} repo={repo} limit={limit} refresh={refresh}", flush=True)
     if progress is not None:
-        progress.update(
-            phase="ingest",
-            done=0,
-            total=0,
-            message=f"ingesting ({source})",
-        )
+        progress.update(phase="ingest", done=0, total=0, message=f"ingesting ({source})")
 
     def on_progress(snap: dict[str, Any]) -> None:
         if progress is None:
@@ -91,121 +202,31 @@ def run_fetch(
             total=snap.get("total", progress.get("total", 0)),
             message=snap.get("message", ""),
         )
-        # Mirror into module progress when this is the live worker dict
-        _set_progress(
-            phase=progress.get("phase", ""),
-            done=progress.get("done", 0),
-            total=progress.get("total", 0),
-            message=progress.get("message", ""),
-        )
+        _set_progress(**{k: progress.get(k) for k in ("phase", "done", "total", "message")})
 
-    prs = ingest(
-        source=source,
-        repo=repo,
-        limit=limit,
-        progress=progress,
-        on_progress=on_progress if progress is not None else None,
-    )
+    prs = ingest(source=source, repo=repo, limit=limit, refresh=refresh,
+                 progress=progress,
+                 on_progress=on_progress if progress is not None else None)
     if progress is not None:
-        progress.update(
-            phase="pipeline",
-            done=len(prs),
-            total=len(prs),
-            message=f"clustering {len(prs)} PRs",
-        )
-        _set_progress(
-            phase="pipeline",
-            done=len(prs),
-            total=len(prs),
-            message=f"clustering {len(prs)} PRs",
-        )
-    run_pipeline(
-        prs,
-        persist=True,
-        store_path=store_path,
-        apply_rules=True,
-        source=source,
-        repo=repo,
-    )
-    return ui_state(store_path)
+        message = f"clustering {len(prs)} PRs"
+        progress.update(phase="pipeline", done=len(prs), total=len(prs), message=message)
+        _set_progress(phase="pipeline", done=len(prs), total=len(prs), message=message)
+    run_pipeline(prs, persist=True, store_path=store_path, apply_rules=True,
+                 source=source, repo=repo)
+    return _state_payload(store_path)
 
 
-def _fetch_worker(
-    source: str,
-    repo: str,
-    limit: int,
-    store_path: Path,
-) -> None:
-    local_progress: dict[str, Any] = {
-        "phase": "starting",
-        "done": 0,
-        "total": 0,
-        "message": "starting",
-    }
+def _fetch_worker(source: str, repo: str, limit: int, refresh: bool, store_path: Path) -> None:
+    local = {"phase": "starting", "done": 0, "total": 0, "message": "starting"}
     try:
-        run_fetch(source, repo, limit, store_path=store_path, progress=local_progress)
-        _set_progress(
-            running=False,
-            phase="done",
-            error=None,
-            ready=True,
-            message=local_progress.get("message") or "ready",
-            done=local_progress.get("done", 0),
-            total=local_progress.get("total", 0),
-        )
-    except Exception as exc:  # noqa: BLE001
+        run_fetch(source, repo, limit, store_path=store_path, progress=local, refresh=refresh)
+        _set_progress(running=False, phase="done", error=None, ready=True,
+                      message=local.get("message") or "ready", done=local.get("done", 0),
+                      total=local.get("total", 0))
+    except Exception:  # noqa: BLE001
         traceback.print_exc()
-        _set_progress(
-            running=False,
-            phase="error",
-            error=str(exc),
-            ready=False,
-            message=str(exc),
-        )
-
-
-def start_fetch_async(
-    source: str,
-    repo: str,
-    limit: int,
-    store_path: Path = DEFAULT_STORE_PATH,
-) -> dict[str, Any]:
-    """
-    Start a daemon fetch thread if none is running.
-    Returns {"started": True} or raises FetchBusyError.
-    """
-    global _fetch_thread
-    with _fetch_lock:
-        if _fetch_progress.get("running"):
-            snap = {
-                "running": True,
-                "phase": _fetch_progress.get("phase") or "",
-                "done": int(_fetch_progress.get("done") or 0),
-                "total": int(_fetch_progress.get("total") or 0),
-                "error": _fetch_progress.get("error"),
-                "ready": bool(_fetch_progress.get("ready")),
-                "message": _fetch_progress.get("message") or "",
-            }
-            raise FetchBusyError(snap)
-        _fetch_progress.update(
-            {
-                "running": True,
-                "phase": "starting",
-                "done": 0,
-                "total": 0,
-                "error": None,
-                "ready": False,
-                "message": "starting",
-            }
-        )
-        _fetch_thread = threading.Thread(
-            target=_fetch_worker,
-            args=(source, repo, limit, store_path),
-            daemon=True,
-            name="triage-fetch",
-        )
-        _fetch_thread.start()
-        return {"started": True}
+        message = "refresh failed; the last usable snapshot was preserved"
+        _set_progress(running=False, phase="error", error=message, ready=False, message=message)
 
 
 class FetchBusyError(RuntimeError):
@@ -214,235 +235,775 @@ class FetchBusyError(RuntimeError):
         self.progress = progress
 
 
+def start_fetch_async(source: str, repo: str, limit: int,
+                      store_path: Path = DEFAULT_STORE_PATH, *, refresh: bool = False) -> dict[str, Any]:
+    global _fetch_thread
+    with _fetch_lock:
+        if _fetch_progress.get("running"):
+            raise FetchBusyError(_progress_unlocked())
+        _fetch_progress.update(running=True, phase="starting", done=0, total=0,
+                               error=None, ready=False, message="starting", repo=repo,
+                               refresh=refresh)
+        _fetch_thread = threading.Thread(
+            target=_fetch_worker, args=(source, repo, limit, refresh, store_path),
+            daemon=True, name="triage-fetch",
+        )
+        _fetch_thread.start()
+    return {"started": True, "repo": repo, "refresh": refresh, "limit": limit}
+
+
+def _repo_key(value: Any) -> str:
+    repo = str(value or "").strip().strip("/").lower()
+    if not repo or len(repo) > 200:
+        raise RequestProblem(400, "invalid_repo", "repo must be owner/name")
+    try:
+        owner, name = parse_repo(repo)
+    except ValueError as exc:
+        raise RequestProblem(400, "invalid_repo", "repo must be owner/name") from exc
+    if f"{owner}/{name}".lower() != repo:
+        raise RequestProblem(400, "invalid_repo", "repo must be canonical owner/name")
+    return repo
+
+
+def _safe_file_path(value: Any) -> str:
+    path = str(value or "")
+    if not path or len(path.encode()) > 1024 or "\x00" in path:
+        raise RequestProblem(400, "invalid_path", "path is required and must be at most 1024 bytes")
+    pure = PurePosixPath(path)
+    if pure.is_absolute() or any(part in {"", ".", ".."} for part in pure.parts):
+        raise RequestProblem(400, "invalid_path", "path must be repository-relative")
+    return path
+
+
+def _state_payload(store_path: Path) -> dict[str, Any]:
+    state = ui_state(store_path)
+    repo, source = str(state.get("repo") or ""), str(state.get("source") or "")
+    if repo and source in {"gh", "github"}:
+        try:
+            owner, name = parse_repo(repo)
+            stored = load_store(store_path)
+            snapshots = [
+                str(pr.get("cache_snapshot_id") or "")
+                for pr in stored.get("last_prs") or []
+            ]
+            unique_snapshots = set(snapshots)
+            if not snapshots or "" in unique_snapshots or len(unique_snapshots) != 1:
+                state["sync"] = {
+                    "repository": repo,
+                    "cache_status": "unverified-store-snapshot",
+                    "evidence_complete": False,
+                }
+            else:
+                snapshot_id = snapshots[0]
+                status = gh_module.cached_sync_status(
+                    owner, name, snapshot_id=snapshot_id
+                )
+                state["sync"] = status or {
+                    "repository": repo,
+                    "snapshot_id": snapshot_id,
+                    "cache_status": "stored-snapshot-unavailable",
+                    "evidence_complete": False,
+                }
+        except (OSError, ValueError, json.JSONDecodeError):
+            state["sync"] = {"repository": repo, "cache_status": "unavailable",
+                             "evidence_complete": False}
+    else:
+        state.setdefault("sync", None)
+    return state
+
+
+def _cached_related(pr_number: int, *, file_path: str | None,
+                    store_path: Path, k: int) -> dict[str, Any]:
+    return rank_module.related_cached(
+        pr_number, file_path=file_path, store_path=store_path, k=k
+    )
+
+
+def _run_enrichment(pr_number: int, *, repo: str, file_path: str | None,
+                    store_path: Path, limit: int, expected_version: int) -> dict[str, Any]:
+    return rank_module.enrich_related(
+        pr_number, repo=repo, file_path=file_path, store_path=store_path, limit=limit,
+        expected_version=expected_version,
+    )
+
+
 class TriageHandler(BaseHTTPRequestHandler):
     store_path: Path = DEFAULT_STORE_PATH
+    csrf_token = ""
+    allowed_hostnames: tuple[str, ...] = ()
+    body_timeout_seconds = BODY_TIMEOUT_SECONDS
+    response_write_timeout_seconds = RESPONSE_WRITE_TIMEOUT_SECONDS
+    protocol_version = "HTTP/1.1"
+
+    def setup(self) -> None:
+        super().setup()
+        self.rfile.close()
+        self._deadline_reader = _DeadlineReader(self.connection)
+        self.rfile = self._deadline_reader
+
+    def handle_one_request(self) -> None:
+        self._deadline_reader.set_deadline(time.monotonic() + self.body_timeout_seconds)
+        try:
+            super().handle_one_request()
+        except RequestDeadlineExceeded:
+            self.close_connection = True
+            self._finish_ingress()
+            if (getattr(self, "command", None)
+                    and str(getattr(self, "request_version", "")).startswith("HTTP/")):
+                try:
+                    self._send_json(408, {
+                        "error": "request headers or body timed out",
+                        "code": "request_timeout",
+                    })
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
+
+    def _finish_ingress(self) -> None:
+        self._deadline_reader.set_deadline(None)
+        self.connection.settimeout(None)
 
     def log_message(self, fmt: str, *args: Any) -> None:
-        print(f"[http] {self.address_string()} {fmt % args}", flush=True)
+        client = self.client_address[0] if self.client_address else "local"
+        raw = fmt % args
+        safe = "".join(char if 32 <= ord(char) < 127 else "?" for char in raw)[:500]
+        print(f"[http] {client} {safe}", flush=True)
 
-    def _send(self, code: int, body: bytes, content_type: str) -> None:
-        self.send_response(code)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
+    def _security_headers(self) -> None:
         self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(body)
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
+            "connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; "
+            "frame-ancestors 'none'",
+        )
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+        self.send_header("Cross-Origin-Opener-Policy", "same-origin")
 
-    def _send_json(self, code: int, payload: Any) -> None:
-        body = json.dumps(payload).encode("utf-8")
-        self._send(code, body, "application/json; charset=utf-8")
+    def _send(self, status: int, body: bytes, content_type: str) -> None:
+        # Provider work may legitimately take longer than the request-ingress
+        # deadline. It must not inherit the final short receive timeout.
+        self._finish_ingress()
+        self.connection.settimeout(self.response_write_timeout_seconds)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self._security_headers()
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+        except (TimeoutError, BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+
+    def _send_json(self, status: int, payload: Any) -> None:
+        self._send(status, json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode(),
+                   "application/json; charset=utf-8")
+
+    def send_error(self, code: int, message: str | None = None,
+                   explain: str | None = None) -> None:
+        del explain
+        safe = message if code < 500 and message else "request failed"
+        self._send_json(code, {"error": safe})
+
+    def _problem(self, problem: RequestProblem) -> None:
+        self._send_json(problem.status, {"error": problem.message, "code": problem.code})
+
+    def _authorities(self) -> tuple[str, ...]:
+        port = int(self.server.server_address[1])
+        hosts = self.allowed_hostnames or (str(self.server.server_address[0]).lower(),)
+        return tuple(f"[{h}]:{port}" if ":" in h and not h.startswith("[") else f"{h}:{port}"
+                     for h in hosts)
+
+    def _guard(self, *, mutation: bool) -> str:
+        if len(self.path.encode(errors="replace")) > MAX_URL_BYTES:
+            raise RequestProblem(414, "url_too_long", "request target is too long")
+        host = self._header("Host").strip().lower()
+        if not host or host not in self._authorities():
+            raise RequestProblem(421, "invalid_host", "Host is not allowed")
+        fetch_site = self._header("Sec-Fetch-Site").strip().lower()
+        if fetch_site in {"cross-site", "same-site"}:
+            raise RequestProblem(403, "cross_origin", "cross-origin requests are forbidden")
+        expected_origin = f"http://{host}"
+        origin = self._header("Origin").strip()
+        if origin and origin != expected_origin:
+            raise RequestProblem(403, "invalid_origin", "Origin is not allowed")
+        if mutation:
+            if origin != expected_origin:
+                raise RequestProblem(403, "origin_required", "a same-origin Origin header is required")
+            token = self._header("X-CSRF-Token")
+            if not token or not hmac.compare_digest(token, self.csrf_token):
+                raise RequestProblem(403, "csrf_required", "a valid CSRF token is required")
+            media_type = self._header("Content-Type").split(";", 1)[0].strip().lower()
+            if media_type != "application/json":
+                raise RequestProblem(415, "json_required", "Content-Type must be application/json")
+        return expected_origin
 
     def _read_json(self) -> dict[str, Any]:
-        length = int(self.headers.get("Content-Length", "0") or "0")
-        raw = self.rfile.read(length) if length else b"{}"
-        if not raw:
-            return {}
-        data = json.loads(raw.decode("utf-8"))
-        if not isinstance(data, dict):
-            raise ValueError("JSON body must be an object")
-        return data
-
-    def do_GET(self) -> None:  # noqa: N802
-        parsed = urlparse(self.path)
-        path = parsed.path
-        if path == "/api/state":
-            self._send_json(200, ui_state(self.store_path))
-            return
-        if path == "/api/progress":
-            self._send_json(200, get_fetch_progress())
-            return
-        if path == "/api/overlap":
-            qs = parse_qs(parsed.query)
-            group_id = (qs.get("group_id") or [""])[0]
-            if not group_id:
-                self._send_json(400, {"error": "group_id required"})
-                return
-            try:
-                self._send_json(200, overlap_for_group(group_id, path=self.store_path))
-            except KeyError as exc:
-                self._send_json(404, {"error": str(exc)})
-            return
-        if path == "/api/pr":
-            qs = parse_qs(parsed.query)
-            raw = (qs.get("number") or [""])[0]
-            if not raw.isdigit():
-                self._send_json(400, {"error": "number required"})
-                return
-            repo = (qs.get("repo") or [""])[0] or (
-                load_store(self.store_path).get("repo") or "omacom/omarchy"
-            )
-            try:
-                owner, name = parse_repo(repo)
-            except ValueError as exc:
-                self._send_json(400, {"error": str(exc)})
-                return
-            meta = cached_pr_meta(owner, name, int(raw))
-            if not meta:
-                self._send_json(404, {"error": "pr not in cache"})
-                return
-            self._send_json(200, meta)
-            return
-        if path == "/api/file":
-            qs = parse_qs(parsed.query)
-            file_path = (qs.get("path") or [""])[0]
-            if not file_path:
-                self._send_json(400, {"error": "path required"})
-                return
-            self._send_json(200, prs_for_path(file_path, path=self.store_path))
-            return
-        if path == "/api/related":
-            qs = parse_qs(parsed.query)
-            raw_pr = (qs.get("pr") or [""])[0]
-            if not raw_pr.isdigit():
-                self._send_json(400, {"error": "pr required"})
-                return
-            file_path = (qs.get("path") or [""])[0] or None
-            self._send_json(
-                200,
-                related(int(raw_pr), file_path=file_path, store_path=self.store_path),
-            )
-            return
-        if path == "/api/patches":
-            qs = parse_qs(parsed.query)
-            repo = (qs.get("repo") or [""])[0] or (load_store(self.store_path).get("repo") or "omacom/omarchy")
-            file_path = (qs.get("path") or [""])[0]
-            raw_prs = (qs.get("prs") or [""])[0]
-            numbers = [int(x) for x in raw_prs.split(",") if x.strip().isdigit()][:8]
-            try:
-                owner, name = parse_repo(repo)
-            except ValueError as exc:
-                self._send_json(400, {"error": str(exc)})
-                return
-            items = []
-            for n in numbers:
-                files = cached_pr_files(owner, name, n)
-                patch = ""
-                for f in files:
-                    if f.get("path") == file_path:
-                        patch = f.get("patch") or ""
-                        break
-                cap = 6000
-                raw = patch or ""
-                source_complete = bool(raw) and not raw.rstrip().endswith(
-                    ("… truncated", "... truncated")
-                )
-                preview_truncated = len(raw) > cap
-                if preview_truncated:
-                    raw = raw[:cap] + "\n… truncated"
-                items.append(
-                    {
-                        "number": n,
-                        "path": file_path,
-                        "patch": raw,
-                        "truncated": preview_truncated,
-                        "source_complete": source_complete,
-                        "complete": source_complete and not preview_truncated,
-                    }
-                )
-            self._send_json(200, {"path": file_path, "items": items})
-            return
-        if path == "/" or path == "/index.html":
-            self._serve_file(WEB_DIR / "index.html")
-            return
-        # Static files under web/
-        if path.startswith("/"):
-            rel = path.lstrip("/")
-            # Refuse path traversal
-            candidate = (WEB_DIR / rel).resolve()
-            if not str(candidate).startswith(str(WEB_DIR.resolve())):
-                self._send_json(403, {"error": "forbidden"})
-                return
-            if candidate.is_file():
-                self._serve_file(candidate)
-                return
-        self._send_json(404, {"error": "not found"})
-
-    def do_POST(self) -> None:  # noqa: N802
-        parsed = urlparse(self.path)
-        path = parsed.path
+        if self._header("Transfer-Encoding"):
+            raise RequestProblem(400, "transfer_encoding", "Transfer-Encoding is not supported")
+        raw_length = self._header("Content-Length")
+        if not raw_length:
+            raise RequestProblem(411, "length_required", "Content-Length is required")
         try:
-            if path == "/api/fetch":
-                body = self._read_json()
-                source = str(body.get("source", "fixtures"))
-                repo = str(body.get("repo", "omacom/omarchy"))
-                limit = int(body.get("limit", 0))
-                if source not in ("fixtures", "gh", "github"):
-                    self._send_json(400, {"error": f"invalid source: {source}"})
-                    return
-                # Never proxy GitHub writes — ingest is GET-only by construction
+            length = int(raw_length)
+        except ValueError as exc:
+            raise RequestProblem(400, "invalid_length", "Content-Length is invalid") from exc
+        if length < 0:
+            raise RequestProblem(400, "invalid_length", "Content-Length is invalid")
+        if length > MAX_BODY_BYTES:
+            self.close_connection = True
+            raise RequestProblem(413, "body_too_large", "JSON body exceeds 65536 bytes")
+        try:
+            raw = self.rfile.read(length)
+        except (TimeoutError, RequestDeadlineExceeded) as exc:
+            self.close_connection = True
+            raise RequestProblem(408, "body_timeout", "request body timed out") from exc
+        finally:
+            self._finish_ingress()
+        if len(raw) != length:
+            self.close_connection = True
+            raise RequestProblem(400, "incomplete_body", "request body is incomplete")
+        try:
+            value = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RequestProblem(400, "invalid_json", "body must be valid UTF-8 JSON") from exc
+        if not isinstance(value, dict):
+            raise RequestProblem(400, "invalid_json", "JSON body must be an object")
+        return value
+
+    def _header(self, name: str) -> str:
+        values = self.headers.get_all(name) or []
+        if len(values) > 1:
+            self.close_connection = True
+            raise RequestProblem(400, "duplicate_header", f"{name} must occur once")
+        return values[0] if values else ""
+
+    @staticmethod
+    def _fields(body: dict[str, Any], *, required: set[str],
+                optional: set[str] = frozenset()) -> None:
+        missing, unknown = required - body.keys(), body.keys() - required - optional
+        if missing:
+            raise RequestProblem(400, "missing_fields", f"missing fields: {', '.join(sorted(missing))}")
+        if unknown:
+            raise RequestProblem(400, "unknown_fields", f"unknown fields: {', '.join(sorted(unknown))}")
+
+    def _query(self, parsed: Any, allowed: set[str]) -> dict[str, list[str]]:
+        try:
+            query = parse_qs(parsed.query, keep_blank_values=True, strict_parsing=True,
+                             max_num_fields=16)
+        except ValueError as exc:
+            raise RequestProblem(400, "invalid_query", "query string is invalid") from exc
+        unknown = query.keys() - allowed
+        if unknown:
+            raise RequestProblem(400, "unknown_parameter",
+                                 f"unknown parameters: {', '.join(sorted(unknown))}")
+        return query
+
+    @staticmethod
+    def _one(query: dict[str, list[str]], name: str, default: str = "") -> str:
+        values = query.get(name)
+        if not values:
+            return default
+        if len(values) != 1:
+            raise RequestProblem(400, "duplicate_parameter", f"{name} must occur once")
+        return values[0]
+
+    @staticmethod
+    def _int(raw: str, name: str, low: int, high: int) -> int:
+        if not raw.isdigit() or not low <= int(raw) <= high:
+            raise RequestProblem(400, f"invalid_{name}", f"{name} is invalid")
+        return int(raw)
+
+    @staticmethod
+    def _json_int(raw: Any, name: str, low: int, high: int) -> int:
+        if isinstance(raw, bool) or not isinstance(raw, int) or not low <= raw <= high:
+            raise RequestProblem(400, f"invalid_{name}", f"{name} is invalid")
+        return raw
+
+    def _active_repo(self, requested: str | None = None) -> tuple[dict[str, Any], str]:
+        store = load_store(self.store_path)
+        active = str(store.get("repo") or "").strip().strip("/").lower()
+        if requested is not None:
+            repo = _repo_key(requested)
+            if active and repo != active:
+                raise RequestProblem(409, "repository_conflict",
+                                     "repository does not match this store; use a separate workspace")
+        elif not active:
+            raise RequestProblem(409, "repository_unset", "this store has no active repository")
+        return store, active
+
+    @staticmethod
+    def _decoded_path(raw: str) -> str:
+        try:
+            path = unquote_to_bytes(raw).decode("utf-8", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise RequestProblem(400, "invalid_path", "request path must be UTF-8") from exc
+        if "\x00" in path or "\\" in path:
+            raise RequestProblem(400, "invalid_path", "request path is invalid")
+        return path
+
+    def do_GET(self) -> None:
+        try:
+            origin = self._guard(mutation=False)
+            parsed = urlsplit(self.path)
+            path = self._decoded_path(parsed.path)
+            if path == "/api/session":
+                self._send_json(200, {"csrf_token": self.csrf_token, "origin": origin,
+                    "limits": {"body_bytes": MAX_BODY_BYTES, "fetch_prs": MAX_FETCH_LIMIT,
+                               "enrichment_candidates": MAX_ENRICH_CANDIDATES}})
+            elif path == "/api/state":
+                self._send_json(200, _state_payload(self.store_path))
+            elif path == "/api/progress":
+                self._send_json(200, get_fetch_progress())
+            elif path == "/api/overlap":
+                query = self._query(parsed, {"group_id", "member_page", "member_page_size",
+                                             "row_page", "row_page_size"})
+                group_id = self._one(query, "group_id")
+                if not _GROUP_ID.fullmatch(group_id):
+                    raise RequestProblem(400, "invalid_group", "group_id is invalid")
                 try:
-                    result = start_fetch_async(
-                        source, repo, limit, store_path=self.store_path
-                    )
-                    self._send_json(200, result)
-                except FetchBusyError as busy:
-                    self._send_json(409, {"error": "fetch already running", **busy.progress})
-                return
-            if path == "/api/decide":
-                body = self._read_json()
-                group_id = str(body.get("group_id", ""))
-                decision = str(body.get("decision", ""))
-                # Map UI "bless" -> approve
-                if decision in ("bless", "approve"):
-                    decision = "approve"
-                elif decision in ("reject",):
-                    decision = "reject"
-                elif decision in ("hardware", "needs-hardware"):
-                    decision = "hardware"
-                elif decision in ("upgrade", "can-break-upgrade"):
-                    decision = "upgrade"
+                    self._send_json(200, overlap_for_group(
+                        group_id, path=self.store_path,
+                        member_page=self._int(self._one(query, "member_page", "1"),
+                                              "member_page", 1, 1_000_000),
+                        member_page_size=self._int(self._one(query, "member_page_size", "24"),
+                                                   "member_page_size", 1, 24),
+                        row_page=self._int(self._one(query, "row_page", "1"),
+                                           "row_page", 1, 1_000_000),
+                        row_page_size=self._int(self._one(query, "row_page_size", "80"),
+                                                "row_page_size", 1, 80),
+                    ))
+                except KeyError as exc:
+                    raise RequestProblem(404, "group_not_found", "group not found") from exc
+            elif path == "/api/pr":
+                query = self._query(parsed, {"number", "repo"})
+                number = self._int(self._one(query, "number"), "number", 1, 2_147_483_647)
+                store, repo = self._active_repo(self._one(query, "repo") or None)
+                if str(store.get("source") or "") == "fixtures":
+                    meta = next((p for p in store.get("last_prs") or []
+                                 if int(p.get("number") or 0) == number), None)
                 else:
-                    self._send_json(
-                        400,
-                        {"error": "decision must be approve|reject|hardware|upgrade"},
+                    owner, name = parse_repo(repo)
+                    stored = next((p for p in store.get("last_prs") or []
+                                   if int(p.get("number") or 0) == number), None)
+                    if stored is None:
+                        raise RequestProblem(404, "pr_not_found", "PR is not in the active store")
+                    evidence = gh_module.cached_pr_evidence(
+                        owner, name, number, snapshot_id=stored.get("cache_snapshot_id", "")
+                    ) or {}
+                    meta = evidence.get("meta")
+                    legacy_unverified = self._legacy_unverified(stored, evidence)
+                    unbound_preview = (
+                        legacy_unverified and self._legacy_revision_unbound(stored)
                     )
-                    return
-                decide_group(group_id, decision, path=self.store_path)
-                self._send_json(200, ui_state(self.store_path))
-                return
-            self._send_json(404, {"error": "not found"})
-        except Exception as exc:  # noqa: BLE001 — surface to UI for POC
+                    if meta and not unbound_preview and not self._revision_matches(
+                            stored, meta, evidence.get("files") or []):
+                        raise RequestProblem(409, "revision_conflict",
+                                             "cached description does not match the triage revision")
+                if not meta:
+                    raise RequestProblem(404, "cache_miss", "PR is not in the active local cache")
+                payload = dict(meta)
+                if str(store.get("source") or "") != "fixtures" and legacy_unverified:
+                    payload["legacy_unverified"] = True
+                    payload["evidence_complete"] = False
+                self._send_json(200, payload)
+            elif path == "/api/file":
+                query = self._query(parsed, {"path", "page", "page_size"})
+                self._send_json(200, prs_for_path(_safe_file_path(self._one(query, "path")),
+                    path=self.store_path,
+                    page=self._int(self._one(query, "page", "1"), "page", 1, 1_000_000),
+                    page_size=self._int(self._one(query, "page_size", "40"),
+                                        "page_size", 1, 40)))
+            elif path == "/api/related":
+                query = self._query(parsed, {"pr", "path", "limit"})
+                number = self._int(self._one(query, "pr"), "pr", 1, 2_147_483_647)
+                raw_path = self._one(query, "path")
+                limit = self._int(self._one(query, "limit", "5"), "limit", 1, 20)
+                self._send_json(200, _cached_related(number,
+                    file_path=_safe_file_path(raw_path) if raw_path else None,
+                    store_path=self.store_path, k=limit))
+            elif path == "/api/patches":
+                self._send_json(200, self._patches(parsed))
+            elif path in {"/", "/index.html"}:
+                self._serve_file(WEB_DIR / "index.html")
+            else:
+                self._serve_static(path)
+        except RequestProblem as problem:
+            self.close_connection = True
+            self._problem(problem)
+        except (TimeoutError, BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+        except Exception:  # noqa: BLE001
             traceback.print_exc()
-            self._send_json(500, {"error": str(exc)})
+            self._send_json(500, {"error": "internal server error", "code": "internal_error"})
+
+    def do_POST(self) -> None:
+        try:
+            self._guard(mutation=True)
+            parsed = urlsplit(self.path)
+            path = self._decoded_path(parsed.path)
+            if parsed.query:
+                raise RequestProblem(400, "query_forbidden", "POST endpoints do not accept query")
+            body = self._read_json()
+            if path == "/api/fetch":
+                self._post_fetch(body)
+            elif path == "/api/enrich":
+                self._post_enrich(body)
+            elif path == "/api/decide":
+                self._post_decide(body)
+            else:
+                raise RequestProblem(404, "not_found", "not found")
+        except RequestProblem as problem:
+            self.close_connection = True
+            self._problem(problem)
+        except Exception as exc:  # noqa: BLE001
+            conflict = getattr(store_module, "StoreConflictError", ())
+            incomplete = getattr(store_module, "IncompleteEvidenceError", ())
+            if conflict and isinstance(exc, conflict):
+                self._send_json(409, {"error": "target changed; reload before deciding",
+                    "code": getattr(exc, "code", "revision_conflict"),
+                    "repo": getattr(exc, "current_repo", ""),
+                    "version": getattr(exc, "current_version", None)})
+            elif incomplete and isinstance(exc, incomplete):
+                self._send_json(422, {"error": "complete evidence is required",
+                                      "code": "incomplete_evidence"})
+            elif isinstance(exc, KeyError):
+                self._send_json(404, {"error": "target not found", "code": "not_found"})
+            elif isinstance(exc, ValueError):
+                self._send_json(400, {"error": "request is invalid", "code": "invalid_request"})
+            else:
+                traceback.print_exc()
+                self._send_json(500, {"error": "internal server error", "code": "internal_error"})
+
+    def _post_fetch(self, body: dict[str, Any]) -> None:
+        self._fields(body, required={"source", "repo", "limit", "refresh"})
+        source = body["source"]
+        if source not in {"fixtures", "gh", "github"}:
+            raise RequestProblem(400, "invalid_source", "source must be fixtures|gh|github")
+        repo = _repo_key(body["repo"])
+        requested_limit = self._json_int(body["limit"], "limit", 0, MAX_FETCH_LIMIT)
+        effective_limit = MAX_FETCH_LIMIT if requested_limit == 0 else requested_limit
+        refresh = body["refresh"]
+        if not isinstance(refresh, bool):
+            raise RequestProblem(400, "invalid_refresh", "refresh must be a boolean")
+        store = load_store(self.store_path)
+        active_repo = str(store.get("repo") or "").strip().strip("/").lower()
+        active_source = str(store.get("source") or "")
+        if active_repo and active_repo != repo:
+            raise RequestProblem(409, "repository_conflict",
+                                 "repository does not match this store; use a separate workspace")
+        canonical = "github" if source in {"gh", "github"} else source
+        active_canonical = "github" if active_source in {"gh", "github"} else active_source
+        if active_canonical and active_canonical != canonical:
+            raise RequestProblem(409, "source_conflict",
+                                 "source does not match this store; use a separate workspace")
+        try:
+            result = start_fetch_async(source, repo, effective_limit,
+                                       store_path=self.store_path, refresh=refresh)
+        except FetchBusyError as busy:
+            self._send_json(409, {"error": "fetch already running", "code": "fetch_busy",
+                                  **busy.progress})
+            return
+        result["requested_limit"] = requested_limit
+        self._send_json(202, result)
+
+    def _post_enrich(self, body: dict[str, Any]) -> None:
+        self._fields(body,
+            required={"repo", "pr", "limit", "allow_external", "expected_version"},
+            optional={"path"})
+        if body["allow_external"] is not True:
+            raise RequestProblem(403, "external_consent_required",
+                                 "this request must explicitly allow external processing")
+        repo = _repo_key(body["repo"])
+        store, active = self._active_repo(repo)
+        version = self._json_int(body["expected_version"], "expected_version", 0,
+                                 9_007_199_254_740_991)
+        if version != int(store.get("store_version") or 0):
+            raise RequestProblem(409, "revision_conflict",
+                                 "store version changed; reload before enriching")
+        number = self._json_int(body["pr"], "pr", 1, 2_147_483_647)
+        if number not in {int(p.get("number") or 0) for p in store.get("last_prs") or []}:
+            raise RequestProblem(404, "pr_not_found", "PR is not in the active store")
+        limit = self._json_int(body["limit"], "limit", 1, MAX_ENRICH_CANDIDATES)
+        file_path = _safe_file_path(body["path"]) if body.get("path") else None
+        self._send_json(200, _run_enrichment(
+            number, repo=active, file_path=file_path, store_path=self.store_path,
+            limit=limit, expected_version=version
+        ))
+
+    def _post_decide(self, body: dict[str, Any]) -> None:
+        self._fields(body, required={"repo", "group_id", "decision", "expected_version",
+                                          "idempotency_key"})
+        repo = _repo_key(body["repo"])
+        self._active_repo(repo)
+        group_id = body["group_id"]
+        if not isinstance(group_id, str) or not _GROUP_ID.fullmatch(group_id):
+            raise RequestProblem(400, "invalid_group", "group_id is invalid")
+        mapping = {"bless": "approve", "approve": "approve", "reject": "reject",
+                   "hardware": "hardware", "needs-hardware": "hardware",
+                   "upgrade": "upgrade", "can-break-upgrade": "upgrade"}
+        decision = body["decision"]
+        if not isinstance(decision, str) or decision not in mapping:
+            raise RequestProblem(400, "invalid_decision",
+                                 "decision must be approve|reject|hardware|upgrade")
+        version = self._json_int(body["expected_version"], "expected_version", 0,
+                                 9_007_199_254_740_991)
+        key = body["idempotency_key"]
+        if not isinstance(key, str) or not _IDEMPOTENCY_KEY.fullmatch(key):
+            raise RequestProblem(400, "invalid_idempotency_key",
+                                 "idempotency_key must be 8-128 safe characters")
+        rule = store_module.decide_group(
+            group_id, mapping[decision], path=self.store_path, expected_repo=repo,
+            expected_version=version, idempotency_key=key
+        )
+        self._send_json(200, {"decision": rule.to_dict(),
+                              "state": _state_payload(self.store_path)})
+
+    def _patches(self, parsed: Any) -> dict[str, Any]:
+        query = self._query(parsed, {"repo", "path", "prs", "group_id", "page",
+            "page_size", "patch_offset", "patch_limit"})
+        repo = _repo_key(self._one(query, "repo"))
+        store, active = self._active_repo(repo)
+        file_path = _safe_file_path(self._one(query, "path"))
+        raw_prs, group_id = self._one(query, "prs"), self._one(query, "group_id")
+        if bool(raw_prs) == bool(group_id):
+            raise RequestProblem(400, "target_required", "provide exactly one of prs or group_id")
+        if group_id:
+            if not _GROUP_ID.fullmatch(group_id):
+                raise RequestProblem(400, "invalid_group", "group_id is invalid")
+            group = next((g for g in store.get("last_groups") or []
+                          if g.get("group_id") == group_id), None)
+            if group is None:
+                raise RequestProblem(404, "group_not_found", "group not found")
+            numbers = [int(n) for n in group.get("pr_numbers") or []]
+        else:
+            tokens = raw_prs.split(",")
+            if len(tokens) > MAX_PATCH_PRS or any(not token.isdigit() for token in tokens):
+                raise RequestProblem(400, "invalid_prs", "prs must be a bounded integer list")
+            numbers = [int(token) for token in tokens]
+            if not numbers or any(n <= 0 for n in numbers) or len(set(numbers)) != len(numbers):
+                raise RequestProblem(400, "invalid_prs", "prs must be unique positive integers")
+        page = self._int(self._one(query, "page", "1"), "page", 1, 1_000_000)
+        page_size = self._int(self._one(query, "page_size", str(MAX_PATCH_PAGE_SIZE)),
+                              "page_size", 1, MAX_PATCH_PAGE_SIZE)
+        offset = self._int(self._one(query, "patch_offset", "0"), "patch_offset",
+                           0, 100_000_000)
+        chunk = self._int(self._one(query, "patch_limit", "6000"), "patch_limit",
+                          1, MAX_PATCH_CHUNK)
+        start = (page - 1) * page_size
+        selected = numbers[start:start + page_size]
+        owner, name = parse_repo(active)
+        fixture_source = str(store.get("source") or "") == "fixtures"
+        stored_prs = {int(p.get("number") or 0): p for p in store.get("last_prs") or []}
+        items, hashes, snapshot_ids = [], [], set()
+        all_complete = bool(selected)
+        for number in selected:
+            stored = stored_prs.get(number)
+            if stored is None:
+                raise RequestProblem(409, "membership_conflict",
+                                     "requested PR is not in the active store")
+            evidence = ({"meta": stored, "files": stored.get("files") or [], "snapshot_id": ""}
+                        if fixture_source
+                        else (gh_module.cached_pr_evidence(
+                            owner, name, number,
+                            snapshot_id=stored.get("cache_snapshot_id", ""),
+                        ) or {}))
+            meta, files = evidence.get("meta"), evidence.get("files") or []
+            legacy_unverified = (
+                not fixture_source and self._legacy_unverified(stored, evidence)
+            )
+            if evidence.get("snapshot_id"):
+                snapshot_ids.add(str(evidence["snapshot_id"]))
+                if len(snapshot_ids) > 1:
+                    raise RequestProblem(409, "snapshot_conflict",
+                                         "active cache snapshot changed; retry this read")
+            unbound_preview = (
+                legacy_unverified and self._legacy_revision_unbound(stored)
+            )
+            if meta and not unbound_preview and not self._revision_matches(stored, meta, files):
+                raise RequestProblem(409, "revision_conflict",
+                                     "cached evidence changed; refresh the triage snapshot")
+            record = next((row for row in files if row.get("path") == file_path), None)
+            patch = str((record or {}).get("patch") or "")
+            complete = (
+                bool(patch)
+                and not legacy_unverified
+                and bool(stored.get("evidence_complete", False))
+                and bool((meta or {}).get("evidence_complete", False))
+                and (record or {}).get("patch_complete") is True
+            )
+            complete = complete and not patch.rstrip().endswith(("… truncated", "... truncated"))
+            incomplete_reasons = []
+            if legacy_unverified:
+                incomplete_reasons.append("unverified legacy cache preview")
+            if not patch:
+                incomplete_reasons.append("patch unavailable or binary")
+            if stored.get("evidence_complete") is not True:
+                incomplete_reasons.append("stored revision evidence is incomplete")
+            if not fixture_source and (meta or {}).get("evidence_complete") is not True:
+                incomplete_reasons.append("cached revision evidence is incomplete")
+            if (meta or {}).get("files_cap_reached"):
+                incomplete_reasons.append("provider file cap reached")
+            if int((meta or {}).get("missing_patch_count") or 0):
+                incomplete_reasons.append("one or more patches are unavailable")
+            digest = hashlib.sha256(patch.encode()).hexdigest() if complete else None
+            if digest:
+                hashes.append(digest)
+            all_complete = all_complete and complete
+            end = min(len(patch), offset + chunk)
+            next_offset = end if end < len(patch) else None
+            items.append({"number": number, "path": file_path, "patch": patch[offset:end],
+                "patch_offset": offset, "patch_length": len(patch),
+                "next_patch_offset": next_offset,
+                "preview_truncated": next_offset is not None or offset > 0,
+                "source_complete": complete, "evidence_complete": complete,
+                "legacy_unverified": legacy_unverified,
+                "incomplete_reasons": incomplete_reasons,
+                "content_sha256": digest,
+                "head_sha": (meta or {}).get("head_sha") or stored.get("head_sha") or "",
+                "base_sha": (meta or {}).get("base_sha") or stored.get("base_sha") or "",
+                "snapshot_id": evidence.get("snapshot_id") or ""})
+        equality = len(set(hashes)) == 1 if all_complete and len(selected) >= 2 else None
+        total_pages = (len(numbers) + page_size - 1) // page_size
+        return {"repo": active, "path": file_path, "items": items, "page": page,
+                "page_size": page_size, "total_items": len(numbers),
+                "total_pages": total_pages,
+                "next_page": page + 1 if page < total_pages else None,
+                "comparison": {"complete": all_complete,
+                               "same_complete_patch": equality, "scope": "page"}}
+
+    @staticmethod
+    def _legacy_unverified(stored: dict[str, Any], evidence: dict[str, Any]) -> bool:
+        """Accept only an explicitly isolated pre-snapshot cache as a preview."""
+        return (
+            str(stored.get("cache_snapshot_id") or "") == ""
+            and evidence.get("snapshot_id") == ""
+            and evidence.get("legacy_unverified") is True
+        )
+
+    @staticmethod
+    def _legacy_revision_unbound(stored: dict[str, Any]) -> bool:
+        """Old rollout records without any content identity may preview only."""
+        return not any(
+            str(stored.get(field) or "")
+            for field in ("content_digest", "head_sha", "base_sha")
+        )
+
+    @staticmethod
+    def _revision_matches(
+        stored: dict[str, Any], meta: dict[str, Any], files: list[dict[str, Any]]
+    ) -> bool:
+        compared = False
+        for field in ("head_sha", "base_sha", "updated_at"):
+            expected, current = stored.get(field), meta.get(field)
+            if expected and current:
+                compared = True
+                if str(expected) != str(current):
+                    return False
+            elif expected or current:
+                return False
+        expected_digest = str(stored.get("content_digest") or "")
+        if expected_digest:
+            changed_files = [ChangedFile.from_dict(item) for item in files]
+            candidate = PullRequest(
+                number=int(meta.get("number") or stored.get("number") or 0),
+                title=str(meta.get("title") or ""), body=str(meta.get("body") or ""),
+                user=str(meta.get("user") or ""), changed_files=changed_files,
+                created_at=str(meta.get("created_at") or ""),
+                head_sha=str(meta.get("head_sha") or ""),
+                base_sha=str(meta.get("base_sha") or ""),
+                updated_at=str(meta.get("updated_at") or ""),
+                additions=meta.get("additions"), deletions=meta.get("deletions"),
+                evidence_complete=bool(meta.get("evidence_complete", False)),
+                evidence_source=str(stored.get("evidence_source") or "github"),
+            )
+            if candidate.revision_evidence().content_digest != expected_digest:
+                return False
+        return compared or not any(stored.get(k) for k in ("head_sha", "base_sha", "updated_at"))
+
+    def _serve_static(self, request_path: str) -> None:
+        rel = request_path[1:] if request_path.startswith("/") else ""
+        if not rel or any(part in {"", ".", ".."} for part in PurePosixPath(rel).parts):
+            raise RequestProblem(403, "forbidden", "forbidden")
+        root, candidate = WEB_DIR.resolve(), (WEB_DIR / rel).resolve()
+        if not candidate.is_relative_to(root):
+            raise RequestProblem(403, "forbidden", "forbidden")
+        if not candidate.is_file():
+            raise RequestProblem(404, "not_found", "not found")
+        self._serve_file(candidate)
 
     def _serve_file(self, path: Path) -> None:
-        data = path.read_bytes()
-        ctype, _ = mimetypes.guess_type(str(path))
-        if ctype is None:
-            if path.suffix == ".js":
-                ctype = "application/javascript"
-            elif path.suffix == ".css":
-                ctype = "text/css"
-            else:
-                ctype = "application/octet-stream"
-        if ctype.startswith("text/") or ctype in (
-            "application/javascript",
-            "application/json",
-        ):
-            ctype = f"{ctype}; charset=utf-8"
-        self._send(200, data, ctype)
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            raise RequestProblem(404, "not_found", "not found") from exc
+        content_type = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
+        if content_type.startswith("text/") or content_type in {"application/javascript",
+                                                                 "application/json"}:
+            content_type += "; charset=utf-8"
+        self._send(200, data, content_type)
+
+    def do_OPTIONS(self) -> None:
+        try:
+            self._guard(mutation=False)
+            self._send_json(405, {"error": "method not allowed", "code": "method_not_allowed"})
+        except RequestProblem as problem:
+            self._problem(problem)
 
 
-def make_handler(store_path: Path) -> type[BaseHTTPRequestHandler]:
+def make_handler(store_path: Path, *, allowed_hostnames: tuple[str, ...] | None = None,
+                 csrf_token: str | None = None,
+                 body_timeout_seconds: float = BODY_TIMEOUT_SECONDS) -> type[BaseHTTPRequestHandler]:
+    """Create a per-server handler with a fresh, unguessable session token."""
+    token = csrf_token or secrets.token_urlsafe(32)
+    allowed = tuple(host.lower() for host in (allowed_hostnames or ()))
+
     class BoundHandler(TriageHandler):
         pass
 
     BoundHandler.store_path = store_path
+    BoundHandler.csrf_token = token
+    BoundHandler.allowed_hostnames = allowed
+    BoundHandler.body_timeout_seconds = body_timeout_seconds
     return BoundHandler
 
 
-def serve(
-    host: str = "127.0.0.1",
-    port: int = 8741,
-    open_browser: bool = True,
-    store_path: Path = DEFAULT_STORE_PATH,
-) -> None:
-    ensure_initial_fixtures(store_path)
-    handler = make_handler(store_path)
-    httpd = ThreadingHTTPServer((host, port), handler)
-    url = f"http://{host}:{port}"
+def _validate_loopback_host(host: str) -> None:
+    if not host or host in {"0.0.0.0", "::", "*"}:
+        raise ValueError("dashboard serving is restricted to loopback addresses")
+    if host.lower() == "localhost":
+        return
+    try:
+        loopback = ipaddress.ip_address(host.split("%", 1)[0]).is_loopback
+    except ValueError as exc:
+        raise ValueError("dashboard host must be localhost or a literal loopback address") from exc
+    if not loopback:
+        raise ValueError("dashboard serving is restricted to loopback addresses")
+
+
+def _serve_allowed_hostnames(host: str) -> tuple[str, ...]:
+    """Return exact Host aliases that reach the same default IPv4 listener."""
+    normalized = host.lower()
+    if normalized in {"127.0.0.1", "localhost"}:
+        return ("127.0.0.1", "localhost")
+    return (normalized,)
+
+
+def serve(host: str = "127.0.0.1", port: int = 8741, open_browser: bool = True,
+          store_path: Path = DEFAULT_STORE_PATH) -> None:
+    """Serve one local store; LAN/team exposure requires another architecture."""
+    _validate_loopback_host(host)
+    httpd = BoundedThreadingHTTPServer((host, port), make_handler(
+        store_path, allowed_hostnames=_serve_allowed_hostnames(host)
+    ))
+    actual_port = int(httpd.server_address[1])
+    display_host = f"[{host}]" if ":" in host and not host.startswith("[") else host
+    url = f"http://{display_host}:{actual_port}"
     print(f"Omarchy triage dashboard: {url}", flush=True)
-    print("(local only — Bless/Reject never write to GitHub)", flush=True)
+    print("(loopback only; refresh and external enrichment require explicit POSTs)", flush=True)
     if open_browser:
         try:
             webbrowser.open(url)
