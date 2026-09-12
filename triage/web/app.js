@@ -140,7 +140,12 @@
     if (state.selectedPr && !state.prs.some((p) => p.number === state.selectedPr)) {
       state.selectedPr = null;
     }
-    if (!state.selectedGroupId && state.groups.length && !new URLSearchParams(location.search).get("group")) {
+    if (
+      !state.selectedGroupId &&
+      state.groups.length &&
+      !new URLSearchParams(location.search).get("group") &&
+      !state.selectedFile
+    ) {
       const gs = sortedGroups();
       const pick =
         gs.find((g) => {
@@ -160,7 +165,8 @@
       state.selectedFile &&
       (!state.fileQueue || state.fileQueue.path !== state.selectedFile)
     ) {
-      openFileQueue(state.selectedFile, { fromUrl: true });
+      if (state.selectedGroupId) openFileQueue(state.selectedFile, { fromUrl: true });
+      else openHotspot(state.selectedFile, { fromUrl: true });
     }
     renderUserDrawer();
   }
@@ -777,7 +783,9 @@
     }
     const hs = row.hotspot;
     const el = document.createElement("div");
-    el.className = "hotspot-row";
+    el.className =
+      "hotspot-row" +
+      (!state.selectedGroupId && state.selectedFile === hs.path ? " selected" : "");
     el.innerHTML =
       '<span class="mono">' +
       escapeHtml(hs.path) +
@@ -785,7 +793,7 @@
       hs.pr_count +
       " PRs</span>";
     el.addEventListener("click", () => {
-      openFileQueue(hs.path);
+      openHotspot(hs.path);
     });
     return el;
   }
@@ -871,6 +879,16 @@
         if (card) {
           card.className =
             "group-card" + (row.group.group_id === state.selectedGroupId ? " selected" : "");
+        }
+      } else if (row.kind === "hotspot") {
+        const card = el.firstChild;
+        if (card) {
+          card.className =
+            "hotspot-row" +
+            (!state.selectedGroupId &&
+            state.selectedFile === row.hotspot.path
+              ? " selected"
+              : "");
         }
       }
       el.style.transform = "translateY(" + vi.start + "px)";
@@ -967,27 +985,56 @@
     });
   }
 
+  function isFileView() {
+    return !state.selectedGroupId && !!state.selectedFile;
+  }
+
+  function openHotspot(path, opts) {
+    const fromUrl = !!(opts && opts.fromUrl);
+    state.selectedGroupId = null;
+    state.selectedPr = null;
+    state.selectedFile = path;
+    state.fileQueue = { path: path, prs: [], loading: true, same_patch: [] };
+    if (state.queuePile !== "hotspots") {
+      state.queuePile = "hotspots";
+      queueRowsCache = null;
+    }
+    if (!fromUrl) writeUrl(true);
+    render();
+    openFileQueue(path, { fromUrl: true, fileView: true });
+  }
+
   async function openFileQueue(path, opts) {
     const fromUrl = !!(opts && opts.fromUrl);
+    const fileView = !!(opts && opts.fileView) || isFileView();
     state.selectedFile = path;
     state.fileQueue = { path: path, prs: [], loading: true, same_patch: [] };
     const extra = $("fileQueueBlock");
-    if (!fromUrl && extra && extra.tagName === "DETAILS") extra.open = true;
-    writeUrl(!fromUrl);
-    renderFileQueue();
-    const g = state.groups.find((x) => x.group_id === state.selectedGroupId);
-    if (g) renderDiffs(g, { scroll: true });
+    if (!fromUrl && !fileView && extra && extra.tagName === "DETAILS") extra.open = true;
+    if (!fileView) writeUrl(!fromUrl);
+    if (fileView) renderFileDetail();
+    else {
+      renderFileQueue();
+      const g = state.groups.find((x) => x.group_id === state.selectedGroupId);
+      if (g) renderDiffs(g, { scroll: true });
+    }
     try {
       const data = await api("/api/file?path=" + encodeURIComponent(path));
       if (state.selectedFile !== path) return;
       state.fileQueue = data;
-      renderFileQueue();
-      const g2 = state.groups.find((x) => x.group_id === state.selectedGroupId);
-      if (g2) renderDiffs(g2, { scroll: true });
+      if (isFileView()) {
+        renderFileDetail();
+        renderDiffs(null, { scroll: true });
+      } else {
+        renderFileQueue();
+        const g2 = state.groups.find((x) => x.group_id === state.selectedGroupId);
+        if (g2) renderDiffs(g2, { scroll: true });
+      }
     } catch (err) {
       if (state.selectedFile !== path) return;
       state.fileQueue = { path: path, prs: [], error: err.message };
-      renderFileQueue();
+      if (isFileView()) renderFileDetail();
+      else renderFileQueue();
     }
   }
 
@@ -1262,10 +1309,105 @@
     root.dataset.ready = "1";
   }
 
+  function renderFileMembers() {
+    const wrap = $("detailMembersWrap");
+    const members = $("detailMembers");
+    members.innerHTML = "";
+    memberVirtualizer = null;
+    wrap.classList.remove("virt");
+    wrap.style.maxHeight = "";
+    members.style.position = "";
+    members.style.height = "";
+    const fq = state.fileQueue;
+    if (fq && fq.loading) {
+      const li = document.createElement("li");
+      li.className = "muted";
+      li.textContent = "Loading…";
+      members.appendChild(li);
+      return;
+    }
+    const items = (fq && fq.prs) || [];
+    if (!items.length) {
+      const li = document.createElement("li");
+      li.className = "muted";
+      li.textContent = fq && fq.error ? fq.error : "No open PRs on this file.";
+      members.appendChild(li);
+      return;
+    }
+    const byG = new Map();
+    for (const pr of items) {
+      const gid = pr.group_id || "?";
+      if (!byG.has(gid)) byG.set(gid, []);
+      byG.get(gid).push(pr);
+    }
+    const groups = [...byG.entries()].sort((a, b) => b[1].length - a[1].length);
+    for (const [gid, prs] of groups) {
+      const g = groupById(gid);
+      const head = document.createElement("li");
+      head.className = "file-shape";
+      const dec = (g && g.suggested_decision) || "";
+      const cls = (g && g.card_class) || "";
+      const n = g ? (g.pr_numbers || []).length : prs.length;
+      head.textContent =
+        gid +
+        " · " +
+        prs.length +
+        (n !== prs.length ? " of " + n : "") +
+        (dec ? " · " + dec : "") +
+        (cls ? " · " + cls : "");
+      head.title = "Open this shape";
+      head.addEventListener("click", () => {
+        if (gid && gid !== "?") state.selectedGroupId = gid;
+        state.selectedPr = prs[0].number;
+        render();
+      });
+      members.appendChild(head);
+      prs.forEach((pr) => members.appendChild(buildMemberLi(pr.number)));
+    }
+  }
+
+  function renderFileDetail() {
+    const empty = $("detailEmpty");
+    const detail = $("detail");
+    empty.classList.add("hidden");
+    detail.classList.remove("hidden");
+    detail.classList.add("file-view");
+    const path = state.selectedFile;
+    const fq = state.fileQueue;
+    const count = (fq && (fq.pr_count || (fq.prs || []).length)) || 0;
+    const same = (fq && fq.same_patch) || [];
+    const sameN = same.reduce((n, c) => n + (c.count || 0), 0);
+    $("detailKicker").textContent = "Hotspot";
+    $("detailTitle").textContent = path || "";
+    let meta = "";
+    if (fq && fq.loading) meta = "Loading PRs on this file…";
+    else if (fq && fq.error) meta = "error: " + fq.error;
+    else {
+      meta = count + " open PRs touch this file";
+      if (same.length) meta += " · " + same.length + " identical hunks (" + sameN + " PRs)";
+    }
+    $("detailMeta").textContent = meta;
+    $("detailPills").innerHTML = "";
+    const mh = $("membersHead");
+    if (mh) mh.textContent = "PRs on this file" + (count ? " · " + count : "");
+    renderFileMembers();
+    renderPrBodies({ pr_numbers: ((fq && fq.prs) || []).map((p) => p.number) });
+    if (fq && !fq.loading) renderDiffs(null);
+    if (state.selectedPr) loadRelated(state.selectedPr, path);
+    else {
+      state.related = null;
+      renderRelated();
+    }
+  }
+
   function renderDetail() {
     const empty = $("detailEmpty");
     const detail = $("detail");
     const g = state.groups.find((x) => x.group_id === state.selectedGroupId);
+    if (!g && state.selectedFile) {
+      renderFileDetail();
+      return;
+    }
     if (!g) {
       empty.classList.remove("hidden");
       detail.classList.add("hidden");
@@ -1273,6 +1415,7 @@
     }
     empty.classList.add("hidden");
     detail.classList.remove("hidden");
+    detail.classList.remove("file-view");
 
     const rule = ruleFor(g.group_id);
     const n = (g.pr_numbers || []).length;
@@ -1657,22 +1800,34 @@
       root.innerHTML = '<div class="muted diff-hint">Pick a file above to compare hunks.</div>';
       return;
     }
-    const groupSet = new Set(g.pr_numbers || []);
     const fqNums = ((state.fileQueue && state.fileQueue.prs) || [])
       .map((p) => p.number)
       .filter(Boolean);
-    const groupOnFile = fqNums.filter((n) => groupSet.has(n));
-    const nums = (groupOnFile.length ? groupOnFile : (g.pr_numbers || [])).slice(0, 8);
+    let nums;
+    if (g) {
+      const groupSet = new Set(g.pr_numbers || []);
+      const groupOnFile = fqNums.filter((n) => groupSet.has(n));
+      nums = (groupOnFile.length ? groupOnFile : (g.pr_numbers || [])).slice(0, 8);
+    } else {
+      nums = fqNums.slice(0, 8);
+    }
     if (!nums.length) {
       root.innerHTML =
-        '<div class="muted diff-hint">No patches for ' +
-        escapeHtml(path) +
-        ".</div>";
+        '<div class="muted diff-hint">' +
+        (g
+          ? "This shape does not touch " + escapeHtml(path) + "."
+          : state.fileQueue && state.fileQueue.loading
+            ? "Loading patches…"
+            : "No patches for " + escapeHtml(path) + ".") +
+        "</div>";
       return;
     }
     const gen = ++diffGen;
     const meta = $("diffMeta");
-    if (meta) meta.textContent = path + " · " + nums.length + " PRs in this group";
+    if (meta) {
+      meta.textContent =
+        path + " · " + nums.length + (g ? " PRs in this group" : " PRs on this file");
+    }
     if (shouldScroll) scrollToDiff();
     if (!root.querySelector(".diff-panel")) {
       root.innerHTML = '<div class="muted diff-hint">Loading patches…</div>';

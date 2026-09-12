@@ -821,3 +821,27 @@ button.user-shape:hover { color: var(--text); }
   color: var(--muted);
 }
 .pile-tab.active .pile-n { color: var(--accent); }
+
+
+.detail.file-view .actions,
+.detail.file-view .label-key,
+.detail.file-view #overlapBlock,
+.detail.file-view #fileQueueBlock {
+  display: none;
+}
+.hotspot-row.selected {
+  border-color: var(--accent);
+  box-shadow: inset 0 0 0 1px var(--accent-dim);
+}
+.member-list li.file-shape {
+  display: block;
+  grid-template-columns: none;
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  cursor: pointer;
+  padding: 10px 8px 4px;
+  font-weight: 600;
+}
+.member-list li.file-shape:hover { color: var(--text); }
