@@ -257,14 +257,14 @@
     }
 
     if (!groupVirtualizer) {
-      groupVirtualizer = makeVirtualizer(root, groups.length, () => 78, 8, paintGroupVirtual);
+      groupVirtualizer = makeVirtualizer(root, groups.length, () => 96, 8, paintGroupVirtual);
       groupVirtualizer._didMount();
     } else {
       groupVirtualizer.setOptions({
         ...groupVirtualizer.options,
         count: groups.length,
         getScrollElement: () => root,
-        estimateSize: () => 78,
+        estimateSize: () => 96,
         overscan: 8,
         onChange: () => paintGroupVirtual(),
       });
@@ -317,28 +317,52 @@
     }
   }
 
-  function buildGroupCard(g) {
+  function pillHtml(name, cls) {
+    const key = cls || name;
+    const tip = labelHelp(key) || labelHelp(name);
+    return (
+      '<span class="pill ' +
+      escapeHtml(key) +
+      '" title="' +
+      escapeHtml(tip) +
+      '">' +
+      escapeHtml(name) +
+      "</span>"
+    );
+  }
+
+  function groupCardPills(g) {
     const rule = ruleFor(g.group_id);
+    const cls = g.card_class || "needs-look";
+    const decision = g.suggested_decision || "unique";
+    const parts = [pillHtml(cls)];
+    if (decision !== cls) parts.push(pillHtml(decision));
+    if (rule) {
+      const shown = ruleLabel(rule.decision);
+      const key =
+        rule.decision === "approve"
+          ? "blessed"
+          : rule.decision === "reject"
+            ? "rejected"
+            : rule.decision;
+      parts.push(pillHtml(shown, key));
+    } else {
+      parts.push('<span class="muted">unreviewed</span>');
+    }
+    return parts.join("");
+  }
+
+  function buildGroupCard(g) {
     const card = document.createElement("div");
     card.className =
       "group-card" + (g.group_id === state.selectedGroupId ? " selected" : "");
     const firstTitle = (g.title_variants && g.title_variants[0]) || "";
-    const decision = g.suggested_decision || "unique";
     card.innerHTML = `
       <div class="row">
         <span class="mono">${escapeHtml(g.group_id)}</span>
         <span class="muted">${(g.pr_numbers || []).length} PRs</span>
       </div>
-      <div class="row" style="margin-top:4px">
-        <span class="pill ${escapeHtml(decision)}" title="${escapeHtml(labelHelp(decision))}">${escapeHtml(decision)}</span>
-        ${
-          rule
-            ? `<span class="pill ${escapeHtml(rule.decision)}" title="${escapeHtml(labelHelp(ruleLabel(rule.decision)) || labelHelp(rule.decision))}">${escapeHtml(
-                ruleLabel(rule.decision)
-              )}</span>`
-            : `<span class="muted">unreviewed</span>`
-        }
-      </div>
+      <div class="pills">${groupCardPills(g)}</div>
       <div class="card-title" title="${escapeHtml(firstTitle)}">${escapeHtml(
       firstTitle
     )}</div>`;
@@ -636,7 +660,7 @@
         continue;
       }
       for (const g of groups) {
-        rows.push({ kind: "group", key: "g:" + g.group_id, group: g, size: 78 });
+        rows.push({ kind: "group", key: "g:" + g.group_id, group: g, size: 96 });
       }
     }
     const qtext = (state.filterQuery || "").trim().toLowerCase();

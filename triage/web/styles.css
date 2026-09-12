@@ -215,9 +215,17 @@ a:hover { text-decoration: underline; }
   padding: 8px 10px;
   margin-bottom: 6px;
   cursor: pointer;
-  height: 72px;
+  min-height: 72px;
+  height: auto;
   box-sizing: border-box;
   overflow: hidden;
+}
+.group-card .pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  align-items: center;
+  margin-top: 4px;
 }
 .group-card:hover { border-color: #52525b; }
 .group-card.selected {
@@ -245,7 +253,7 @@ a:hover { text-decoration: underline; }
 .pill.related-theme { color: #fda4af; border-color: #9f1239; }
 .pill.unique { color: var(--muted); }
 .pill.approve, .pill.blessed { color: var(--ok); border-color: #065f46; }
-.pill.reject { color: var(--danger); border-color: #7f1d1d; }
+.pill.reject, .pill.rejected { color: var(--danger); border-color: #7f1d1d; }
 .card-title {
   margin-top: 4px;
   white-space: nowrap;
