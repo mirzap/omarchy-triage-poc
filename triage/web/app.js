@@ -35,7 +35,9 @@
 
   let groupVirtualizer = null;
   let allPrVirtualizer = null;
+  let queueVirtualizer = null;
   let memberVirtualizer = null;
+  let queueRowsCache = null;
   let fetchPollTimer = null;
 
   const $ = (id) => document.getElementById(id);
@@ -67,6 +69,7 @@
     state.repo = data.repo || "";
     state.queue = data.queue || {};
     state.new_pr_numbers = data.new_pr_numbers || [];
+    queueRowsCache = null;
     if (data.source) $("source").value = "gh";
     if (data.repo) $("repo").value = data.repo;
     if (
@@ -383,11 +386,10 @@
     return state.groups.find((g) => g.group_id === id) || null;
   }
 
-  function renderQueue() {
-    const root = $("queueList");
+  function queueRows() {
+    if (queueRowsCache) return queueRowsCache;
     const q = state.queue || {};
-    renderLeftHeader();
-    root.innerHTML = "";
+    const rows = [];
     const piles = [
       ["Needs you", q.needs_you || []],
       ["Needs hardware", q.hardware || []],
@@ -396,47 +398,138 @@
       ["Junk", q.junk || []],
     ];
     for (const [label, ids] of piles) {
-      const h = document.createElement("div");
-      h.className = "pile-head";
-      h.textContent = label + " · " + ids.length;
-      root.appendChild(h);
+      rows.push({ kind: "head", key: "hd:" + label, label: label, count: ids.length, size: 34 });
       if (!ids.length) {
-        const empty = document.createElement("div");
-        empty.className = "muted pile-empty";
-        empty.textContent = "none";
-        root.appendChild(empty);
+        rows.push({ kind: "empty", key: "e:" + label, size: 30 });
         continue;
       }
-      ids.slice(0, 80).forEach((id) => {
+      for (const id of ids) {
         const g = groupById(id);
-        if (g) root.appendChild(buildGroupCard(g));
-      });
-      if (ids.length > 80) {
-        const more = document.createElement("div");
-        more.className = "muted pile-empty";
-        more.textContent = "+" + (ids.length - 80) + " more";
-        root.appendChild(more);
+        if (g) rows.push({ kind: "group", key: "g:" + g.group_id, group: g, size: 78 });
       }
     }
-    const h = document.createElement("div");
-    h.className = "pile-head";
     const spots = q.hotspots || [];
-    h.textContent = "File hotspots · " + spots.length;
-    root.appendChild(h);
-    spots.forEach((hs) => {
-      const row = document.createElement("div");
-      row.className = "hotspot-row";
-      row.innerHTML =
-        '<span class="mono">' +
-        escapeHtml(hs.path) +
-        '</span><span class="muted">' +
-        hs.pr_count +
-        " PRs</span>";
-      row.addEventListener("click", () => {
-        openFileQueue(hs.path);
-      });
-      root.appendChild(row);
+    rows.push({ kind: "head", key: "hd:hotspots", label: "File hotspots", count: spots.length, size: 34 });
+    for (const hs of spots) {
+      rows.push({ kind: "hotspot", key: "h:" + hs.path, hotspot: hs, size: 40 });
+    }
+    queueRowsCache = rows;
+    return rows;
+  }
+
+  function buildQueueItem(row) {
+    if (row.kind === "head") {
+      const h = document.createElement("div");
+      h.className = "pile-head";
+      h.textContent = row.label + " · " + row.count;
+      return h;
+    }
+    if (row.kind === "empty") {
+      const empty = document.createElement("div");
+      empty.className = "muted pile-empty";
+      empty.textContent = "none";
+      return empty;
+    }
+    if (row.kind === "group") {
+      return buildGroupCard(row.group);
+    }
+    const hs = row.hotspot;
+    const el = document.createElement("div");
+    el.className = "hotspot-row";
+    el.innerHTML =
+      '<span class="mono">' +
+      escapeHtml(hs.path) +
+      '</span><span class="muted">' +
+      hs.pr_count +
+      " PRs</span>";
+    el.addEventListener("click", () => {
+      openFileQueue(hs.path);
     });
+    return el;
+  }
+
+  function renderQueue() {
+    const root = $("queueList");
+    const rows = queueRows();
+    renderLeftHeader();
+
+    if (!rows.length) {
+      if (queueVirtualizer) {
+        try { queueVirtualizer._willUpdate = () => {}; } catch (_) {}
+        queueVirtualizer = null;
+      }
+      root.innerHTML = '<div class="empty">No queue — Fetch</div>';
+      return;
+    }
+
+    if (!Virtualizer) {
+      root.innerHTML = "";
+      for (const row of rows) root.appendChild(buildQueueItem(row));
+      return;
+    }
+
+    if (!queueVirtualizer) {
+      queueVirtualizer = makeVirtualizer(
+        root,
+        rows.length,
+        (i) => (queueRows()[i] && queueRows()[i].size) || 40,
+        8,
+        paintQueueVirtual
+      );
+      queueVirtualizer._didMount();
+    } else {
+      queueVirtualizer.setOptions({
+        ...queueVirtualizer.options,
+        count: rows.length,
+        getScrollElement: () => root,
+        estimateSize: (i) => (queueRows()[i] && queueRows()[i].size) || 40,
+        overscan: 8,
+        onChange: () => paintQueueVirtual(),
+      });
+    }
+    queueVirtualizer._willUpdate();
+    paintQueueVirtual();
+  }
+
+  function paintQueueVirtual() {
+    const root = $("queueList");
+    const rows = queueRows();
+    if (!queueVirtualizer || !rows.length) return;
+    const items = queueVirtualizer.getVirtualItems();
+    const total = queueVirtualizer.getTotalSize();
+    let inner = root.querySelector(".virt-inner");
+    if (!inner) {
+      root.innerHTML = "";
+      inner = document.createElement("div");
+      inner.className = "virt-inner";
+      root.appendChild(inner);
+    }
+    inner.style.height = total + "px";
+    const keep = new Set(items.map((vi) => rows[vi.index] && rows[vi.index].key));
+    [...inner.querySelectorAll(".virt-item")].forEach((el) => {
+      if (!keep.has(el.dataset.key)) el.remove();
+    });
+    for (const vi of items) {
+      const row = rows[vi.index];
+      if (!row) continue;
+      let el = [...inner.querySelectorAll(".virt-item")].find((n) => n.dataset.key === row.key);
+      if (!el) {
+        el = document.createElement("div");
+        el.className = "virt-item";
+        el.dataset.key = row.key;
+        el.dataset.index = String(vi.index);
+        el.appendChild(buildQueueItem(row));
+        inner.appendChild(el);
+      } else if (row.kind === "group") {
+        const card = el.firstChild;
+        if (card) {
+          card.className =
+            "group-card" + (row.group.group_id === state.selectedGroupId ? " selected" : "");
+        }
+      }
+      el.style.transform = "translateY(" + vi.start + "px)";
+      el.style.height = vi.size + "px";
+    }
   }
 
 
