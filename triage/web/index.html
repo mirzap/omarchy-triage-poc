@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Omarchy triage</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">Omarchy triage</div>
+    <label class="field">
+      <span>source</span>
+      <select id="source">
+        <option value="fixtures">fixtures</option>
+        <option value="gh">gh</option>
+      </select>
+    </label>
+    <label class="field grow">
+      <span>repo</span>
+      <input id="repo" type="text" value="omacom/omarchy" spellcheck="false" />
+    </label>
+    <label class="field narrow">
+      <span>limit</span>
+      <input id="limit" type="number" value="0" min="0" placeholder="0 = all" title="0 = all open PRs" />
+    </label>
+    <button id="fetchBtn" type="button" class="btn primary">Fetch</button>
+    <div id="status" class="status">idle</div>
+  </header>
+
+  <main class="layout">
+    <aside class="pane left">
+      <div class="left-tabs" role="tablist">
+        <button type="button" class="tab active" id="tabGroups" data-tab="groups" role="tab" aria-selected="true">Groups</button>
+        <button type="button" class="tab" id="tabAllPrs" data-tab="allprs" role="tab" aria-selected="false">All PRs</button>
+      </div>
+      <div id="groupListHeader" class="list-header muted"></div>
+      <div id="groupList" class="virt-scroll" role="list"></div>
+      <div id="allPrList" class="virt-scroll hidden" role="list"></div>
+    </aside>
+
+    <section class="pane center">
+      <div id="detailEmpty" class="empty">Select a group</div>
+      <div id="detail" class="detail hidden">
+        <div class="detail-head">
+          <div>
+            <div class="mono" id="detailId"></div>
+            <div class="muted" id="detailMeta"></div>
+          </div>
+          <div class="actions">
+            <button id="blessBtn" type="button" class="btn accent">Bless shape</button>
+            <button id="rejectBtn" type="button" class="btn danger">Reject</button>
+          </div>
+        </div>
+        <div class="block">
+          <h3>Suggested</h3>
+          <div id="detailDecision" class="pill"></div>
+        </div>
+        <div class="block">
+          <h3>Overlap</h3>
+          <div id="overlapSummary" class="overlap-summary muted"></div>
+          <div id="overlapMatrixWrap" class="overlap-matrix-wrap">
+            <table id="overlapMatrix" class="overlap-matrix"></table>
+          </div>
+        </div>
+        <div class="block">
+          <h3>Diff</h3>
+          <div id="diffPanels" class="diff-panels">
+            <div class="muted diff-hint">Click a file to see patches.</div>
+          </div>
+        </div>
+        <div class="block">
+          <h3>Title variants</h3>
+          <ul id="detailTitles" class="title-list"></ul>
+        </div>
+        <div class="block">
+          <h3>Members</h3>
+          <div id="detailMembersWrap" class="member-wrap">
+            <ul id="detailMembers" class="member-list"></ul>
+          </div>
+        </div>
+        <div class="block graph-block">
+          <div class="graph-head">
+            <h3>Neighborhood</h3>
+            <label class="toggle">
+              <input type="checkbox" id="groupGraphToggle" />
+              group overview
+            </label>
+          </div>
+          <svg id="graphSvg" class="graph" viewBox="0 0 400 280" aria-label="neighborhood graph"></svg>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="/vendor/virtual.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>

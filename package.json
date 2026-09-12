@@ -1,0 +1,15 @@
+{
+  "name": "omarchy-triage-poc",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Tiny frontend build for TanStack Virtual (committed vendor bundle)",
+  "scripts": {
+    "build": "esbuild web-src/virtual.js --bundle --format=iife --outfile=triage/web/vendor/virtual.js --platform=browser --target=es2020"
+  },
+  "dependencies": {
+    "@tanstack/virtual-core": "^3.13.12"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.9"
+  }
+}

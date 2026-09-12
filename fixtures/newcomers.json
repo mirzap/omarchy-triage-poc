@@ -1,0 +1,36 @@
+[
+  {
+    "number": 120,
+    "title": "hyprland keybind fix for workspaces",
+    "body": "SUPER digit workspace binds broken after hyprland upgrade. Fix bindings.conf and source from hyprland.conf with reload.",
+    "user": "newdev",
+    "created_at": "2026-09-01T10:00:00Z",
+    "changed_files": [
+      {
+        "path": "config/hypr/bindings.conf",
+        "patch": "@@ -12,7 +12,7 @@\n-bind = SUPER, 1, workspace, 1\n+bind = SUPER, 1, workspace, 1, exact\n@@ -20,3 +20,4 @@\n+exec-once = hyprctl reload\n"
+      },
+      {
+        "path": "config/hypr/hyprland.conf",
+        "patch": "@@ -5,3 +5,4 @@\n+source = ./bindings.conf\n"
+      }
+    ]
+  },
+  {
+    "number": 999,
+    "title": "Add Bluetooth battery widget to waybar",
+    "body": "Completely new feature: show Bluetooth headset battery in waybar. Unrelated to prior groups.",
+    "user": "stranger",
+    "created_at": "2026-09-02T11:00:00Z",
+    "changed_files": [
+      {
+        "path": "config/waybar/modules/bluetooth-battery.sh",
+        "patch": "@@ -0,0 +1,8 @@\n+#!/bin/bash\n+echo battery\n"
+      },
+      {
+        "path": "config/waybar/config.jsonc",
+        "patch": "@@ -15,0 +16,3 @@\n+\"custom/bt-battery\": { \"exec\": \"bluetooth-battery.sh\" }\n"
+      }
+    ]
+  }
+]
