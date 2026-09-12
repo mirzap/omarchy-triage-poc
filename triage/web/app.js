@@ -561,7 +561,6 @@
     }
     root.classList.toggle("hidden", !state.fileQueueOpen);
     if (!state.fileQueueOpen) return;
-    const fq = state.fileQueue;
     const path = state.selectedFile;
     if (!path) {
       root.className = "file-queue muted";
