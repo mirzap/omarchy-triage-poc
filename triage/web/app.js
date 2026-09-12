@@ -53,6 +53,9 @@
     const pr = q.get("pr");
     if (pr && /^\d+$/.test(pr)) state.selectedPr = parseInt(pr, 10);
     else if (q.has("pr")) state.selectedPr = null;
+    const file = q.get("file");
+    if (file) state.selectedFile = file;
+    else if (q.has("file")) state.selectedFile = null;
   }
 
   function writeUrl(push) {
@@ -60,6 +63,7 @@
     q.set("tab", state.leftTab || "queue");
     if (state.selectedGroupId) q.set("group", state.selectedGroupId);
     if (state.selectedPr) q.set("pr", String(state.selectedPr));
+    if (state.selectedFile) q.set("file", state.selectedFile);
     const next = "?" + q.toString();
     if (next === location.search) return;
     writingUrl = true;
@@ -117,11 +121,17 @@
           return n >= 2 && n <= 24;
         }) || gs.find((g) => (g.pr_numbers || []).length <= 24);
       state.selectedGroupId = pick ? pick.group_id : null;
-      state.selectedFile = null;
+      if (!new URLSearchParams(location.search).get("file")) state.selectedFile = null;
     }
     setLeftTab(state.leftTab, true);
     render();
     writeUrl(false);
+    if (
+      state.selectedFile &&
+      (!state.fileQueue || state.fileQueue.path !== state.selectedFile)
+    ) {
+      openFileQueue(state.selectedFile, { fromUrl: true });
+    }
   }
 
   function ruleFor(groupId) {
@@ -653,21 +663,23 @@
     });
   }
 
-  async function openFileQueue(path) {
+  async function openFileQueue(path, opts) {
+    const fromUrl = !!(opts && opts.fromUrl);
     state.selectedFile = path;
     state.fileQueue = { path: path, prs: [], loading: true, same_patch: [] };
-    const block = $("fileQueueBlock");
-    if (block && block.tagName === "DETAILS") block.open = true;
+    const extra = $("fileQueueBlock");
+    if (!fromUrl && extra && extra.tagName === "DETAILS") extra.open = true;
+    writeUrl(!fromUrl);
     renderFileQueue();
     const g = state.groups.find((x) => x.group_id === state.selectedGroupId);
-    if (g) renderDiffs(g);
+    if (g) renderDiffs(g, { scroll: true });
     try {
       const data = await api("/api/file?path=" + encodeURIComponent(path));
       if (state.selectedFile !== path) return;
       state.fileQueue = data;
       renderFileQueue();
       const g2 = state.groups.find((x) => x.group_id === state.selectedGroupId);
-      if (g2) renderDiffs(g2);
+      if (g2) renderDiffs(g2, { scroll: true });
     } catch (err) {
       if (state.selectedFile !== path) return;
       state.fileQueue = { path: path, prs: [], error: err.message };
@@ -1070,9 +1082,28 @@
 
   let diffGen = 0;
 
-  async function renderDiffs(g) {
+  let lastScrolledFile = null;
+
+  function scrollToDiff() {
+    const pane = document.querySelector(".pane.center");
+    const block = $("diffBlock");
+    if (!pane || !block) return;
+    const path = state.selectedFile;
+    lastScrolledFile = path;
+    requestAnimationFrame(() => {
+      const paneRect = pane.getBoundingClientRect();
+      const blockRect = block.getBoundingClientRect();
+      pane.scrollTo({
+        top: pane.scrollTop + blockRect.top - paneRect.top - 8,
+        behavior: "smooth",
+      });
+    });
+  }
+
+  async function renderDiffs(g, opts) {
     const root = $("diffPanels");
     const path = state.selectedFile;
+    const shouldScroll = !!(opts && opts.scroll);
     if (!path) {
       root.innerHTML = '<div class="muted diff-hint">Pick a file above to compare hunks.</div>';
       return;
@@ -1093,10 +1124,7 @@
     const gen = ++diffGen;
     const meta = $("diffMeta");
     if (meta) meta.textContent = path + " · " + nums.length + " PRs in this group";
-    const block = $("diffBlock");
-    if (block && block.scrollIntoView) {
-      block.scrollIntoView({ block: "start" });
-    }
+    if (shouldScroll) scrollToDiff();
     if (!root.querySelector(".diff-panel")) {
       root.innerHTML = '<div class="muted diff-hint">Loading patches…</div>';
     }
@@ -1167,6 +1195,7 @@
         "</div>";
       root.appendChild(panel);
     });
+    if (shouldScroll) scrollToDiff();
     if (!withPatch.length) {
       const hint = document.createElement("div");
       hint.className = "muted diff-hint";
@@ -1565,6 +1594,7 @@
     readUrl();
     setLeftTab(state.leftTab, true);
     renderDetail();
+    if (state.selectedFile) openFileQueue(state.selectedFile, { fromUrl: true });
   });
 
   readUrl();
