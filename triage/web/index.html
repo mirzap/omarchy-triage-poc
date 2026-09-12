@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Omarchy triage</title>
-  <link rel="stylesheet" href="/styles.css?v=11" />
+  <link rel="stylesheet" href="/styles.css?v=12" />
 </head>
 <body>
   <header class="topbar">
@@ -93,9 +93,23 @@
         </details>
       </div>
     </section>
+
+    <aside class="pane right hidden" id="userDrawer" aria-hidden="true">
+      <div class="user-drawer-head">
+        <div class="row">
+          <div>
+            <div class="mono" id="userDrawerName"></div>
+            <div class="muted" id="userDrawerMeta"></div>
+            <a id="userDrawerGh" href="#" target="_blank" rel="noopener">GitHub profile</a>
+          </div>
+          <button type="button" id="userDrawerClose" class="btn">Close</button>
+        </div>
+      </div>
+      <div id="userDrawerList" class="user-drawer-list"></div>
+    </aside>
   </main>
 
   <script src="/vendor/virtual.js"></script>
-  <script src="/app.js?v=11"></script>
+  <script src="/app.js?v=12"></script>
 </body>
 </html>

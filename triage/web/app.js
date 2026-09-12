@@ -28,6 +28,7 @@
     new_pr_numbers: [],
     fileQueue: null,
     fileQueueOpen: false,
+    selectedUser: null,
     related: null,
     relatedKey: "",
     fetching: false,
@@ -56,6 +57,9 @@
     const file = q.get("file");
     if (file) state.selectedFile = file;
     else if (q.has("file")) state.selectedFile = null;
+    const user = q.get("user");
+    if (user) state.selectedUser = user;
+    else if (q.has("user")) state.selectedUser = null;
   }
 
   function writeUrl(push) {
@@ -64,6 +68,7 @@
     if (state.selectedGroupId) q.set("group", state.selectedGroupId);
     if (state.selectedPr) q.set("pr", String(state.selectedPr));
     if (state.selectedFile) q.set("file", state.selectedFile);
+    if (state.selectedUser) q.set("user", state.selectedUser);
     const next = "?" + q.toString();
     if (next === location.search) return;
     writingUrl = true;
@@ -132,6 +137,7 @@
     ) {
       openFileQueue(state.selectedFile, { fromUrl: true });
     }
+    renderUserDrawer();
   }
 
   function ruleFor(groupId) {
@@ -775,6 +781,120 @@
     });
   }
 
+  function prsByUser(name) {
+    const key = (name || "").toLowerCase();
+    return state.prs
+      .filter((p) => (p.user || "").toLowerCase() === key)
+      .sort((a, b) => (b.number || 0) - (a.number || 0));
+  }
+
+  function openUserDrawer(name) {
+    if (!name || name === "?") return;
+    state.selectedUser = name;
+    renderUserDrawer();
+    writeUrl(true);
+  }
+
+  function closeUserDrawer() {
+    if (!state.selectedUser) return;
+    state.selectedUser = null;
+    renderUserDrawer();
+    writeUrl(true);
+  }
+
+  function renderUserDrawer() {
+    const pane = $("userDrawer");
+    const layout = document.querySelector(".layout");
+    if (!pane || !layout) return;
+    const user = state.selectedUser;
+    layout.classList.toggle("drawer-open", !!user);
+    pane.classList.toggle("hidden", !user);
+    pane.setAttribute("aria-hidden", user ? "false" : "true");
+    if (!user) return;
+    const prs = prsByUser(user);
+    const byG = new Map();
+    for (const pr of prs) {
+      const gid = pr.group_id || "?";
+      if (!byG.has(gid)) byG.set(gid, []);
+      byG.get(gid).push(pr);
+    }
+    const needs = new Set((state.queue && state.queue.needs_you) || []);
+    const groups = [...byG.entries()].sort((a, b) => {
+      if (b[1].length !== a[1].length) return b[1].length - a[1].length;
+      return a[0].localeCompare(b[0]);
+    });
+    const inQueue = groups.filter(([gid]) => needs.has(gid)).length;
+    $("userDrawerName").textContent = user;
+    $("userDrawerMeta").textContent =
+      prs.length +
+      " open PRs · " +
+      groups.length +
+      " shape" +
+      (groups.length === 1 ? "" : "s") +
+      (inQueue ? " · " + inQueue + " in queue" : "");
+    const gh = $("userDrawerGh");
+    gh.href = "https://github.com/" + encodeURIComponent(user);
+    const list = $("userDrawerList");
+    list.innerHTML = "";
+    if (!prs.length) {
+      const empty = document.createElement("div");
+      empty.className = "muted pile-empty";
+      empty.textContent = "No open PRs in the cache.";
+      list.appendChild(empty);
+      return;
+    }
+    for (const [gid, members] of groups) {
+      const g = groupById(gid);
+      const head = document.createElement("button");
+      head.type = "button";
+      head.className = "pile-head user-shape";
+      const n = g ? (g.pr_numbers || []).length : members.length;
+      const dec = (g && g.suggested_decision) || "";
+      head.textContent =
+        gid +
+        " · " +
+        members.length +
+        (n !== members.length ? " of " + n : "") +
+        (dec ? " · " + dec : "") +
+        (needs.has(gid) ? " · queue" : "");
+      head.addEventListener("click", () => {
+        if (gid && gid !== "?") state.selectedGroupId = gid;
+        state.selectedPr = members[0].number;
+        state.selectedFile = null;
+        render();
+      });
+      list.appendChild(head);
+      members.forEach((pr) => {
+        const row = document.createElement("div");
+        row.className = "pr-row" + (state.selectedPr === pr.number ? " selected" : "");
+        row.innerHTML =
+          '<span class="num">#' +
+          pr.number +
+          '</span><span class="meta" title="' +
+          escapeHtml(pr.title || "") +
+          '">' +
+          escapeHtml(pr.title || "") +
+          "</span>";
+        row.addEventListener("click", () => {
+          if (pr.group_id) state.selectedGroupId = pr.group_id;
+          state.selectedPr = pr.number;
+          render();
+        });
+        list.appendChild(row);
+      });
+    }
+  }
+
+  function bindUserLink(el, name) {
+    if (!el || !name || name === "?") return;
+    el.classList.add("user-link");
+    el.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      openUserDrawer(name);
+    });
+  }
+
   function makePill(text, cls) {
     const el = document.createElement("span");
     el.className = "pill " + (cls || text);
@@ -810,8 +930,19 @@
         pr.number +
         "</a> " +
         escapeHtml(pr.title || "");
-      $("detailMeta").textContent =
-        (pr.user || "") + (rule ? " · marked " + rule.decision : " · unreviewed");
+      const meta = $("detailMeta");
+      meta.textContent = "";
+      if (pr.user) {
+        const ub = document.createElement("button");
+        ub.type = "button";
+        ub.className = "user-link";
+        ub.textContent = pr.user;
+        bindUserLink(ub, pr.user);
+        meta.appendChild(ub);
+      }
+      meta.appendChild(
+        document.createTextNode(rule ? " · marked " + rule.decision : " · unreviewed")
+      );
     } else {
       $("detailKicker").textContent = g.group_id + " · " + n + (n === 1 ? " PR" : " PRs");
       $("detailTitle").textContent = firstTitle || g.group_id;
@@ -915,8 +1046,9 @@
     li.innerHTML = `
       <a href="${escapeHtml(href)}" target="_blank" rel="noopener">#${num}</a>
       <span title="${escapeHtml(pr.title || "")}">${escapeHtml(pr.title || "")}</span>
-      <span class="user muted">${escapeHtml(pr.user || "")}</span>
+      <button type="button" class="user muted">${escapeHtml(pr.user || "")}</button>
       <span class="${labelClass}">${escapeHtml(pr.label || "")}</span>`;
+    bindUserLink(li.querySelector(".user"), pr.user);
     li.addEventListener("click", (ev) => {
       if (ev.target.tagName === "A") return;
       state.selectedPr = num;
@@ -1182,9 +1314,12 @@
         escapeHtml(href) +
         '" target="_blank" rel="noopener">#' +
         pr.number +
-        " " +
+        "</a> " +
+        '<button type="button" class="user-link" data-user="' +
         escapeHtml(pr.user || "") +
-        "</a>" +
+        '">' +
+        escapeHtml(pr.user || "") +
+        "</button>" +
         '<span class="diff-tag ' +
         (same ? "same" : "diff") +
         '">' +
@@ -1194,6 +1329,7 @@
         colorizeDiff(shown || "(empty patch)") +
         "</div>";
       root.appendChild(panel);
+      bindUserLink(panel.querySelector("[data-user]"), pr.user);
     });
     if (shouldScroll) scrollToDiff();
     if (!withPatch.length) {
@@ -1454,6 +1590,7 @@
     else renderGroupList();
     renderDetail();
     writeUrl(true);
+    if (state.selectedUser) renderUserDrawer();
   }
 
   async function loadState() {
@@ -1589,12 +1726,18 @@
   $("tabQueue").addEventListener("click", () => setLeftTab("queue"));
   $("tabGroups").addEventListener("click", () => setLeftTab("groups"));
   $("tabAllPrs").addEventListener("click", () => setLeftTab("allprs"));
+  const userClose = $("userDrawerClose");
+  if (userClose) userClose.addEventListener("click", closeUserDrawer);
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && state.selectedUser) closeUserDrawer();
+  });
   window.addEventListener("popstate", () => {
     if (writingUrl) return;
     readUrl();
     setLeftTab(state.leftTab, true);
     renderDetail();
     if (state.selectedFile) openFileQueue(state.selectedFile, { fromUrl: true });
+    renderUserDrawer();
   });
 
   readUrl();
