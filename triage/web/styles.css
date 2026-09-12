@@ -552,3 +552,32 @@ pre.diff .hunk { color: #71717a; }
   font-weight: 600;
 }
 .queue-toggle:hover { color: var(--text); }
+
+a.pr-link { color: var(--accent); font-family: var(--mono); }
+.diff-code {
+  margin: 0;
+  max-height: 320px;
+  overflow: auto;
+  background: #09090b;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.diff-line {
+  display: grid;
+  grid-template-columns: 44px 44px 1fr;
+  min-width: max-content;
+}
+.diff-line .ln {
+  color: #52525b;
+  text-align: right;
+  padding: 0 8px;
+  user-select: none;
+  border-right: 1px solid #27272a;
+}
+.diff-line .src { padding: 0 10px; white-space: pre; color: #d4d4d8; }
+.diff-line.add { background: #052e16; }
+.diff-line.add .src { color: #34d399; }
+.diff-line.del { background: #3f0d0d; }
+.diff-line.del .src { color: #f87171; }
+.diff-line.hunk .src, .diff-line.meta .src { color: #71717a; }

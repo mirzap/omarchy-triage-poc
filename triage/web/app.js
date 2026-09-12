@@ -856,23 +856,62 @@
   }
 
 
+  function prUrl(pr) {
+    if (pr && pr.html_url) return pr.html_url;
+    const repo = state.repo || "omacom/omarchy";
+    return "https://github.com/" + repo + "/pull/" + (pr && pr.number ? pr.number : "");
+  }
+
   function colorizeDiff(patch) {
-    const lines = String(patch || "").split("\n");
-    return lines
-      .map((line) => {
-        const esc = escapeHtml(line);
-        if (line.startsWith("+") && !line.startsWith("+++")) {
-          return '<span class="add">' + esc + "</span>";
-        }
-        if (line.startsWith("-") && !line.startsWith("---")) {
-          return '<span class="del">' + esc + "</span>";
-        }
-        if (line.startsWith("@@")) {
-          return '<span class="hunk">' + esc + "</span>";
-        }
-        return esc;
-      })
-      .join("\n");
+    const hunkRe = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/;
+    let oldN = 0;
+    let newN = 0;
+    const rows = [];
+    function row(oldL, newL, text, cls) {
+      rows.push(
+        '<div class="diff-line ' +
+          cls +
+          '"><span class="ln">' +
+          (oldL || "") +
+          '</span><span class="ln">' +
+          (newL || "") +
+          '</span><span class="src">' +
+          escapeHtml(text) +
+          "</span></div>"
+      );
+    }
+    String(patch || "").split("\n").forEach((line) => {
+      const m = line.match(hunkRe);
+      if (m) {
+        oldN = parseInt(m[1], 10);
+        newN = parseInt(m[2], 10);
+        row("", "", line, "hunk");
+        return;
+      }
+      if (
+        line.startsWith("+++") ||
+        line.startsWith("---") ||
+        line.startsWith("diff ") ||
+        line.startsWith("index ")
+      ) {
+        row("", "", line, "meta");
+        return;
+      }
+      if (line.startsWith("+")) {
+        row("", String(newN), line, "add");
+        newN += 1;
+        return;
+      }
+      if (line.startsWith("-")) {
+        row(String(oldN), "", line, "del");
+        oldN += 1;
+        return;
+      }
+      row(oldN ? String(oldN) : "", newN ? String(newN) : "", line, "ctx");
+      if (oldN) oldN += 1;
+      if (newN) newN += 1;
+    });
+    return rows.join("");
   }
 
   let diffGen = 0;
@@ -953,21 +992,25 @@
       const same = patch === firstPatch;
       const panel = document.createElement("div");
       panel.className = "diff-panel";
+      const href = prUrl(pr);
+      const shown = patch && patch.length > 4000 ? patch.slice(0, 4000) + "\n… truncated" : patch;
       panel.innerHTML =
         '<div class="diff-panel-head">' +
-        '<span><span class="mono">#' +
+        '<a class="pr-link" href="' +
+        escapeHtml(href) +
+        '" target="_blank" rel="noopener">#' +
         pr.number +
-        "</span> " +
+        " " +
         escapeHtml(pr.user || "") +
-        "</span>" +
+        "</a>" +
         '<span class="diff-tag ' +
         (same ? "same" : "diff") +
         '">' +
         (patch ? (same ? "same hunk" : "different") : "no patch") +
         "</span></div>" +
-        '<pre class="diff">' +
-        colorizeDiff((patch && patch.length > 4000 ? patch.slice(0, 4000) + "\n… truncated" : patch) || "(empty patch)") +
-        "</pre>";
+        '<div class="diff-code">' +
+        colorizeDiff(shown || "(empty patch)") +
+        "</div>";
       root.appendChild(panel);
     });
     if (!withPatch.length) {
