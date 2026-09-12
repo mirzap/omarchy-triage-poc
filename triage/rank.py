@@ -16,24 +16,65 @@ from triage.gh import cached_pr_files
 from triage.github import parse_repo
 from triage.store import DEFAULT_STORE_PATH, load_store
 
-MODEL = "voyageai/voyage-code-4"
-DIM = 1024
-MAX_CHARS = 4000
+PROVIDERS = {
+    "together": {
+        "url": "https://api.together.xyz/v1/embeddings",
+        "model": "togethercomputer/m2-bert-80M-8k-retrieval",
+        "dim": 768,
+        "env": "TOGETHER_API_KEY",
+        "keyfile": "together.key",
+        "max_chars": 2000,
+        "payload_extra": {},
+        "headers_extra": {},
+    },
+    "openrouter": {
+        "url": "https://openrouter.ai/api/v1/embeddings",
+        "model": "voyageai/voyage-code-4",
+        "dim": 1024,
+        "env": "OPENROUTER_API_KEY",
+        "keyfile": "openrouter.key",
+        "max_chars": 4000,
+        "payload_extra": {"dimensions": 1024, "encoding_format": "float"},
+        "headers_extra": {
+            "HTTP-Referer": "http://127.0.0.1:8741",
+            "X-Title": "omarchy-triage-poc",
+        },
+    },
+}
+
 BATCH = 8
 CANDIDATE_CAP = 24
 MAX_BATCH_CHARS = 400000
-OPENROUTER_URL = "https://openrouter.ai/api/v1/embeddings"
-CACHE_PATH = Path(".triage") / "embeddings.json"
 
 _HEX = re.compile(r"\b[0-9a-f]{7,}\b", re.I)
 _NUM = re.compile(r"\b\d{4,}\b")
 
 
+def provider_name() -> str:
+    raw = (os.environ.get("EMBED_PROVIDER") or "together").strip().lower()
+    return raw if raw in PROVIDERS else "together"
+
+
+def provider() -> dict[str, Any]:
+    cfg = dict(PROVIDERS[provider_name()])
+    model = (os.environ.get("EMBED_MODEL") or "").strip()
+    if model:
+        cfg["model"] = model
+    return cfg
+
+
+def cache_path() -> Path:
+    cfg = provider()
+    slug = cfg["model"].replace("/", "-")
+    return Path(".triage") / f"embeddings-{provider_name()}-{slug}.json"
+
+
 def api_key() -> str:
-    env = (os.environ.get("OPENROUTER_API_KEY") or "").strip()
+    cfg = provider()
+    env = (os.environ.get(cfg["env"]) or "").strip()
     if env:
         return env
-    p = Path(".triage") / "openrouter.key"
+    p = Path(".triage") / cfg["keyfile"]
     if p.is_file():
         return p.read_text(encoding="utf-8").strip()
     return ""
@@ -48,8 +89,9 @@ def normalize_patch(text: str) -> str:
         line = _NUM.sub("<n>", line)
         kept.append(line)
     out = "\n".join(kept).strip()
-    if len(out) > MAX_CHARS:
-        out = out[:MAX_CHARS]
+    cap = int(provider().get("max_chars") or 4000)
+    if len(out) > cap:
+        out = out[:cap]
     return out
 
 
@@ -65,8 +107,9 @@ def patch_text(owner: str, name: str, number: int, file_path: str | None = None)
             continue
         parts.append(f"# {path}\n{patch}")
     joined = "\n\n".join(parts)
-    if len(joined) > MAX_CHARS:
-        joined = joined[:MAX_CHARS]
+    cap = int(provider().get("max_chars") or 4000)
+    if len(joined) > cap:
+        joined = joined[:cap]
     return joined
 
 
@@ -78,18 +121,21 @@ def _cache_key(number: int, file_path: str | None) -> str:
     return f"{number}::{file_path}" if file_path else str(number)
 
 
-def load_cache(path: Path = CACHE_PATH) -> dict[str, Any]:
+def load_cache(path: Path | None = None) -> dict[str, Any]:
+    cfg = provider()
+    path = path or cache_path()
     if not path.exists():
-        return {"model": MODEL, "dim": DIM, "items": {}}
+        return {"model": cfg["model"], "dim": cfg["dim"], "items": {}}
     with path.open("r", encoding="utf-8") as fh:
         data = json.load(fh)
-    if data.get("model") != MODEL or int(data.get("dim") or 0) != DIM:
-        return {"model": MODEL, "dim": DIM, "items": {}}
+    if data.get("model") != cfg["model"] or int(data.get("dim") or 0) != cfg["dim"]:
+        return {"model": cfg["model"], "dim": cfg["dim"], "items": {}}
     data.setdefault("items", {})
     return data
 
 
-def save_cache(data: dict[str, Any], path: Path = CACHE_PATH) -> None:
+def save_cache(data: dict[str, Any], path: Path | None = None) -> None:
+    path = path or cache_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     with tmp.open("w", encoding="utf-8") as fh:
@@ -98,23 +144,19 @@ def save_cache(data: dict[str, Any], path: Path = CACHE_PATH) -> None:
 
 
 def _post_embed(texts: list[str], key: str) -> list[list[float]]:
-    payload = json.dumps(
-        {
-            "model": MODEL,
-            "input": texts,
-            "dimensions": DIM,
-            "encoding_format": "float",
-        }
-    ).encode("utf-8")
+    cfg = provider()
+    body = {"model": cfg["model"], "input": texts}
+    body.update(cfg.get("payload_extra") or {})
+    payload = json.dumps(body).encode("utf-8")
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+    }
+    headers.update(cfg.get("headers_extra") or {})
     req = urllib.request.Request(
-        OPENROUTER_URL,
+        cfg["url"],
         data=payload,
-        headers={
-            "Authorization": f"Bearer {key}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "http://127.0.0.1:8741",
-            "X-Title": "omarchy-triage-poc",
-        },
+        headers=headers,
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=90) as resp:
@@ -147,9 +189,9 @@ def _embed_batch(texts: list[str], key: str) -> list[list[float]]:
 def ensure_vectors(
     jobs: list[tuple[str, str]],
     key: str,
-    cache_path: Path = CACHE_PATH,
+    cache_file: Path | None = None,
 ) -> dict[str, list[float]]:
-    cache = load_cache(cache_path)
+    cache = load_cache(cache_file)
     items: dict[str, Any] = cache["items"]
     out: dict[str, list[float]] = {}
     missing: list[tuple[str, str]] = []
@@ -168,7 +210,7 @@ def ensure_vectors(
             items[ck] = {"hash": _text_hash(text), "vec": vec}
             out[ck] = vec
         cache["items"] = items
-        save_cache(cache, cache_path)
+        save_cache(cache, cache_file)
     return out
 
 
@@ -213,9 +255,12 @@ def related(
 ) -> dict[str, Any]:
     key = api_key()
     if not key:
+        cfg = provider()
         return {
             "enabled": False,
-            "reason": "OPENROUTER_API_KEY missing",
+            "provider": provider_name(),
+            "model": cfg["model"],
+            "reason": f"{cfg['env']} missing (or .triage/{cfg['keyfile']}). Switch with EMBED_PROVIDER=together|openrouter.",
             "query": pr_number,
             "related": [],
         }
@@ -241,12 +286,13 @@ def related(
         vecs = ensure_vectors(jobs, key)
     except urllib.error.HTTPError as exc:
         if exc.code == 402:
-            reason = "OpenRouter needs credits — https://openrouter.ai/settings/credits"
+            reason = f"{provider_name()} needs credits"
         else:
             detail = exc.read().decode("utf-8", errors="replace")[:180]
-            reason = f"openrouter {exc.code}: {detail}"
+            reason = f"{provider_name()} {exc.code}: {detail}"
         return {
             "enabled": True,
+            "provider": provider_name(),
             "reason": reason,
             "query": pr_number,
             "related": [],
@@ -281,7 +327,8 @@ def related(
     return {
         "enabled": True,
         "reason": "",
-        "model": MODEL,
+        "provider": provider_name(),
+        "model": provider()["model"],
         "query": pr_number,
         "path": file_path or "",
         "related": ranked[:k],

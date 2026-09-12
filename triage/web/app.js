@@ -449,6 +449,10 @@
       return;
     }
     const key = pr + "|" + (path || "");
+    if (state.related && state.related.frozen) {
+      renderRelated();
+      return;
+    }
     if (state.relatedKey === key && state.related && !state.related.loading) {
       renderRelated();
       return;
@@ -462,7 +466,10 @@
       if (path) url += "&path=" + encodeURIComponent(path);
       const data = await api(url);
       if (gen !== relatedGen) return;
+      if (data && data.frozen) data.frozen = true;
       state.related = data;
+      if (data && (data.reason || "").indexOf("credits") >= 0) state.related.frozen = true;
+      if (data && data.enabled === false) state.related.frozen = true;
       renderRelated();
     } catch (err) {
       if (gen !== relatedGen) return;
@@ -487,20 +494,7 @@
     }
     if (!data.enabled || !(data.related || []).length) {
       root.className = "related-list muted";
-      const reason = data.reason || (data.enabled ? "No near-patch neighbors." : "OpenRouter key not set.");
-      root.textContent = "";
-      if (reason.indexOf("https://") >= 0) {
-        const [before, url] = [reason.split("https://")[0], "https://" + reason.split("https://", 1)[1]];
-        root.appendChild(document.createTextNode(before));
-        const a = document.createElement("a");
-        a.href = url.split(" ")[0];
-        a.target = "_blank";
-        a.rel = "noopener";
-        a.textContent = a.href;
-        root.appendChild(a);
-      } else {
-        root.textContent = reason;
-      }
+      root.textContent = data.reason || (data.enabled ? "No near-patch neighbors." : "Embedding key not set.");
       return;
     }
     const items = data.related || [];
@@ -536,18 +530,20 @@
   async function openFileQueue(path) {
     state.selectedFile = path;
     state.fileQueue = { path: path, prs: [], loading: true };
-    render();
+    renderFileQueue();
+    const g = state.groups.find((x) => x.group_id === state.selectedGroupId);
+    if (g) renderDiffs(g);
     try {
       const data = await api("/api/file?path=" + encodeURIComponent(path));
       if (state.selectedFile !== path) return;
       state.fileQueue = data;
-      const first = (data.prs || [])[0];
-      if (first && first.group_id) state.selectedGroupId = first.group_id;
-      render();
+      renderFileQueue();
+      const g2 = state.groups.find((x) => x.group_id === state.selectedGroupId);
+      if (g2) renderDiffs(g2);
     } catch (err) {
       if (state.selectedFile !== path) return;
       state.fileQueue = { path: path, prs: [], error: err.message };
-      render();
+      renderFileQueue();
     }
   }
 
@@ -873,14 +869,15 @@
 
   async function renderDiffs(g) {
     const root = $("diffPanels");
-    root.innerHTML = "";
     const path = state.selectedFile;
     if (!path) {
       root.innerHTML = '<div class="muted diff-hint">Click a file to see patches.</div>';
       return;
     }
-    const fqNums = (state.fileQueue && state.fileQueue.prs || []).map((p) => p.number);
-    const nums = fqNums.length ? fqNums.slice(0, 24) : (g.pr_numbers || []).slice();
+    const fqNums = ((state.fileQueue && state.fileQueue.prs) || [])
+      .map((p) => p.number)
+      .filter(Boolean);
+    const nums = (fqNums.length ? fqNums : (g.pr_numbers || [])).slice(0, 12);
     if (!nums.length) {
       root.innerHTML =
         '<div class="muted diff-hint">No patches for ' +
@@ -889,7 +886,9 @@
       return;
     }
     const gen = ++diffGen;
-    root.innerHTML = '<div class="muted diff-hint">Loading patches…</div>';
+    if (!root.querySelector(".diff-panel")) {
+      root.innerHTML = '<div class="muted diff-hint">Loading patches…</div>';
+    }
     const repo = state.repo || "omacom/omarchy";
     let data;
     try {
@@ -958,6 +957,21 @@
       hint.className = "muted diff-hint";
       hint.textContent = "Cached files have no patch for this path (binary or too large for GitHub).";
       root.prepend(hint);
+    }
+    const byPatch = {};
+    items.forEach((it) => {
+      const patch = it.patch || "";
+      if (!patch) return;
+      if (!byPatch[patch]) byPatch[patch] = [];
+      byPatch[patch].push(it.number);
+    });
+    const same = Object.keys(byPatch)
+      .map((k) => ({ pr_numbers: byPatch[k], count: byPatch[k].length }))
+      .filter((c) => c.count >= 2)
+      .sort((a, b) => b.count - a.count);
+    if (state.fileQueue && state.fileQueue.path === path) {
+      state.fileQueue.same_patch = same;
+      renderFileQueue();
     }
   }
 

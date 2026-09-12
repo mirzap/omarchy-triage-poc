@@ -6,12 +6,8 @@ import json
 from pathlib import Path
 from typing import Any
 
-from collections import defaultdict
-from hashlib import sha256
 
 from triage.classify import classify_group
-from triage.gh import cached_pr_files
-from triage.github import parse_repo
 from triage.models import Group, TrustedRule
 
 DEFAULT_STORE_DIR = Path(".triage")
@@ -296,35 +292,10 @@ def prs_for_path(file_path: str, path: Path = DEFAULT_STORE_PATH, limit: int = 4
                 "label": pr.get("label") or "needs-human",
             })
     hits.sort(key=lambda x: -(x["number"] or 0))
-    repo = data.get("repo") or "omacom/omarchy"
-    try:
-        owner, name = parse_repo(repo)
-    except ValueError:
-        owner, name = "omacom", "omarchy"
-    shown = hits[:limit]
-    by_sha: dict[str, list[int]] = defaultdict(list)
-    for hit in hits:
-        files = cached_pr_files(owner, name, int(hit["number"] or 0))
-        patch = ""
-        for f in files:
-            if f.get("path") == file_path:
-                patch = f.get("patch") or ""
-                break
-        sha = sha256(patch.encode("utf-8")).hexdigest()[:12] if patch else ""
-        hit["patch_sha"] = sha
-        if sha:
-            by_sha[sha].append(int(hit["number"]))
-    same = [
-        {"patch_sha": sha, "pr_numbers": nums, "count": len(nums)}
-        for sha, nums in by_sha.items()
-        if len(nums) >= 2
-    ]
-    same.sort(key=lambda c: -c["count"])
     return {
         "path": file_path,
         "pr_count": len(hits),
-        "prs": shown,
-        "same_patch": same,
+        "prs": hits[:limit],
         "truncated": max(0, len(hits) - limit),
     }
 
