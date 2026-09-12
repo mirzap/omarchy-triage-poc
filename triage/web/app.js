@@ -26,6 +26,7 @@
     leftTab: "queue", // queue | groups | allprs
     queue: {},
     new_pr_numbers: [],
+    fileQueue: null,
     fetching: false,
   };
 
@@ -426,15 +427,78 @@
         hs.pr_count +
         " PRs</span>";
       row.addEventListener("click", () => {
-        state.selectedFile = hs.path;
-        const hit = state.groups.find((g) =>
-          (g.shared_files || []).includes(hs.path) ||
-          (g.pr_numbers || []).some((n) => {
-            const pr = prByNumber(n);
-            return pr && (pr.paths || []).includes(hs.path);
-          })
-        );
-        if (hit) state.selectedGroupId = hit.group_id;
+        openFileQueue(hs.path);
+      });
+      root.appendChild(row);
+    });
+  }
+
+  async function openFileQueue(path) {
+    state.selectedFile = path;
+    state.fileQueue = { path: path, prs: [], loading: true };
+    render();
+    try {
+      const data = await api("/api/file?path=" + encodeURIComponent(path));
+      if (state.selectedFile !== path) return;
+      state.fileQueue = data;
+      const first = (data.prs || [])[0];
+      if (first && first.group_id) state.selectedGroupId = first.group_id;
+      render();
+    } catch (err) {
+      if (state.selectedFile !== path) return;
+      state.fileQueue = { path: path, prs: [], error: err.message };
+      render();
+    }
+  }
+
+  function renderFileQueue() {
+    const root = $("fileQueue");
+    if (!root) return;
+    const fq = state.fileQueue;
+    const path = state.selectedFile;
+    if (!path) {
+      root.className = "file-queue muted";
+      root.textContent = "Click a hotspot or a file row.";
+      return;
+    }
+    if (fq && fq.loading) {
+      root.className = "file-queue muted";
+      root.textContent = "Loading PRs on " + path + "…";
+      return;
+    }
+    if (fq && fq.error) {
+      root.className = "file-queue muted";
+      root.textContent = "error: " + fq.error;
+      return;
+    }
+    const items = (fq && fq.prs) || [];
+    const extra = fq && fq.truncated ? " · +" + fq.truncated + " hidden" : "";
+    root.className = "file-queue";
+    root.innerHTML = "";
+    const head = document.createElement("div");
+    head.className = "muted";
+    head.textContent = path + " · " + ((fq && fq.pr_count) || items.length) + " PRs" + extra;
+    root.appendChild(head);
+    items.forEach((pr) => {
+      const row = document.createElement("div");
+      row.className = "hotspot-row";
+      if (state.selectedPr === pr.number) row.classList.add("selected");
+      row.innerHTML =
+        '<a class="mono" href="' +
+        escapeHtml(pr.html_url || "#") +
+        '" target="_blank" rel="noopener">#' +
+        pr.number +
+        '</a><span title="' +
+        escapeHtml(pr.title || "") +
+        '">' +
+        escapeHtml(pr.title || "") +
+        '</span><span class="muted">' +
+        escapeHtml(pr.group_id || "") +
+        "</span>";
+      row.addEventListener("click", (ev) => {
+        if (ev.target.tagName === "A") return;
+        if (pr.group_id) state.selectedGroupId = pr.group_id;
+        state.selectedPr = pr.number;
         render();
       });
       root.appendChild(row);
@@ -452,6 +516,7 @@
     }
     empty.classList.add("hidden");
     detail.classList.remove("hidden");
+    renderFileQueue();
 
     const rule = ruleFor(g.group_id);
     $("detailId").textContent = g.group_id;
@@ -642,9 +707,7 @@
         tr.appendChild(td);
       });
       tr.addEventListener("click", () => {
-        state.selectedFile = row.path;
-        renderOverlap(g);
-        renderDiffs(g);
+        openFileQueue(row.path);
       });
       tbody.appendChild(tr);
     });
@@ -681,7 +744,8 @@
       root.innerHTML = '<div class="muted diff-hint">Click a file to see patches.</div>';
       return;
     }
-    const nums = (g.pr_numbers || []).slice();
+    const fqNums = (state.fileQueue && state.fileQueue.prs || []).map((p) => p.number);
+    const nums = fqNums.length ? fqNums.slice(0, 24) : (g.pr_numbers || []).slice();
     if (!nums.length) {
       root.innerHTML =
         '<div class="muted diff-hint">No patches for ' +

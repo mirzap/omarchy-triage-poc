@@ -20,6 +20,7 @@ from triage.store import (
     decide_group,
     load_store,
     overlap_for_group,
+    prs_for_path,
     ui_state,
 )
 
@@ -259,6 +260,14 @@ class TriageHandler(BaseHTTPRequestHandler):
                 self._send_json(200, overlap_for_group(group_id, path=self.store_path))
             except KeyError as exc:
                 self._send_json(404, {"error": str(exc)})
+            return
+        if path == "/api/file":
+            qs = parse_qs(parsed.query)
+            file_path = (qs.get("path") or [""])[0]
+            if not file_path:
+                self._send_json(400, {"error": "path required"})
+                return
+            self._send_json(200, prs_for_path(file_path, path=self.store_path))
             return
         if path == "/api/patches":
             qs = parse_qs(parsed.query)

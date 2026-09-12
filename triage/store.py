@@ -265,6 +265,30 @@ def _slim_pr_for_ui(pr: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def prs_for_path(file_path: str, path: Path = DEFAULT_STORE_PATH, limit: int = 40) -> dict:
+    """Open PRs that touch file_path (from persisted slim PRs)."""
+    data = load_store(path)
+    hits = []
+    for pr in data.get("last_prs") or []:
+        paths = pr.get("paths") or []
+        if file_path in paths:
+            hits.append({
+                "number": pr.get("number"),
+                "title": pr.get("title") or "",
+                "user": pr.get("user") or "",
+                "group_id": pr.get("group_id") or "",
+                "html_url": pr.get("html_url") or "",
+                "label": pr.get("label") or "needs-human",
+            })
+    hits.sort(key=lambda x: -(x["number"] or 0))
+    return {
+        "path": file_path,
+        "pr_count": len(hits),
+        "prs": hits[:limit],
+        "truncated": max(0, len(hits) - limit),
+    }
+
+
 def ui_state(path: Path = DEFAULT_STORE_PATH) -> dict[str, Any]:
     """Slim dashboard payload. Full overlap matrices are lazy via overlap_for_group."""
     data = load_store(path)
