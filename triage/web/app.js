@@ -42,6 +42,32 @@
 
   const $ = (id) => document.getElementById(id);
 
+  let writingUrl = false;
+
+  function readUrl() {
+    const q = new URLSearchParams(location.search);
+    const tab = q.get("tab");
+    if (tab === "queue" || tab === "groups" || tab === "allprs") state.leftTab = tab;
+    const gid = q.get("group");
+    if (gid) state.selectedGroupId = gid;
+    const pr = q.get("pr");
+    if (pr && /^\d+$/.test(pr)) state.selectedPr = parseInt(pr, 10);
+    else if (q.has("pr")) state.selectedPr = null;
+  }
+
+  function writeUrl(push) {
+    const q = new URLSearchParams();
+    q.set("tab", state.leftTab || "queue");
+    if (state.selectedGroupId) q.set("group", state.selectedGroupId);
+    if (state.selectedPr) q.set("pr", String(state.selectedPr));
+    const next = "?" + q.toString();
+    if (next === location.search) return;
+    writingUrl = true;
+    if (push) history.pushState(null, "", next);
+    else history.replaceState(null, "", next);
+    writingUrl = false;
+  }
+
   function setStatus(msg) {
     $("status").textContent = msg;
   }
@@ -80,7 +106,10 @@
       state.selectedPr = null;
       state.selectedFile = null;
     }
-    if (!state.selectedGroupId && state.groups.length) {
+    if (state.selectedPr && !state.prs.some((p) => p.number === state.selectedPr)) {
+      state.selectedPr = null;
+    }
+    if (!state.selectedGroupId && state.groups.length && !new URLSearchParams(location.search).get("group")) {
       const gs = sortedGroups();
       const pick =
         gs.find((g) => {
@@ -90,7 +119,9 @@
       state.selectedGroupId = pick ? pick.group_id : null;
       state.selectedFile = null;
     }
+    setLeftTab(state.leftTab, true);
     render();
+    writeUrl(false);
   }
 
   function ruleFor(groupId) {
@@ -362,7 +393,7 @@
     return row;
   }
 
-  function setLeftTab(tab) {
+  function setLeftTab(tab, fromUrl) {
     state.leftTab = tab;
     const qTab = $("tabQueue");
     const groupsTab = $("tabGroups");
@@ -380,6 +411,7 @@
     if (tab === "queue") renderQueue();
     else if (tab === "groups") renderGroupList();
     else renderAllPrList();
+    if (!fromUrl) writeUrl(true);
   }
 
   function groupById(id) {
@@ -1392,6 +1424,7 @@
     else if (state.leftTab === "queue") renderQueue();
     else renderGroupList();
     renderDetail();
+    writeUrl(true);
   }
 
   async function loadState() {
@@ -1527,6 +1560,13 @@
   $("tabQueue").addEventListener("click", () => setLeftTab("queue"));
   $("tabGroups").addEventListener("click", () => setLeftTab("groups"));
   $("tabAllPrs").addEventListener("click", () => setLeftTab("allprs"));
+  window.addEventListener("popstate", () => {
+    if (writingUrl) return;
+    readUrl();
+    setLeftTab(state.leftTab, true);
+    renderDetail();
+  });
 
+  readUrl();
   loadState();
 })();
