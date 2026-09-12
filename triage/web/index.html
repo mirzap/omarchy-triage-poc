@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Omarchy triage</title>
-  <link rel="stylesheet" href="/styles.css?v=14" />
+  <link rel="stylesheet" href="/styles.css?v=15" />
 </head>
 <body>
   <header class="topbar">
@@ -73,16 +73,16 @@
             <button id="rejectBtn" type="button" class="btn danger">Reject</button>
           </div>
         </div>
-        <div class="block" id="prBodyBlock">
-          <h3 id="prBodyHead">What this does</h3>
-          <div id="prBody" class="pr-body muted"></div>
-        </div>
         <div class="block" id="membersBlock">
           <h3 id="membersHead">PRs in this shape</h3>
           <div id="detailMembersWrap" class="member-wrap">
             <ul id="detailMembers" class="member-list"></ul>
           </div>
         </div>
+        <details class="block more-block" id="prBodyBlock">
+          <summary id="prBodyHead" class="queue-toggle">Description</summary>
+          <div id="prBody" class="pr-body muted">Click a PR above.</div>
+        </details>
         <div class="block">
           <h3>Files in this shape</h3>
           <div id="overlapSummary" class="overlap-summary muted"></div>
@@ -130,6 +130,6 @@
   </main>
 
   <script src="/vendor/virtual.js"></script>
-  <script src="/app.js?v=14"></script>
+  <script src="/app.js?v=15"></script>
 </body>
 </html>

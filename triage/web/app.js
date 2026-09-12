@@ -1065,52 +1065,51 @@
     return data;
   }
 
+  let lastBodyPr = null;
+
   function renderPrBodies(g) {
     const root = $("prBody");
     const head = $("prBodyHead");
+    const block = $("prBodyBlock");
     if (!root) return;
     const selected = state.selectedPr;
-    const nums = selected
-      ? [selected]
-      : (g.pr_numbers || []).slice(0, 6);
-    if (head) {
-      head.textContent = selected
-        ? "What this PR does"
-        : "What these PRs do";
-    }
-    if (!nums.length) {
+    if (!selected) {
+      lastBodyPr = null;
+      if (block) block.open = false;
+      if (head) head.textContent = "Description";
       root.className = "pr-body muted";
-      root.textContent = "No PRs.";
+      root.textContent = "Click a PR above.";
       return;
     }
+    if (head) head.textContent = "Description · #" + selected;
+    if (block && lastBodyPr !== selected) block.open = true;
+    lastBodyPr = selected;
     const gen = ++bodyGen;
     root.className = "pr-body muted";
     root.textContent = "Loading description…";
-    Promise.all(nums.map((n) => loadPrBody(n).catch((err) => ({ number: n, error: err.message }))))
-      .then((items) => {
+    loadPrBody(selected)
+      .catch((err) => ({ number: selected, error: err.message }))
+      .then((it) => {
         if (gen !== bodyGen) return;
         root.className = "pr-body";
         root.innerHTML = "";
-        items.forEach((it) => {
-          const box = document.createElement("div");
-          box.className = "pr-body-item";
-          const who = document.createElement("div");
-          who.className = "who muted";
-          const pr = prByNumber(it.number) || it;
-          who.textContent =
-            "#" +
-            (it.number || "") +
-            " " +
-            (pr.user || it.user || "") +
-            (it.error ? " · " + it.error : "");
-          const text = document.createElement("div");
-          text.className = "pr-body-text";
-          const body = (it.body || "").trim();
-          text.textContent = body || "(no description)";
-          box.appendChild(who);
-          box.appendChild(text);
-          root.appendChild(box);
-        });
+        const box = document.createElement("div");
+        box.className = "pr-body-item";
+        const who = document.createElement("div");
+        who.className = "who muted";
+        const pr = prByNumber(it.number || selected) || it;
+        who.textContent =
+          "#" +
+          selected +
+          " " +
+          (pr.user || it.user || "") +
+          (it.error ? " · " + it.error : "");
+        const text = document.createElement("div");
+        text.className = "pr-body-text";
+        text.textContent = (it.body || "").trim() || "(no description)";
+        box.appendChild(who);
+        box.appendChild(text);
+        root.appendChild(box);
       });
   }
 
