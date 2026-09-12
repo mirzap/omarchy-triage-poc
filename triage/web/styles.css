@@ -785,3 +785,39 @@ button.user-shape:hover { color: var(--text); }
   border-bottom: none;
   padding: 0 2px 8px;
 }
+
+
+.pile-nav {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px;
+  margin: 0 0 8px;
+}
+.pile-nav.hidden { display: none; }
+.pile-tab {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 6px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--muted);
+  padding: 5px 8px;
+  cursor: pointer;
+  text-align: left;
+}
+.pile-tab:hover { color: var(--text); border-color: #52525b; }
+.pile-tab.active {
+  color: var(--text);
+  border-color: var(--accent-dim);
+  background: #1c1917;
+}
+.pile-tab.empty { opacity: 0.5; }
+.pile-tab .pile-name { font-size: 11px; }
+.pile-tab .pile-n {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--muted);
+}
+.pile-tab.active .pile-n { color: var(--accent); }

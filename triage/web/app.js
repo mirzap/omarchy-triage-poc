@@ -34,7 +34,17 @@
     fetching: false,
     filterQuery: "",
     filterLabel: "",
+    queuePile: "needs_you",
   };
+
+  const QUEUE_PILES = [
+    { id: "needs_you", label: "Needs you", hint: "No decision yet — the actual triage work" },
+    { id: "hardware", label: "Hardware", hint: "You marked Needs hardware" },
+    { id: "upgrade", label: "Upgrade", hint: "You marked Can break upgrade" },
+    { id: "known", label: "Known", hint: "Blessed or auto-approved shape" },
+    { id: "junk", label: "Junk", hint: "Rejected or singleton noise" },
+    { id: "hotspots", label: "Hotspots", hint: "Files touched by 20+ open PRs" },
+  ];
 
   let groupVirtualizer = null;
   let allPrVirtualizer = null;
@@ -65,6 +75,8 @@
     else if (q.has("user")) state.selectedUser = null;
     state.filterQuery = q.get("q") || "";
     state.filterLabel = q.get("label") || "";
+    const pile = q.get("pile");
+    if (pile && QUEUE_PILES.some((p) => p.id === pile)) state.queuePile = pile;
   }
 
   function writeUrl(push) {
@@ -76,6 +88,9 @@
     if (state.selectedUser) q.set("user", state.selectedUser);
     if (state.filterQuery) q.set("q", state.filterQuery);
     if (state.filterLabel) q.set("label", state.filterLabel);
+    if ((state.leftTab || "queue") === "queue" && state.queuePile) {
+      q.set("pile", state.queuePile);
+    }
     const next = "?" + q.toString();
     if (next === location.search) return;
     writingUrl = true;
@@ -134,6 +149,9 @@
         }) || gs.find((g) => (g.pr_numbers || []).length <= 24);
       state.selectedGroupId = pick ? pick.group_id : null;
       if (!new URLSearchParams(location.search).get("file")) state.selectedFile = null;
+    }
+    if (!new URLSearchParams(location.search).get("pile") && state.selectedGroupId) {
+      state.queuePile = pileForGroup(state.selectedGroupId);
     }
     setLeftTab(state.leftTab, true);
     render();
@@ -215,16 +233,21 @@
     const hdr = $("groupListHeader");
     const q = state.queue || {};
     const c = q.counts || {};
+    hdr.classList.remove("hidden");
     if (state.leftTab === "allprs") {
       const n = visibleAllPrs().length;
       hdr.textContent = hasListFilter() ? n + " of " + state.prs.length + " PRs" : state.prs.length + " PRs";
     } else if (state.leftTab === "queue") {
-      hdr.textContent =
-        (c.needs_you || 0) + " need you · " +
-        (c.hardware || 0) + " hw · " +
-        (c.upgrade || 0) + " upgrade · " +
-        (c.hotspots || 0) + " hotspots";
-      if (hasListFilter()) hdr.textContent += " · filtered";
+      paintPileNav();
+      const shown = queueRows().filter((r) => r.kind === "group" || r.kind === "hotspot").length;
+      const total = pileTotal(state.queuePile);
+      if (hasListFilter()) {
+        hdr.classList.remove("hidden");
+        hdr.textContent = shown + " of " + total + " match";
+      } else {
+        hdr.textContent = "";
+        hdr.classList.add("hidden");
+      }
     } else {
       const n = visibleGroups().length;
       hdr.textContent = hasListFilter()
@@ -497,6 +520,7 @@
     $("queueList").classList.toggle("hidden", tab !== "queue");
     $("groupList").classList.toggle("hidden", tab !== "groups");
     $("allPrList").classList.toggle("hidden", tab !== "allprs");
+    paintPileNav();
     renderLeftHeader();
     if (tab === "queue") renderQueue();
     else if (tab === "groups") renderGroupList();
@@ -608,6 +632,7 @@
     const inp = $("listFilter");
     if (inp && inp.value !== state.filterQuery) inp.value = state.filterQuery;
     paintLabelFilters();
+    paintPileNav();
     if (state.leftTab === "queue") renderQueue();
     else if (state.leftTab === "groups") renderGroupList();
     else renderAllPrList();
@@ -635,44 +660,99 @@
     });
   }
 
+  function pileForGroup(gid) {
+    const q = state.queue || {};
+    for (const p of QUEUE_PILES) {
+      if (p.id === "hotspots") continue;
+      if ((q[p.id] || []).indexOf(gid) >= 0) return p.id;
+    }
+    return "needs_you";
+  }
+
+  function pileItems(id) {
+    const q = state.queue || {};
+    if (id === "hotspots") {
+      const qtext = (state.filterQuery || "").trim().toLowerCase();
+      return (q.hotspots || []).filter((hs) => {
+        if (state.filterLabel) return false;
+        if (!qtext) return true;
+        return (hs.path || "").toLowerCase().includes(qtext);
+      });
+    }
+    const out = [];
+    for (const gid of q[id] || []) {
+      const g = groupById(gid);
+      if (g && groupMatches(g)) out.push(g);
+    }
+    return out;
+  }
+
+  function pileTotal(id) {
+    const q = state.queue || {};
+    if (id === "hotspots") return (q.hotspots || []).length;
+    return (q[id] || []).length;
+  }
+
+  function paintPileNav() {
+    const root = $("pileNav");
+    if (!root) return;
+    root.classList.toggle("hidden", state.leftTab !== "queue");
+    if (state.leftTab !== "queue") return;
+    if (!root.dataset.ready) {
+      root.innerHTML = "";
+      QUEUE_PILES.forEach((p) => {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "pile-tab";
+        btn.dataset.pile = p.id;
+        btn.title = p.hint;
+        btn.innerHTML =
+          '<span class="pile-name">' +
+          p.label +
+          '</span><span class="pile-n">0</span>';
+        btn.addEventListener("click", () => {
+          if (state.queuePile === p.id) return;
+          state.queuePile = p.id;
+          queueRowsCache = null;
+          alignSidebar = true;
+          renderQueue();
+          writeUrl(true);
+        });
+        root.appendChild(btn);
+      });
+      root.dataset.ready = "1";
+    }
+    [...root.querySelectorAll(".pile-tab")].forEach((btn) => {
+      const id = btn.dataset.pile;
+      const n = pileItems(id).length;
+      btn.classList.toggle("active", id === state.queuePile);
+      btn.classList.toggle("empty", n === 0);
+      const el = btn.querySelector(".pile-n");
+      if (el) el.textContent = String(n);
+    });
+  }
+
   function queueRows() {
     if (queueRowsCache) return queueRowsCache;
-    const q = state.queue || {};
+    const pile = state.queuePile || "needs_you";
     const rows = [];
-    const piles = [
-      ["Needs you", q.needs_you || []],
-      ["Needs hardware", q.hardware || []],
-      ["Can break upgrade", q.upgrade || []],
-      ["Known shape", q.known || []],
-      ["Junk", q.junk || []],
-    ];
-    const filtering = hasListFilter();
-    for (const [label, ids] of piles) {
-      const groups = [];
-      for (const id of ids) {
-        const g = groupById(id);
-        if (g && groupMatches(g)) groups.push(g);
+    if (pile === "hotspots") {
+      const spots = pileItems("hotspots");
+      if (!spots.length) {
+        rows.push({ kind: "empty", key: "e:hotspots", size: 36 });
+      } else {
+        for (const hs of spots) {
+          rows.push({ kind: "hotspot", key: "h:" + hs.path, hotspot: hs, size: 40 });
+        }
       }
-      if (filtering && !groups.length) continue;
-      rows.push({ kind: "head", key: "hd:" + label, label: label, count: groups.length, size: 34 });
+    } else {
+      const groups = pileItems(pile);
       if (!groups.length) {
-        rows.push({ kind: "empty", key: "e:" + label, size: 30 });
-        continue;
-      }
-      for (const g of groups) {
-        rows.push({ kind: "group", key: "g:" + g.group_id, group: g, size: 96 });
-      }
-    }
-    const qtext = (state.filterQuery || "").trim().toLowerCase();
-    const spots = (q.hotspots || []).filter((hs) => {
-      if (state.filterLabel) return false;
-      if (!qtext) return true;
-      return (hs.path || "").toLowerCase().includes(qtext);
-    });
-    if (!filtering || spots.length) {
-      rows.push({ kind: "head", key: "hd:hotspots", label: "File hotspots", count: spots.length, size: 34 });
-      for (const hs of spots) {
-        rows.push({ kind: "hotspot", key: "h:" + hs.path, hotspot: hs, size: 40 });
+        rows.push({ kind: "empty", key: "e:" + pile, size: 36 });
+      } else {
+        for (const g of groups) {
+          rows.push({ kind: "group", key: "g:" + g.group_id, group: g, size: 96 });
+        }
       }
     }
     queueRowsCache = rows;
@@ -689,7 +769,7 @@
     if (row.kind === "empty") {
       const empty = document.createElement("div");
       empty.className = "muted pile-empty";
-      empty.textContent = "none";
+      empty.textContent = "Nothing in this pile";
       return empty;
     }
     if (row.kind === "group") {
@@ -2088,5 +2168,6 @@
     });
   }
   paintLabelFilters();
+  paintPileNav();
   loadState();
 })();
