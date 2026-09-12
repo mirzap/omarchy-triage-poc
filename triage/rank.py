@@ -18,9 +18,10 @@ from triage.store import DEFAULT_STORE_PATH, load_store
 
 MODEL = "voyageai/voyage-code-4"
 DIM = 1024
-MAX_CHARS = 12000
-BATCH = 16
-CANDIDATE_CAP = 80
+MAX_CHARS = 4000
+BATCH = 8
+CANDIDATE_CAP = 24
+MAX_BATCH_CHARS = 400000
 OPENROUTER_URL = "https://openrouter.ai/api/v1/embeddings"
 CACHE_PATH = Path(".triage") / "embeddings.json"
 
@@ -63,7 +64,10 @@ def patch_text(owner: str, name: str, number: int, file_path: str | None = None)
         if not patch:
             continue
         parts.append(f"# {path}\n{patch}")
-    return "\n\n".join(parts)
+    joined = "\n\n".join(parts)
+    if len(joined) > MAX_CHARS:
+        joined = joined[:MAX_CHARS]
+    return joined
 
 
 def _text_hash(text: str) -> str:
@@ -93,7 +97,7 @@ def save_cache(data: dict[str, Any], path: Path = CACHE_PATH) -> None:
     tmp.replace(path)
 
 
-def _embed_batch(texts: list[str], key: str) -> list[list[float]]:
+def _post_embed(texts: list[str], key: str) -> list[list[float]]:
     payload = json.dumps(
         {
             "model": MODEL,
@@ -121,6 +125,23 @@ def _embed_batch(texts: list[str], key: str) -> list[list[float]]:
     if len(vecs) != len(texts):
         raise RuntimeError(f"embed count mismatch: {len(vecs)} vs {len(texts)}")
     return vecs
+
+
+def _embed_batch(texts: list[str], key: str) -> list[list[float]]:
+    out: list[list[float]] = []
+    chunk: list[str] = []
+    size = 0
+    for text in texts:
+        extra = len(text)
+        if chunk and size + extra > MAX_BATCH_CHARS:
+            out.extend(_post_embed(chunk, key))
+            chunk = []
+            size = 0
+        chunk.append(text)
+        size += extra
+    if chunk:
+        out.extend(_post_embed(chunk, key))
+    return out
 
 
 def ensure_vectors(

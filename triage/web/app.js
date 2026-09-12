@@ -503,6 +503,7 @@
       }
       return;
     }
+    const items = data.related || [];
     root.className = "related-list";
     root.innerHTML = "";
     items.forEach((it) => {
@@ -576,8 +577,31 @@
     root.innerHTML = "";
     const head = document.createElement("div");
     head.className = "muted";
-    head.textContent = path + " · " + ((fq && fq.pr_count) || items.length) + " PRs" + extra;
+    const same = (fq && fq.same_patch) || [];
+    const sameN = same.reduce((n, c) => n + (c.count || 0), 0);
+    head.textContent =
+      path +
+      " · " +
+      ((fq && fq.pr_count) || items.length) +
+      " PRs" +
+      extra +
+      (same.length ? " · " + same.length + " identical hunks (" + sameN + " PRs)" : "");
     root.appendChild(head);
+    if (same.length) {
+      const box = document.createElement("div");
+      box.className = "same-patch-list";
+      same.forEach((c) => {
+        const row = document.createElement("div");
+        row.className = "muted";
+        row.textContent =
+          "same hunk ×" +
+          c.count +
+          "  #" +
+          (c.pr_numbers || []).join(" #");
+        box.appendChild(row);
+      });
+      root.appendChild(box);
+    }
     items.forEach((pr) => {
       const row = document.createElement("div");
       row.className = "hotspot-row";
