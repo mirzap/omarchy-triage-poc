@@ -9,13 +9,11 @@ from pathlib import Path
 from triage.dedupe import apply_fingerprints
 from triage.embed import Embedder
 from triage.pipeline import (
-    AUTO_APPROVE_LABEL,
     FIXTURES_DIR,
     NEEDS_HUMAN_LABEL,
     format_groups,
     ingest,
     load_prs_from_json,
-    match_rule,
     run_pipeline,
 )
 from triage.store import (
@@ -27,22 +25,70 @@ from triage.store import (
 )
 
 
+DEMO_STORE_PATH = DEFAULT_STORE_PATH.with_name("demo-store.json")
+
+
 def _project_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+def _is_live_store(path: Path) -> bool:
+    """Return whether path names the normal, non-fixture store."""
+    candidate = path.expanduser()
+    live_paths = (
+        DEFAULT_STORE_PATH.expanduser(),
+        _project_root() / DEFAULT_STORE_PATH,
+    )
+    resolved = candidate.resolve()
+    if any(resolved == live.resolve() for live in live_paths):
+        return True
+    if candidate.exists():
+        for live in live_paths:
+            if not live.exists():
+                continue
+            try:
+                if candidate.samefile(live):
+                    return True
+            except OSError:
+                continue
+    return False
+
+
+def _isolated_store(args: argparse.Namespace, command: str) -> Path | None:
+    """Resolve a fixture-only store, refusing the normal live store."""
+    raw_store = getattr(args, "store", None)
+    store = Path(raw_store).expanduser() if raw_store else DEMO_STORE_PATH
+    if _is_live_store(store):
+        print(
+            f"Error: {command} cannot use the live store {DEFAULT_STORE_PATH}; "
+            f"choose an isolated path such as {DEMO_STORE_PATH}.",
+            file=sys.stderr,
+        )
+        return None
+    return store
+
+
 def cmd_run(args: argparse.Namespace) -> int:
+    if args.source == "fixtures":
+        store = _isolated_store(args, "fixture run")
+        if store is None:
+            return 2
+    else:
+        raw_store = getattr(args, "store", None)
+        store = Path(raw_store).expanduser() if raw_store else DEFAULT_STORE_PATH
+
     prs = ingest(source=args.source, repo=args.repo, limit=args.limit)
     result = run_pipeline(
         prs,
         use_llm=args.llm,
         persist=True,
+        store_path=store,
         source=args.source,
         repo=args.repo,
     )
     print(f"Ingested {len(result['prs'])} PRs from {args.source}")
     print(format_groups(result["groups"], result["prs"]))
-    print(f"Stored groups in {DEFAULT_STORE_PATH}")
+    print(f"Stored groups in {store}")
     return 0
 
 
@@ -81,13 +127,24 @@ def cmd_decide(args: argparse.Namespace) -> int:
 
 def cmd_replay(args: argparse.Namespace) -> int:
     """Re-run fixtures + newcomers against persisted rules."""
+    store = _isolated_store(args, "fixture replay")
+    if store is None:
+        return 2
     base = load_prs_from_json(FIXTURES_DIR / "prs.json")
     newcomers = load_prs_from_json(FIXTURES_DIR / "newcomers.json")
     all_prs = base + newcomers
-    result = run_pipeline(all_prs, use_llm=args.llm, persist=True, apply_rules=True)
+    result = run_pipeline(
+        all_prs,
+        use_llm=args.llm,
+        persist=True,
+        store_path=store,
+        apply_rules=True,
+        source="fixtures",
+        repo="omacom/omarchy",
+    )
     print(f"Replay: {len(base)} fixtures + {len(newcomers)} newcomers")
     print(format_groups(result["groups"], result["prs"]))
-    print("Newcomer classification:")
+    print("Newcomer classification (manual review enforced):")
     newcomer_nums = {p.number for p in newcomers}
     for pr in result["prs"]:
         if pr.number in newcomer_nums:
@@ -97,17 +154,33 @@ def cmd_replay(args: argparse.Namespace) -> int:
 
 def cmd_demo(args: argparse.Namespace) -> int:
     """
-    Wow path: fixtures pipeline, auto-approve largest duplicate group,
-    then classify two newcomers (one match, one stranger). Offline, zero env.
+    Wow path: fixtures pipeline, human-approve largest duplicate group,
+    then queue two newcomers for manual review. Offline, zero env.
     """
-    store = Path(args.store) if args.store else DEFAULT_STORE_PATH
+    store = _isolated_store(args, "demo")
+    if store is None:
+        return 2
+    explicit_store = bool(getattr(args, "store", None))
+    reset = bool(getattr(args, "reset", False))
+    if reset and not explicit_store:
+        print(
+            "Error: --reset requires an explicit --store path.",
+            file=sys.stderr,
+        )
+        return 2
     if store.exists():
+        if not reset:
+            print(
+                f"Error: demo store already exists: {store}. "
+                "Pass both --store PATH and --reset to replace it.",
+                file=sys.stderr,
+            )
+            return 2
+        if store.is_dir():
+            print(f"Error: demo store path is a directory: {store}", file=sys.stderr)
+            return 2
         store.unlink()
-    if store.parent.exists() and store.parent != Path("."):
-        # keep dir
-        pass
-    else:
-        store.parent.mkdir(parents=True, exist_ok=True)
+    store.parent.mkdir(parents=True, exist_ok=True)
 
     print("=== Omarchy PR group-triage DEMO ===")
     print("Stage 1: ingest fixtures")
@@ -136,16 +209,14 @@ def cmd_demo(args: argparse.Namespace) -> int:
     rule = decide_group(target.group_id, "approve", path=store)
     print(f"  persisted {rule.rule_id}\n")
 
-    print("Stage 3: second ingest — 2 newcomers against trusted rules")
+    print("Stage 3: second ingest — 2 newcomers; auto-approval disabled")
     newcomers = load_prs_from_json(FIXTURES_DIR / "newcomers.json")
-    # Classify newcomers using embedder fit on original + new for stable space,
-    # but match against stored rule centroids from the blessed group.
-    # Rebuild vectors in a joint corpus so cosine is meaningful.
+    # Keep the stored rule centroid reproducible in a joint fixture corpus,
+    # while leaving every newcomer queued for the human gate.
     combined = apply_fingerprints(list(prs) + list(newcomers))
     docs = [p.text_for_embed for p in combined]
     embedder = Embedder(n=3)
     vectors = embedder.fit_transform(docs)
-    rules = load_rules(store)
 
     # Recompute blessed centroid in the joint space from the approved group's PRs
     approved_nums = set(rule.created_from_prs)
@@ -162,16 +233,9 @@ def cmd_demo(args: argparse.Namespace) -> int:
 
     print("Newcomer results:")
     for pr in newcomers:
-        idx = next(i for i, p in enumerate(combined) if p.number == pr.number)
-        vec = vectors[idx]
-        matched = match_rule(pr, vec, [rule])
-        if matched:
-            pr.label = AUTO_APPROVE_LABEL
-        else:
-            pr.label = NEEDS_HUMAN_LABEL
-        status = "AUTO-CLASSIFY (blessed shape)" if matched else "NEEDS-HUMAN (stranger)"
+        pr.label = NEEDS_HUMAN_LABEL
         print(f"  #{pr.number} {pr.title!r}")
-        print(f"    label={pr.label}  => {status}")
+        print(f"    label={pr.label}  => NEEDS-HUMAN (manual review required)")
 
     print("\n=== Demo complete (no GitHub writes) ===")
     return 0
@@ -198,7 +262,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_demo = sub.add_parser("demo", help="Offline wow path with fixtures + newcomers")
     p_demo.add_argument("--llm", action="store_true", help="Enable LLM stub note")
-    p_demo.add_argument("--store", default=str(DEFAULT_STORE_PATH), help="Store path")
+    p_demo.add_argument(
+        "--store",
+        help=f"Isolated store path (default: {DEMO_STORE_PATH})",
+    )
+    p_demo.add_argument(
+        "--reset",
+        action="store_true",
+        help="Replace an existing explicitly named demo store",
+    )
     p_demo.set_defaults(func=cmd_demo)
 
     p_run = sub.add_parser("run", help="Run pipeline and print groups")
@@ -215,6 +287,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Max open PRs to fetch (0 = all, default).",
     )
     p_run.add_argument("--llm", action="store_true")
+    p_run.add_argument(
+        "--store",
+        help=(
+            f"Store path (fixtures default: {DEMO_STORE_PATH}; "
+            f"gh/github default: {DEFAULT_STORE_PATH})"
+        ),
+    )
     p_run.set_defaults(func=cmd_run)
 
     p_list = sub.add_parser("list-groups", help="Show last run groups")
@@ -230,6 +309,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Re-run fixtures + newcomers against persisted rules",
     )
     p_replay.add_argument("--llm", action="store_true")
+    p_replay.add_argument(
+        "--store",
+        help=f"Isolated store path (default: {DEMO_STORE_PATH})",
+    )
     p_replay.set_defaults(func=cmd_replay)
 
     p_serve = sub.add_parser("serve", help="Local group-queue + neighborhood dashboard")

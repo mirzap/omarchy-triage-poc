@@ -323,9 +323,22 @@ class TriageHandler(BaseHTTPRequestHandler):
                         break
                 cap = 6000
                 raw = patch or ""
-                if len(raw) > cap:
+                source_complete = bool(raw) and not raw.rstrip().endswith(
+                    ("… truncated", "... truncated")
+                )
+                preview_truncated = len(raw) > cap
+                if preview_truncated:
                     raw = raw[:cap] + "\n… truncated"
-                items.append({"number": n, "path": file_path, "patch": raw, "truncated": len(patch or "") > cap})
+                items.append(
+                    {
+                        "number": n,
+                        "path": file_path,
+                        "patch": raw,
+                        "truncated": preview_truncated,
+                        "source_complete": source_complete,
+                        "complete": source_complete and not preview_truncated,
+                    }
+                )
             self._send_json(200, {"path": file_path, "items": items})
             return
         if path == "/" or path == "/index.html":

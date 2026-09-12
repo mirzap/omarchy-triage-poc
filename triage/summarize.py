@@ -19,8 +19,25 @@ def suggest_decision(group: Group, prs_by_number: dict[int, PullRequest]) -> str
     shared = set.intersection(*path_sets) if len(path_sets) > 1 else path_sets[0]
     union = set.union(*path_sets)
     overlap = len(shared) / len(union) if union else 0.0
-    # Same fingerprint = same hunks. Shared files alone is not a duplicate fix.
-    if len(set(m.fingerprint for m in members if m.fingerprint)) == 1 and members:
+    # Fingerprints contain paths and hunk positions, not +/- line content.  Only
+    # identical, available raw patches are strong enough to suggest a duplicate.
+    complete_patches = [
+        tuple(sorted((f.path, f.patch) for f in member.changed_files))
+        if member.changed_files
+        and all(
+            f.patch
+            and "... truncated" not in f.patch.casefold()
+            and "… truncated" not in f.patch.casefold()
+            for f in member.changed_files
+        )
+        else None
+        for member in members
+    ]
+    if (
+        len(members) == n
+        and all(patches is not None for patches in complete_patches)
+        and len(set(complete_patches)) == 1
+    ):
         return "duplicate"
     if overlap >= 0.3:
         return "related-theme"

@@ -40,15 +40,25 @@ def _best_join(
 def assign_incremental(
     prs: list[PullRequest],
     existing_groups: list[Group],
+    *,
+    repo: str = "",
+    reserved_group_ids: list[str] | set[str] | None = None,
 ) -> list[Group]:
     """
     Keep open PRs in their current groups. Cluster brand-new PRs among
     themselves, then attach a new cluster to an existing group only when
     file Jaccard >= FILE_JACCARD_CONFIRM (or exact fingerprint).
     """
-    if not existing_groups:
-        return cluster_prs(prs, [[0.0] for _ in prs])
-
+    # Repository identity is part of group identity.  Foreign (and, for an
+    # explicit repository, unscoped legacy) groups are never attachment
+    # candidates, but all supplied IDs remain reserved globally.
+    all_existing_ids = [g.group_id for g in existing_groups]
+    repo_key = repo.strip().strip("/").lower()
+    existing_groups = [
+        g
+        for g in existing_groups
+        if g.repo.strip().strip("/").lower() == repo_key
+    ]
     by_num = {p.number: p for p in prs}
     old_of: dict[int, str] = {}
     for g in existing_groups:
@@ -81,12 +91,20 @@ def assign_incremental(
             leftovers.append(members)
 
     groups: list[Group] = []
-    used_ids = list(attached.keys())
+    used_ids = (
+        list(reserved_group_ids or [])
+        + all_existing_ids
+        + list(attached.keys())
+    )
     for gid, members in attached.items():
         if members:
-            groups.append(_build_group(gid, members, [0.0]))
+            group = _build_group(gid, members, [0.0])
+            group.repo = repo
+            groups.append(group)
     new_ids = _next_group_ids(used_ids, len(leftovers))
     for gid, members in zip(new_ids, leftovers):
-        groups.append(_build_group(gid, members, [0.0]))
+        group = _build_group(gid, members, [0.0])
+        group.repo = repo
+        groups.append(group)
     groups.sort(key=lambda g: (min(g.pr_numbers) if g.pr_numbers else 0))
     return groups

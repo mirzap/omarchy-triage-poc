@@ -8,13 +8,18 @@ from typing import Any
 
 from triage.assign import assign_incremental
 from triage.cluster import DEFAULT_THRESHOLD, cluster_prs
-from triage.dedupe import apply_fingerprints, file_set_signature
-from triage.embed import cosine_similarity
+from triage.dedupe import apply_fingerprints
 from triage.github import fetch_pulls, parse_repo
 from triage.models import Group, PullRequest, TrustedRule
 from triage.overlap import overlap_for_groups
 from triage.queue import build_queue
-from triage.store import load_rules, load_store, save_run_state
+from triage.store import (
+    load_groups,
+    load_rules,
+    load_store,
+    reserved_group_ids,
+    save_run_state,
+)
 from triage.summarize import summarize_all
 
 AUTO_APPROVE_LABEL = "auto:approved-shape"
@@ -92,39 +97,14 @@ def match_rule(
     rules: list[TrustedRule],
     auto_threshold: float = AUTO_MATCH_THRESHOLD,
 ) -> TrustedRule | None:
+    """Return no approval match while Stage 1 auto-approval is disabled.
+
+    The arguments and return type remain compatible with existing callers.  A
+    fingerprint is only a hash of paths and hunk positions; it omits added and
+    removed line content.  Consequently even an exact fingerprint match cannot
+    safely inherit a prior approval.  File-set, embedding, and SimHash
+    similarity are likewise advisory rather than approval evidence.
     """
-    Match APPROVED rules: exact fingerprint OR
-    (cosine >= auto_threshold AND overlapping file-set) OR
-    (SimHash Hamming <= 3 AND files overlap / overlap coeff > 0).
-    Rejected fingerprints still block auto-approve.
-    Missing rule.simhash skips the SimHash clause (back-compat).
-    """
-    from triage.simhash import SIMHASH_MAX_HAMMING, hamming
-
-    approved = [r for r in rules if r.decision == "approve"]
-    rejected = [r for r in rules if r.decision == "reject"]
-
-    # Exact fingerprint on a rejected rule: stay needs-human
-    for r in rejected:
-        if pr.fingerprint and pr.fingerprint in r.fingerprints:
-            return None
-
-    for r in approved:
-        if pr.fingerprint and pr.fingerprint in r.fingerprints:
-            return r
-        if r.file_set_signature and file_set_signature(pr.paths) == r.file_set_signature:
-            return r
-        overlap = files_overlap(pr.paths, r.shared_files)
-        sim = cosine_similarity(vector, r.centroid) if r.centroid and vector else 0.0
-        if overlap and sim >= auto_threshold:
-            return r
-        # SimHash near-dup + file overlap
-        rule_sh = getattr(r, "simhash", 0) or 0
-        pr_sh = getattr(pr, "simhash", 0) or 0
-        if rule_sh and pr_sh:
-            ov_coeff = _overlap_coefficient(pr.paths, r.shared_files)
-            if hamming(pr_sh, rule_sh) <= SIMHASH_MAX_HAMMING and (overlap or ov_coeff > 0):
-                return r
     return None
 
 
@@ -134,12 +114,13 @@ def auto_classify(
     rules: list[TrustedRule],
     auto_threshold: float = AUTO_MATCH_THRESHOLD,
 ) -> list[PullRequest]:
-    for pr, vec in zip(prs, vectors):
-        rule = match_rule(pr, vec, rules, auto_threshold=auto_threshold)
-        if rule is not None:
-            pr.label = AUTO_APPROVE_LABEL
-        else:
-            pr.label = NEEDS_HUMAN_LABEL
+    """Reset every PR to the human-review gate.
+
+    Do not zip PRs with vectors here: vectors are optional legacy input and may
+    be shorter than the PR list, while every PR must have a safe label.
+    """
+    for pr in prs:
+        pr.label = NEEDS_HUMAN_LABEL
     return prs
 
 
@@ -188,33 +169,45 @@ def run_pipeline(
 
     existing: list[Group] = []
     prev_nums: set[int] = set()
+    data = load_store(path)
+    active_repo = (repo or data.get("repo") or "").strip().strip("/").lower()
+    reserved_ids = reserved_group_ids(path)
     if incremental is None:
         incremental = persist
     if incremental:
-        data = load_store(path)
-        raw = data.get("last_groups") or []
-        prev_nums = {int(n) for n in (data.get("last_pr_numbers") or []) if n}
-        if raw:
-            existing = [g if isinstance(g, Group) else Group.from_dict(g) for g in raw]
+        existing = load_groups(path, repo=active_repo) if active_repo else []
+        prior = (data.get("pr_numbers_by_repo") or {}).get(active_repo, [])
+        prev_nums = {int(n) for n in prior if n}
 
-    if existing:
-        groups = assign_incremental(prs, existing)
-        mode = "incremental"
+    if incremental or (persist and reserved_ids):
+        groups = assign_incremental(
+            prs,
+            existing if incremental else [],
+            repo=active_repo,
+            reserved_group_ids=reserved_ids,
+        )
     else:
         groups = cluster_prs(prs, dummy, threshold=threshold)
+        for group in groups:
+            group.repo = active_repo
+    if existing:
+        mode = "incremental"
+    else:
         mode = "full"
 
     groups = summarize_all(groups, prs, use_llm=use_llm)
 
     rules: list[TrustedRule] = []
     if apply_rules:
-        rules = load_rules(path)
-        auto_classify(prs, dummy, rules)
+        rules = load_rules(path, repo=active_repo)
+    # Classification is a safety invariant even when persisted rules are not
+    # loaded: callers may reuse PR objects carrying stale auto-approval labels.
+    auto_classify(prs, dummy, rules)
 
-    slim = _slim_prs(prs, groups, repo)
+    slim = _slim_prs(prs, groups, active_repo)
     overlap = overlap_for_groups(groups, prs)
     new_nums = [p.number for p in prs if p.number not in prev_nums]
-    queue = build_queue(groups, prs, rules, new_pr_numbers=new_nums)
+    queue = build_queue(groups, prs, rules, new_pr_numbers=new_nums, repo=active_repo)
 
     if persist:
         save_run_state(
@@ -225,7 +218,7 @@ def run_pipeline(
             last_group_edges=[],
             last_overlap=overlap,
             source=source or None,
-            repo=repo or None,
+            repo=active_repo or None,
             path=path,
             last_new_pr_numbers=new_nums,
             last_queue=queue,

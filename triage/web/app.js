@@ -52,6 +52,15 @@
   let memberVirtualizer = null;
   let queueRowsCache = null;
   let fetchPollTimer = null;
+  let stateLoadGen = 0;
+  let snapshotGen = 0;
+  let fileQueueGen = 0;
+  let relatedGen = 0;
+  let bodyGen = 0;
+  let overlapGen = 0;
+  let diffGen = 0;
+  let lastBodyPr = null;
+  const bodyCache = {};
 
   const $ = (id) => document.getElementById(id);
 
@@ -63,16 +72,14 @@
     const tab = q.get("tab");
     if (tab === "queue" || tab === "groups" || tab === "allprs") state.leftTab = tab;
     const gid = q.get("group");
-    if (gid) state.selectedGroupId = gid;
+    state.selectedGroupId = gid || null;
     const pr = q.get("pr");
     if (pr && /^\d+$/.test(pr)) state.selectedPr = parseInt(pr, 10);
-    else if (q.has("pr")) state.selectedPr = null;
+    else state.selectedPr = null;
     const file = q.get("file");
-    if (file) state.selectedFile = file;
-    else if (q.has("file")) state.selectedFile = null;
+    state.selectedFile = file || null;
     const user = q.get("user");
-    if (user) state.selectedUser = user;
-    else if (q.has("user")) state.selectedUser = null;
+    state.selectedUser = user || null;
     state.filterQuery = q.get("q") || "";
     state.filterLabel = q.get("label") || "";
     const pile = q.get("pile");
@@ -115,7 +122,26 @@
     return data;
   }
 
+  function snapshotKey() {
+    return (state.source || "") + "|" + (state.repo || "");
+  }
+
+  function invalidateSnapshotCaches() {
+    snapshotGen += 1;
+    fileQueueGen += 1;
+    relatedGen += 1;
+    bodyGen += 1;
+    overlapGen += 1;
+    diffGen += 1;
+    state.fileQueue = null;
+    state.related = null;
+    state.relatedKey = "";
+    lastBodyPr = null;
+    Object.keys(bodyCache).forEach((key) => delete bodyCache[key]);
+  }
+
   function applyState(data) {
+    invalidateSnapshotCaches();
     state.groups = data.groups || [];
     state.prs = data.prs || [];
     state.edges = data.edges || [];
@@ -140,6 +166,7 @@
     if (state.selectedPr && !state.prs.some((p) => p.number === state.selectedPr)) {
       state.selectedPr = null;
     }
+    normalizeSelection();
     if (
       !state.selectedGroupId &&
       state.groups.length &&
@@ -538,6 +565,32 @@
     return state.groups.find((g) => g.group_id === id) || null;
   }
 
+  function normalizeSelection() {
+    let changed = false;
+    let group = state.selectedGroupId ? groupById(state.selectedGroupId) : null;
+    const pr = state.selectedPr ? prByNumber(state.selectedPr) : null;
+
+    if (state.selectedGroupId && !group) {
+      state.selectedGroupId = null;
+      state.selectedFile = null;
+      group = null;
+      changed = true;
+    }
+    if (state.selectedPr && !pr) {
+      state.selectedPr = null;
+      changed = true;
+    } else if (!group && pr && !state.selectedFile && pr.group_id && groupById(pr.group_id)) {
+      state.selectedGroupId = pr.group_id;
+      group = groupById(pr.group_id);
+      changed = true;
+    }
+    if (group && state.selectedPr && !(group.pr_numbers || []).includes(state.selectedPr)) {
+      state.selectedPr = null;
+      changed = true;
+    }
+    return changed;
+  }
+
   const FILTER_CHIPS = [
     "related-theme",
     "duplicate",
@@ -589,6 +642,10 @@
     }
     const q = (state.filterQuery || "").trim().toLowerCase();
     if (!q) return true;
+    const prNumberQuery = q.match(/^#?(\d+)$/);
+    if (prNumberQuery) {
+      return (g.pr_numbers || []).includes(parseInt(prNumberQuery[1], 10));
+    }
     if ((g.group_id || "").toLowerCase().includes(q)) return true;
     if ((g.title_variants || []).some((t) => (t || "").toLowerCase().includes(q))) return true;
     const nums = g.pr_numbers || [];
@@ -613,6 +670,8 @@
     }
     const q = (state.filterQuery || "").trim().toLowerCase();
     if (!q) return !state.filterLabel || groupMatches(groupById(pr.group_id) || { group_id: pr.group_id, pr_numbers: [pr.number], title_variants: [pr.title], suggested_decision: "unique", card_class: "needs-look" });
+    const prNumberQuery = q.match(/^#?(\d+)$/);
+    if (prNumberQuery) return pr.number === parseInt(prNumberQuery[1], 10);
     if (String(pr.number).includes(q)) return true;
     if ((pr.title || "").toLowerCase().includes(q)) return true;
     if ((pr.user || "").toLowerCase().includes(q)) return true;
@@ -896,22 +955,20 @@
     }
   }
 
-
-  let relatedGen = 0;
-
   async function loadRelated(pr, path) {
     if (!pr) {
+      relatedGen += 1;
       state.related = null;
       state.relatedKey = "";
       renderRelated();
       return;
     }
-    const key = pr + "|" + (path || "");
+    const key = snapshotKey() + "|" + pr + "|" + (path || "");
     if (state.related && state.related.frozen) {
       renderRelated();
       return;
     }
-    if (state.relatedKey === key && state.related && !state.related.loading) {
+    if (state.relatedKey === key && state.related) {
       renderRelated();
       return;
     }
@@ -934,6 +991,28 @@
       state.related = { enabled: false, reason: err.message, related: [] };
       renderRelated();
     }
+  }
+
+  function loadRelatedIfOpen(pr, path) {
+    const block = $("relatedBlock");
+    if (!block || !block.open) {
+      relatedGen += 1;
+      state.related = null;
+      state.relatedKey = "";
+      return;
+    }
+    loadRelated(pr, path);
+  }
+
+  function currentRelatedTarget() {
+    if (isFileView()) {
+      return { pr: state.selectedPr, path: state.selectedFile || null };
+    }
+    const group = groupById(state.selectedGroupId);
+    return {
+      pr: state.selectedPr || (group && (group.pr_numbers || [])[0]) || null,
+      path: state.selectedFile || null,
+    };
   }
 
   function renderRelated() {
@@ -1005,6 +1084,7 @@
   }
 
   async function openFileQueue(path, opts) {
+    const gen = ++fileQueueGen;
     const fromUrl = !!(opts && opts.fromUrl);
     const fileView = !!(opts && opts.fileView) || isFileView();
     state.selectedFile = path;
@@ -1020,18 +1100,17 @@
     }
     try {
       const data = await api("/api/file?path=" + encodeURIComponent(path));
-      if (state.selectedFile !== path) return;
+      if (gen !== fileQueueGen || state.selectedFile !== path) return;
       state.fileQueue = data;
       if (isFileView()) {
-        renderFileDetail();
-        renderDiffs(null, { scroll: true });
+        renderFileDetail({ scroll: true });
       } else {
         renderFileQueue();
         const g2 = state.groups.find((x) => x.group_id === state.selectedGroupId);
         if (g2) renderDiffs(g2, { scroll: true });
       }
     } catch (err) {
-      if (state.selectedFile !== path) return;
+      if (gen !== fileQueueGen || state.selectedFile !== path) return;
       state.fileQueue = { path: path, prs: [], error: err.message };
       if (isFileView()) renderFileDetail();
       else renderFileQueue();
@@ -1366,7 +1445,7 @@
     }
   }
 
-  function renderFileDetail() {
+  function renderFileDetail(diffOpts) {
     const empty = $("detailEmpty");
     const detail = $("detail");
     empty.classList.add("hidden");
@@ -1392,15 +1471,16 @@
     if (mh) mh.textContent = "PRs on this file" + (count ? " · " + count : "");
     renderFileMembers();
     renderPrBodies({ pr_numbers: ((fq && fq.prs) || []).map((p) => p.number) });
-    if (fq && !fq.loading) renderDiffs(null);
-    if (state.selectedPr) loadRelated(state.selectedPr, path);
+    renderDiffs(null, diffOpts);
+    if (state.selectedPr) loadRelatedIfOpen(state.selectedPr, path);
     else {
-      state.related = null;
+      loadRelatedIfOpen(null, path);
       renderRelated();
     }
   }
 
   function renderDetail() {
+    normalizeSelection();
     const empty = $("detailEmpty");
     const detail = $("detail");
     const g = state.groups.find((x) => x.group_id === state.selectedGroupId);
@@ -1409,6 +1489,8 @@
       return;
     }
     if (!g) {
+      loadRelatedIfOpen(null, null);
+      renderDiffs(null);
       empty.classList.remove("hidden");
       detail.classList.add("hidden");
       return;
@@ -1466,7 +1548,9 @@
     fillLabelKey();
     const titles = (g.title_variants || []).filter((t) => t && t !== firstTitle);
     if (titles.length) {
-      $("detailMeta").textContent += " · " + titles.length + " other titles";
+      $("detailMeta").appendChild(
+        document.createTextNode(" · " + titles.length + " other titles")
+      );
     }
 
     const mh = $("membersHead");
@@ -1478,29 +1562,27 @@
     renderDiffs(g);
     renderFileQueue();
     const qPr = state.selectedPr || (g.pr_numbers || [])[0];
-    loadRelated(qPr, state.selectedFile || null);
+    loadRelatedIfOpen(qPr, state.selectedFile || null);
   }
 
-  let bodyGen = 0;
-  const bodyCache = {};
-
   async function loadPrBody(num) {
-    if (bodyCache[num]) return bodyCache[num];
+    const key = snapshotKey() + "|" + num;
+    if (bodyCache[key]) return bodyCache[key];
+    const gen = snapshotGen;
     const repo = state.repo || "omacom/omarchy";
     const data = await api(
       "/api/pr?number=" + encodeURIComponent(num) + "&repo=" + encodeURIComponent(repo)
     );
-    bodyCache[num] = data;
+    if (gen === snapshotGen) bodyCache[key] = data;
     return data;
   }
-
-  let lastBodyPr = null;
 
   function renderPrBodies(g) {
     const root = $("prBody");
     const head = $("prBodyHead");
     const block = $("prBodyBlock");
     if (!root) return;
+    const gen = ++bodyGen;
     const selected = state.selectedPr;
     if (!selected) {
       lastBodyPr = null;
@@ -1513,7 +1595,6 @@
     if (head) head.textContent = "Description · #" + selected;
     if (block && lastBodyPr !== selected) block.open = true;
     lastBodyPr = selected;
-    const gen = ++bodyGen;
     root.className = "pr-body muted";
     root.textContent = "Loading description…";
     loadPrBody(selected)
@@ -1634,6 +1715,7 @@
   }
 
   async function renderOverlap(g) {
+    const gen = ++overlapGen;
     const summary = $("overlapSummary");
     const table = $("overlapMatrix");
     table.innerHTML = "";
@@ -1651,12 +1733,13 @@
         (n > 24 ? " · " + n + " PRs (matrix capped)" : "");
       try {
         ov = await api("/api/overlap?group_id=" + encodeURIComponent(g.group_id));
+        if (gen !== overlapGen || state.selectedGroupId !== g.group_id) return;
         state.overlap[g.group_id] = ov;
       } catch (err) {
+        if (gen !== overlapGen || state.selectedGroupId !== g.group_id) return;
         summary.textContent = "overlap error: " + err.message;
         return;
       }
-      if (state.selectedGroupId !== g.group_id) return;
     }
     if (!ov) {
       summary.textContent = "no overlap data";
@@ -1771,9 +1854,6 @@
     });
     return rows.join("");
   }
-
-  let diffGen = 0;
-
   let lastScrolledFile = null;
 
   function scrollToDiff() {
@@ -1793,6 +1873,7 @@
   }
 
   async function renderDiffs(g, opts) {
+    const gen = ++diffGen;
     const root = $("diffPanels");
     const path = state.selectedFile;
     const shouldScroll = !!(opts && opts.scroll);
@@ -1807,9 +1888,17 @@
     if (g) {
       const groupSet = new Set(g.pr_numbers || []);
       const groupOnFile = fqNums.filter((n) => groupSet.has(n));
-      nums = (groupOnFile.length ? groupOnFile : (g.pr_numbers || [])).slice(0, 8);
+      const selectedGroupPr = groupSet.has(state.selectedPr) ? state.selectedPr : null;
+      nums = takeWithSelected(
+        groupOnFile.length ? groupOnFile : (g.pr_numbers || []),
+        selectedGroupPr,
+        8
+      );
     } else {
-      nums = fqNums.slice(0, 8);
+      const selected = prByNumber(state.selectedPr);
+      const selectedFilePr =
+        selected && (selected.paths || []).includes(path) ? selected.number : null;
+      nums = takeWithSelected(fqNums, selectedFilePr, 8);
     }
     if (!nums.length) {
       root.innerHTML =
@@ -1822,7 +1911,6 @@
         "</div>";
       return;
     }
-    const gen = ++diffGen;
     const meta = $("diffMeta");
     if (meta) {
       meta.textContent =
@@ -1871,15 +1959,26 @@
         ".</div>";
       return;
     }
-    const firstPatch = (items[0] && items[0].patch) || "";
+    const firstItem = items[0] || {};
+    const firstPatch = firstItem.patch || "";
+    const firstComplete = firstItem.complete === true && firstPatch.length <= 4000;
     items.forEach((it) => {
       const pr = prByNumber(it.number) || { number: it.number, user: "" };
       const patch = it.patch || "";
-      const same = patch === firstPatch;
+      const displayTruncated = patch.length > 4000;
+      const complete = it.complete === true && !displayTruncated;
+      const same = complete && firstComplete && patch === firstPatch;
+      const comparison = !patch
+        ? "no patch"
+        : !complete
+          ? "preview only"
+          : same
+            ? "same hunk"
+            : "different";
       const panel = document.createElement("div");
       panel.className = "diff-panel";
       const href = prUrl(pr);
-      const shown = patch && patch.length > 4000 ? patch.slice(0, 4000) + "\n… truncated" : patch;
+      const shown = displayTruncated ? patch.slice(0, 4000) + "\n… truncated" : patch;
       panel.innerHTML =
         '<div class="diff-panel-head">' +
         '<a class="pr-link" href="' +
@@ -1895,7 +1994,7 @@
         '<span class="diff-tag ' +
         (same ? "same" : "diff") +
         '">' +
-        (patch ? (same ? "same hunk" : "different") : "no patch") +
+        comparison +
         "</span></div>" +
         '<div class="diff-code">' +
         colorizeDiff(shown || "(empty patch)") +
@@ -1913,7 +2012,7 @@
     const byPatch = {};
     items.forEach((it) => {
       const patch = it.patch || "";
-      if (!patch) return;
+      if (!patch || it.complete !== true || patch.length > 4000) return;
       if (!byPatch[patch]) byPatch[patch] = [];
       byPatch[patch].push(it.number);
     });
@@ -1925,6 +2024,15 @@
       state.fileQueue.same_patch = same;
       renderFileQueue();
     }
+  }
+
+  function takeWithSelected(numbers, selected, limit) {
+    const unique = [...new Set(numbers || [])];
+    const shown = unique.slice(0, limit);
+    if (!selected || shown.includes(selected)) return shown;
+    if (shown.length >= limit) shown[shown.length - 1] = selected;
+    else shown.push(selected);
+    return shown;
   }
 
   function escapeHtml(s) {
@@ -2157,6 +2265,7 @@
   }
 
   function render() {
+    normalizeSelection();
     if (state.leftTab === "allprs") renderAllPrList();
     else if (state.leftTab === "queue") renderQueue();
     else renderGroupList();
@@ -2166,15 +2275,18 @@
   }
 
   async function loadState() {
+    const gen = ++stateLoadGen;
     setStatus("loading…");
     try {
       const data = await api("/api/state");
+      if (gen !== stateLoadGen) return;
       applyState(data);
       const c = (state.queue && state.queue.counts) || {};
       setStatus(
         `${state.prs.length} PRs · ${state.groups.length} groups · ${c.needs_you || 0} need you`
       );
     } catch (err) {
+      if (gen !== stateLoadGen) return;
       setStatus("error: " + err.message);
     }
   }
@@ -2230,6 +2342,7 @@
   }
 
   async function doFetch() {
+    stateLoadGen += 1;
     const source = "gh";
     const repo = $("repo").value.trim() || "omacom/omarchy";
     const limit = Number($("limit").value);
@@ -2244,7 +2357,9 @@
         body: JSON.stringify({ source, repo, limit: limitVal }),
       });
       await pollProgressUntilDone();
+      const gen = ++stateLoadGen;
       const data = await api("/api/state");
+      if (gen !== stateLoadGen) return;
       applyState(data);
       setStatus(`${state.prs.length} PRs · ${state.groups.length} groups`);
     } catch (err) {
@@ -2252,7 +2367,9 @@
         setStatus(formatProgress(err.data) + " (already running)");
         try {
           await pollProgressUntilDone();
+          const gen = ++stateLoadGen;
           const data = await api("/api/state");
+          if (gen !== stateLoadGen) return;
           applyState(data);
           setStatus(`${state.prs.length} PRs · ${state.groups.length} groups`);
         } catch (e2) {
@@ -2273,6 +2390,7 @@
 
   async function doDecide(decision) {
     if (!state.selectedGroupId) return;
+    const gen = ++stateLoadGen;
     setStatus(decision + "…");
     try {
       const data = await api("/api/decide", {
@@ -2283,9 +2401,11 @@
           decision,
         }),
       });
+      if (gen !== stateLoadGen) return;
       applyState(data);
       setStatus(`rule saved: ${decision} ${state.selectedGroupId}`);
     } catch (err) {
+      if (gen !== stateLoadGen) return;
       setStatus("decide error: " + err.message);
     }
   }
@@ -2300,6 +2420,19 @@
   $("tabAllPrs").addEventListener("click", () => setLeftTab("allprs"));
   const userClose = $("userDrawerClose");
   if (userClose) userClose.addEventListener("click", closeUserDrawer);
+  const relatedBlock = $("relatedBlock");
+  if (relatedBlock) {
+    relatedBlock.addEventListener("toggle", () => {
+      if (!relatedBlock.open) {
+        relatedGen += 1;
+        state.related = null;
+        state.relatedKey = "";
+        return;
+      }
+      const target = currentRelatedTarget();
+      loadRelated(target.pr, target.path);
+    });
+  }
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape" && state.selectedUser) closeUserDrawer();
   });
@@ -2307,8 +2440,10 @@
     if (writingUrl) return;
     alignSidebar = true;
     readUrl();
+    normalizeSelection();
     setLeftTab(state.leftTab, true);
     renderDetail();
+    writeUrl(false);
     if (state.selectedFile) openFileQueue(state.selectedFile, { fromUrl: true });
     renderUserDrawer();
   });

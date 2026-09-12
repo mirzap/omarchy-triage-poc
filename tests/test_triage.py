@@ -7,7 +7,6 @@ from pathlib import Path
 
 import pytest
 
-from triage.cluster import cluster_prs
 from triage.dedupe import apply_fingerprints, compute_fingerprint, normalize_title, static_groups
 from triage.embed import Embedder, cosine_similarity
 from triage.github import GitHubError, github_request
@@ -21,7 +20,7 @@ from triage.pipeline import (
     match_rule,
     run_pipeline,
 )
-from triage.store import decide_group, load_rules, save_groups
+from triage.store import decide_group, load_rules
 from triage.cli import main as cli_main
 
 HYPRLAND_NUMS = {101, 108, 115}
@@ -73,8 +72,12 @@ def test_normalize_title() -> None:
     assert normalize_title("Fix Hyprland Keybind!!!") == "fix hyprland keybind"
 
 
-def test_hyprland_trio_clusters_together(fixture_prs: list[PullRequest]) -> None:
-    result = run_pipeline(fixture_prs, persist=False, apply_rules=False)
+def test_hyprland_trio_clusters_together(
+    fixture_prs: list[PullRequest], tmp_store: Path
+) -> None:
+    result = run_pipeline(
+        fixture_prs, persist=False, store_path=tmp_store, apply_rules=False
+    )
     groups = result["groups"]
     hypr_group = None
     for g in groups:
@@ -85,17 +88,21 @@ def test_hyprland_trio_clusters_together(fixture_prs: list[PullRequest]) -> None
     assert set(hypr_group.pr_numbers) >= HYPRLAND_NUMS
 
 
-def test_stranger_does_not_join_hyprland(fixture_prs: list[PullRequest], newcomers: list[PullRequest]) -> None:
+def test_stranger_does_not_join_hyprland(
+    fixture_prs: list[PullRequest], newcomers: list[PullRequest], tmp_store: Path
+) -> None:
     stranger = next(p for p in newcomers if p.number == STRANGER_NUM)
     combined = fixture_prs + [stranger]
-    result = run_pipeline(combined, persist=False, apply_rules=False)
+    result = run_pipeline(
+        combined, persist=False, store_path=tmp_store, apply_rules=False
+    )
     for g in result["groups"]:
         nums = set(g.pr_numbers)
         if HYPRLAND_NUMS & nums:
             assert STRANGER_NUM not in nums
 
 
-def test_approve_then_auto_classify(
+def test_approved_shape_still_requires_human_review(
     fixture_prs: list[PullRequest],
     newcomers: list[PullRequest],
     tmp_store: Path,
@@ -129,12 +136,20 @@ def test_approve_then_auto_classify(
     match_idx = next(i for i, p in enumerate(combined) if p.number == NEWCOMER_MATCH_NUM)
     stranger_idx = next(i for i, p in enumerate(combined) if p.number == STRANGER_NUM)
 
-    assert match_rule(match_pr, vectors[match_idx], rules) is not None
+    assert match_rule(match_pr, vectors[match_idx], rules) is None
     assert match_rule(stranger, vectors[stranger_idx], rules) is None
 
-    match_pr.label = AUTO_APPROVE_LABEL if match_rule(match_pr, vectors[match_idx], rules) else NEEDS_HUMAN_LABEL
-    stranger.label = AUTO_APPROVE_LABEL if match_rule(stranger, vectors[stranger_idx], rules) else NEEDS_HUMAN_LABEL
-    assert match_pr.label == AUTO_APPROVE_LABEL
+    match_pr.label = (
+        AUTO_APPROVE_LABEL
+        if match_rule(match_pr, vectors[match_idx], rules)
+        else NEEDS_HUMAN_LABEL
+    )
+    stranger.label = (
+        AUTO_APPROVE_LABEL
+        if match_rule(stranger, vectors[stranger_idx], rules)
+        else NEEDS_HUMAN_LABEL
+    )
+    assert match_pr.label == NEEDS_HUMAN_LABEL
     assert stranger.label == NEEDS_HUMAN_LABEL
 
 
@@ -160,7 +175,7 @@ def test_github_missing_token(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_demo_and_pipeline_e2e(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    store = tmp_path / ".triage" / "store.json"
+    store = tmp_path / ".triage" / "demo-store.json"
     monkeypatch.chdir(tmp_path)
     # Point CLI default store via --store
     rc = cli_main(["demo", "--store", str(store)])
@@ -188,13 +203,12 @@ def test_embeddings_deterministic(fixture_prs: list[PullRequest]) -> None:
     assert cosine_similarity(a[h0], a[h1]) > cosine_similarity(a[h0], a[noise])
 
 
-# --- gh client, graph, server extensions ---
+# --- gh client and server extensions ---
 
 from triage.gh import GhError, validate_gh_argv, fetch_pulls_gh
-from triage.graph import compute_pr_edges, build_graph_payload, slim_pr
-from triage.overlap import file_overlap, hash_patch
+from triage.overlap import file_overlap
 from triage.server import run_fetch, ensure_initial_fixtures
-from triage.store import ui_state, load_store
+from triage.store import overlap_for_group, ui_state, load_store
 
 
 def test_gh_refuses_merge_and_mutating_methods() -> None:
@@ -215,28 +229,19 @@ def test_gh_refuses_merge_and_mutating_methods() -> None:
     )
 
 
-def test_graph_hyprland_edges_stranger_absent(
+def test_current_group_membership_excludes_unrelated_pr(
     fixture_prs: list[PullRequest],
     newcomers: list[PullRequest],
+    tmp_store: Path,
 ) -> None:
     stranger = next(p for p in newcomers if p.number == STRANGER_NUM)
     combined = fixture_prs + [stranger]
-    result = run_pipeline(combined, persist=False, apply_rules=False)
-    edges = result["edges"]
-    pairs = {(min(e["source"], e["target"]), max(e["source"], e["target"])) for e in edges}
-    # Hyprland trio should have edges among themselves at >= 0.55
-    assert (101, 108) in pairs or any(
-        {e["source"], e["target"]} == {101, 108} for e in edges
+    result = run_pipeline(
+        combined, persist=False, store_path=tmp_store, apply_rules=False
     )
-    assert (101, 115) in pairs or any(
-        {e["source"], e["target"]} == {101, 115} for e in edges
-    )
-    assert (108, 115) in pairs or any(
-        {e["source"], e["target"]} == {108, 115} for e in edges
-    )
-    # Stranger 999 should not edge to 101 at threshold 0.55
-    bad = [e for e in edges if set((e["source"], e["target"])) == {101, 999}]
-    assert not bad, f"unexpected edge 101-999: {bad}"
+    hypr = next(g for g in result["groups"] if 101 in g.pr_numbers)
+    assert HYPRLAND_NUMS.issubset(set(hypr.pr_numbers))
+    assert STRANGER_NUM not in hypr.pr_numbers
 
 
 def test_server_fetch_fixtures_and_decide(tmp_path: Path) -> None:
@@ -253,16 +258,15 @@ def test_server_fetch_fixtures_and_decide(tmp_path: Path) -> None:
     assert g001["pr_numbers"]
 
 
-def test_ensure_initial_fixtures(tmp_path: Path) -> None:
+def test_server_initial_state_remains_empty(tmp_path: Path) -> None:
     store = tmp_path / "store.json"
     ensure_initial_fixtures(store)
     data = load_store(store)
-    assert data["last_groups"]
-    assert data["last_prs"]
-    # second call should no-op (keep same count)
-    n = len(data["last_groups"])
+    assert data["last_groups"] == []
+    assert data["last_prs"] == []
+    assert not store.exists()
     ensure_initial_fixtures(store)
-    assert len(load_store(store)["last_groups"]) == n
+    assert load_store(store)["last_groups"] == []
 
 
 def test_ingest_gh_mocked(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -323,15 +327,15 @@ def test_ingest_gh_mocked(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> No
     assert api_after == api_before
 
 
-def test_slim_pr_files_include_capped_patches(fixture_prs: list[PullRequest]) -> None:
-    pr = next(p for p in fixture_prs if p.number == 101)
-    slim = slim_pr(pr, group_id="G001", repo="omacom/omarchy")
-    assert isinstance(slim["files"], list)
-    assert slim["files"], "expected file entries"
-    assert all(isinstance(f, dict) and "path" in f and "patch" in f for f in slim["files"])
-    assert "paths" in slim
-    assert set(slim["paths"]) == {f["path"] for f in slim["files"]}
-    assert any(f["path"].endswith("bindings.conf") and f["patch"] for f in slim["files"])
+def test_pipeline_slim_prs_keep_current_paths_without_eager_patches(
+    fixture_prs: list[PullRequest], tmp_store: Path
+) -> None:
+    result = run_pipeline(
+        fixture_prs, persist=False, store_path=tmp_store, apply_rules=False
+    )
+    slim = next(p for p in result["slim_prs"] if p["number"] == 101)
+    assert "config/hypr/bindings.conf" in slim["paths"]
+    assert "files" not in slim
 
 
 def test_file_overlap_hyprland_trio(fixture_prs: list[PullRequest]) -> None:
@@ -387,24 +391,33 @@ def test_file_overlap_walker_pair(fixture_prs: list[PullRequest]) -> None:
     assert ov["unique"]  # distinct theme css files
 
 
-def test_ui_state_overlap_g001_hypr(tmp_path: Path) -> None:
+def test_ui_state_overlap_is_summary_and_full_payload_is_lazy(tmp_path: Path) -> None:
     store = tmp_path / "store.json"
     state = run_fetch("fixtures", "omacom/omarchy", 80, store_path=store)
     assert "overlap" in state
     g001 = next(g for g in state["groups"] if g["group_id"] == "G001")
     ov = state["overlap"]["G001"]
     assert HYPRLAND_NUMS.issubset(set(g001["pr_numbers"]))
-    paths = {r["path"] for r in ov["matrix"]}
+    assert ov["lazy"] is True
+    assert ov["matrix"] == []
+    assert ov["matrix_n"] > 0
+    full = overlap_for_group("G001", path=store)
+    assert full["lazy"] is False
+    paths = {r["path"] for r in full["matrix"]}
     assert "config/hypr/bindings.conf" in paths
     assert "config/hypr/hyprland.conf" in paths
-    # slim PRs carry patches
+    # UI state carries paths only; patches are fetched lazily from cache.
     pr101 = next(p for p in state["prs"] if p["number"] == 101)
-    assert isinstance(pr101["files"][0], dict)
-    assert pr101["files"][0]["patch"]
+    assert "config/hypr/bindings.conf" in pr101["paths"]
+    assert "files" not in pr101
 
 
-def test_every_ingested_pr_in_exactly_one_group(fixture_prs: list[PullRequest]) -> None:
-    result = run_pipeline(fixture_prs, persist=False, apply_rules=False)
+def test_every_ingested_pr_in_exactly_one_group(
+    fixture_prs: list[PullRequest], tmp_store: Path
+) -> None:
+    result = run_pipeline(
+        fixture_prs, persist=False, store_path=tmp_store, apply_rules=False
+    )
     nums = [p.number for p in result["prs"]]
     assigned: list[int] = []
     for g in result["groups"]:

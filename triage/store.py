@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +15,11 @@ from triage.models import Group, TrustedRule
 
 DEFAULT_STORE_DIR = Path(".triage")
 DEFAULT_STORE_PATH = DEFAULT_STORE_DIR / "store.json"
+_STORE_LOCK = threading.RLock()
+
+
+def _repo_key(repo: str | None) -> str:
+    return (repo or "").strip().strip("/").lower()
 
 
 def _empty_store() -> dict[str, Any]:
@@ -27,7 +35,63 @@ def _empty_store() -> dict[str, Any]:
         "repo": "",
         "last_new_pr_numbers": [],
         "last_queue": {},
+        "groups_by_repo": {},
+        "pr_numbers_by_repo": {},
+        "reserved_group_ids": [],
+        "reserved_rule_ids": [],
     }
+
+
+def _materialize_identity(data: dict[str, Any]) -> dict[str, Any]:
+    """Give legacy records their original repository before any repo switch."""
+    data.setdefault("groups_by_repo", {})
+    data.setdefault("pr_numbers_by_repo", {})
+    data.setdefault("reserved_group_ids", [])
+    data.setdefault("reserved_rule_ids", [])
+
+    original_repo = _repo_key(data.get("repo"))
+
+    normalized_groups: dict[str, list[dict[str, Any]]] = {}
+    for stored_repo, records in data["groups_by_repo"].items():
+        scoped_repo = _repo_key(stored_repo)
+        if not scoped_repo:
+            continue
+        for raw in records:
+            raw.setdefault("repo", scoped_repo)
+        normalized_groups[scoped_repo] = records
+    data["groups_by_repo"] = normalized_groups
+    data["pr_numbers_by_repo"] = {
+        _repo_key(stored_repo): numbers
+        for stored_repo, numbers in data["pr_numbers_by_repo"].items()
+        if _repo_key(stored_repo)
+    }
+
+    for raw in data.get("last_groups") or []:
+        # A missing field is legacy data eligible for the store's original
+        # repository context.  Once materialized, an explicit empty value means
+        # provenance is unknown and must remain fail-closed across repo swaps.
+        if "repo" not in raw:
+            raw["repo"] = original_repo
+    for raw in data.get("trusted_rules") or []:
+        if "repo" not in raw:
+            raw["repo"] = original_repo
+        raw.setdefault("reviewed_pr_numbers", list(raw.get("created_from_prs") or []))
+
+    if original_repo and data.get("last_groups"):
+        data["groups_by_repo"][original_repo] = list(data["last_groups"])
+        data["pr_numbers_by_repo"][original_repo] = list(data.get("last_pr_numbers") or [])
+
+    group_ids = set(data.get("reserved_group_ids") or [])
+    rule_ids = set(data.get("reserved_rule_ids") or [])
+    group_ids.update(g.get("group_id", "") for g in data.get("last_groups") or [])
+    for records in data["groups_by_repo"].values():
+        group_ids.update(g.get("group_id", "") for g in records)
+    for raw in data.get("trusted_rules") or []:
+        group_ids.add(raw.get("group_id", ""))
+        rule_ids.add(raw.get("rule_id", ""))
+    data["reserved_group_ids"] = sorted(x for x in group_ids if x)
+    data["reserved_rule_ids"] = sorted(x for x in rule_ids if x)
+    return data
 
 
 def ensure_store_dir(path: Path = DEFAULT_STORE_PATH) -> None:
@@ -35,36 +99,77 @@ def ensure_store_dir(path: Path = DEFAULT_STORE_PATH) -> None:
 
 
 def load_store(path: Path = DEFAULT_STORE_PATH) -> dict[str, Any]:
-    if not path.exists():
-        return _empty_store()
-    with path.open("r", encoding="utf-8") as fh:
-        data = json.load(fh)
-    data.setdefault("trusted_rules", [])
-    data.setdefault("last_groups", [])
-    data.setdefault("last_pr_numbers", [])
-    data.setdefault("last_prs", [])
-    data.setdefault("last_edges", [])
-    data.setdefault("last_group_edges", [])
-    data.setdefault("last_overlap", {})
-    data.setdefault("source", "")
-    data.setdefault("repo", "")
-    data.setdefault("last_new_pr_numbers", [])
-    data.setdefault("last_queue", {})
-    return data
+    with _STORE_LOCK:
+        if not path.exists():
+            return _empty_store()
+        with path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        data.setdefault("trusted_rules", [])
+        data.setdefault("last_groups", [])
+        data.setdefault("last_pr_numbers", [])
+        data.setdefault("last_prs", [])
+        data.setdefault("last_edges", [])
+        data.setdefault("last_group_edges", [])
+        data.setdefault("last_overlap", {})
+        data.setdefault("source", "")
+        data.setdefault("repo", "")
+        data.setdefault("last_new_pr_numbers", [])
+        data.setdefault("last_queue", {})
+        return _materialize_identity(data)
+
+
+def _fsync_directory(path: Path) -> None:
+    """Best-effort directory sync after publishing a replacement file."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        # Some filesystems do not support syncing directory descriptors.  The
+        # file itself was synced before the atomic replacement.
+        pass
+    finally:
+        os.close(fd)
+
+
+def _atomic_write_json(data: dict[str, Any], path: Path) -> None:
+    ensure_store_dir(path)
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as fh:
+            temp_path = Path(fh.name)
+            json.dump(data, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(temp_path, path)
+        temp_path = None
+        _fsync_directory(path.parent)
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def save_store(data: dict[str, Any], path: Path = DEFAULT_STORE_PATH) -> None:
-    ensure_store_dir(path)
-    with path.open("w", encoding="utf-8") as fh:
-        json.dump(data, fh, indent=2, sort_keys=True)
-        fh.write("\n")
+    with _STORE_LOCK:
+        _atomic_write_json(data, path)
 
 
 def save_groups(groups: list[Group], pr_numbers: list[int], path: Path = DEFAULT_STORE_PATH) -> None:
-    data = load_store(path)
-    data["last_groups"] = [g.to_dict() for g in groups]
-    data["last_pr_numbers"] = pr_numbers
-    save_store(data, path)
+    save_run_state(groups, pr_numbers, path=path)
 
 
 def save_run_state(
@@ -82,52 +187,89 @@ def save_run_state(
     last_queue: dict[str, Any] | None = None,
 ) -> None:
     """Persist groups plus slim PR/graph payload for the UI."""
-    data = load_store(path)
-    data["last_groups"] = [g.to_dict() for g in groups]
-    data["last_pr_numbers"] = pr_numbers
-    if last_prs is not None:
-        data["last_prs"] = last_prs
-    if last_edges is not None:
-        data["last_edges"] = last_edges
-    if last_group_edges is not None:
-        data["last_group_edges"] = last_group_edges
-    if last_overlap is not None:
-        data["last_overlap"] = last_overlap
-    if source is not None:
-        data["source"] = source
-    if repo is not None:
-        data["repo"] = repo
-    if last_new_pr_numbers is not None:
-        data["last_new_pr_numbers"] = last_new_pr_numbers
-    if last_queue is not None:
-        data["last_queue"] = last_queue
-    save_store(data, path)
+    with _STORE_LOCK:
+        data = load_store(path)
+        active_repo = _repo_key(repo if repo is not None else data.get("repo"))
+        for g in groups:
+            g.repo = active_repo
+        data["last_groups"] = [g.to_dict() for g in groups]
+        data["last_pr_numbers"] = pr_numbers
+        if last_prs is not None:
+            data["last_prs"] = last_prs
+        if last_edges is not None:
+            data["last_edges"] = last_edges
+        if last_group_edges is not None:
+            data["last_group_edges"] = last_group_edges
+        if last_overlap is not None:
+            data["last_overlap"] = last_overlap
+        if source is not None:
+            data["source"] = source
+        if repo is not None:
+            data["repo"] = active_repo
+        if last_new_pr_numbers is not None:
+            data["last_new_pr_numbers"] = last_new_pr_numbers
+        if last_queue is not None:
+            data["last_queue"] = last_queue
+        if active_repo:
+            data["groups_by_repo"][active_repo] = list(data["last_groups"])
+            data["pr_numbers_by_repo"][active_repo] = list(pr_numbers)
+        _materialize_identity(data)
+        save_store(data, path)
 
 
-def load_groups(path: Path = DEFAULT_STORE_PATH) -> list[Group]:
-    data = load_store(path)
-    return [Group.from_dict(g) for g in data.get("last_groups", [])]
+def _groups_from_data(data: dict[str, Any], repo: str | None = None) -> list[Group]:
+    wanted = _repo_key(repo)
+    raw = data.get("last_groups", [])
+    if wanted:
+        raw = (data.get("groups_by_repo") or {}).get(wanted, [])
+    return [Group.from_dict(g) for g in raw]
 
 
-def load_rules(path: Path = DEFAULT_STORE_PATH) -> list[TrustedRule]:
-    data = load_store(path)
-    return [TrustedRule.from_dict(r) for r in data.get("trusted_rules", [])]
+def load_groups(path: Path = DEFAULT_STORE_PATH, repo: str | None = None) -> list[Group]:
+    return _groups_from_data(load_store(path), repo)
 
 
-def upsert_rule(rule: TrustedRule, path: Path = DEFAULT_STORE_PATH) -> None:
-    data = load_store(path)
+def _rules_from_data(
+    data: dict[str, Any], repo: str | None = None
+) -> list[TrustedRule]:
+    rules = [TrustedRule.from_dict(r) for r in data.get("trusted_rules", [])]
+    wanted = _repo_key(repo if repo is not None else data.get("repo"))
+    return [r for r in rules if _repo_key(r.repo) == wanted]
+
+
+def load_rules(path: Path = DEFAULT_STORE_PATH, repo: str | None = None) -> list[TrustedRule]:
+    return _rules_from_data(load_store(path), repo)
+
+
+def reserved_group_ids(path: Path = DEFAULT_STORE_PATH) -> set[str]:
+    return set(load_store(path).get("reserved_group_ids") or [])
+
+
+def _upsert_rule_in_data(data: dict[str, Any], rule: TrustedRule) -> None:
+    if not rule.reviewed_pr_numbers:
+        rule.reviewed_pr_numbers = list(rule.created_from_prs)
     rules = data.get("trusted_rules", [])
     # Replace existing rule for same group_id + decision type, or append
     replaced = False
     for i, existing in enumerate(rules):
-        if existing.get("group_id") == rule.group_id:
+        if (
+            existing.get("group_id") == rule.group_id
+            and _repo_key(existing.get("repo")) == _repo_key(rule.repo)
+        ):
             rules[i] = rule.to_dict()
             replaced = True
             break
     if not replaced:
         rules.append(rule.to_dict())
     data["trusted_rules"] = rules
-    save_store(data, path)
+    _materialize_identity(data)
+
+
+def upsert_rule(rule: TrustedRule, path: Path = DEFAULT_STORE_PATH) -> None:
+    with _STORE_LOCK:
+        data = load_store(path)
+        _upsert_rule_in_data(data, rule)
+        save_store(data, path)
 
 
 def decide_group(
@@ -139,39 +281,75 @@ def decide_group(
         raise ValueError(
             f"decision must be approve|reject|hardware|upgrade, got {decision!r}"
         )
-    groups = load_groups(path)
-    match = next((g for g in groups if g.group_id == group_id), None)
-    if match is None:
-        raise KeyError(f"group not found: {group_id}")
-    rule = TrustedRule(
-        rule_id=f"rule-{group_id}-{decision}",
-        group_id=group_id,
-        decision=decision,
-        fingerprints=list(match.fingerprints),
-        centroid=list(match.centroid),
-        file_set_signature=match.file_set_signature,
-        shared_files=list(match.shared_files),
-        created_from_prs=list(match.pr_numbers),
-        simhash=int(getattr(match, "simhash", 0) or 0),
+    with _STORE_LOCK:
+        data = load_store(path)
+        repo = _repo_key(data.get("repo"))
+        groups = _groups_from_data(data, repo=repo)
+        match = next((g for g in groups if g.group_id == group_id), None)
+        if match is None:
+            raise KeyError(f"group not found: {group_id}")
+        existing_rule = next(
+            (
+                raw
+                for raw in data.get("trusted_rules") or []
+                if raw.get("group_id") == group_id
+                and _repo_key(raw.get("repo")) == repo
+            ),
+            None,
+        )
+        rule_id = (
+            str(existing_rule.get("rule_id"))
+            if existing_rule
+            else f"rule-{group_id}-{decision}"
+        )
+        if not existing_rule and rule_id in set(data.get("reserved_rule_ids") or []):
+            base = rule_id
+            suffix = 2
+            while rule_id in set(data.get("reserved_rule_ids") or []):
+                rule_id = f"{base}-{suffix}"
+                suffix += 1
+        rule = TrustedRule(
+            rule_id=rule_id,
+            group_id=group_id,
+            decision=decision,
+            fingerprints=list(match.fingerprints),
+            centroid=list(match.centroid),
+            file_set_signature=match.file_set_signature,
+            shared_files=list(match.shared_files),
+            created_from_prs=list(match.pr_numbers),
+            simhash=int(getattr(match, "simhash", 0) or 0),
+            repo=repo,
+            reviewed_pr_numbers=list(match.pr_numbers),
+        )
+        _upsert_rule_in_data(data, rule)
+        _refresh_queue_in_data(data)
+        save_store(data, path)
+        return rule
+
+
+def _refresh_queue_in_data(data: dict[str, Any]) -> None:
+    from triage.overlap import slim_to_pr
+    from triage.queue import build_queue
+
+    groups = [Group.from_dict(g) for g in (data.get("last_groups") or [])]
+    prs = [slim_to_pr(p) for p in (data.get("last_prs") or [])]
+    repo = _repo_key(data.get("repo"))
+    rules = _rules_from_data(data, repo=repo)
+    data["last_queue"] = build_queue(
+        groups,
+        prs,
+        rules,
+        new_pr_numbers=data.get("last_new_pr_numbers") or [],
+        repo=repo,
     )
-    upsert_rule(rule, path)
-    _refresh_queue(path)
-    return rule
 
 
 def _refresh_queue(path: Path = DEFAULT_STORE_PATH) -> None:
     """Rebuild last_queue after a local decision so the Queue tab moves."""
-    from triage.overlap import slim_to_pr
-    from triage.queue import build_queue
-
-    data = load_store(path)
-    groups = [Group.from_dict(g) for g in (data.get("last_groups") or [])]
-    prs = [slim_to_pr(p) for p in (data.get("last_prs") or [])]
-    rules = [TrustedRule.from_dict(r) for r in (data.get("trusted_rules") or [])]
-    data["last_queue"] = build_queue(
-        groups, prs, rules, new_pr_numbers=data.get("last_new_pr_numbers") or []
-    )
-    save_store(data, path)
+    with _STORE_LOCK:
+        data = load_store(path)
+        _refresh_queue_in_data(data)
+        save_store(data, path)
 
 
 MAX_STATE_TITLES = 4
@@ -314,9 +492,31 @@ def ui_state(path: Path = DEFAULT_STORE_PATH) -> dict[str, Any]:
         if not gid:
             continue
         bucket = paths_by_gid.setdefault(gid, [])
-        for path in pr.get("paths") or []:
-            if path and path not in bucket:
-                bucket.append(path)
+        for member_path in pr.get("paths") or []:
+            if member_path and member_path not in bucket:
+                bucket.append(member_path)
+    repo = _repo_key(data.get("repo"))
+    group_models = [Group.from_dict(g) for g in data.get("last_groups", [])]
+    from triage.queue import rule_applies_to_group
+
+    active_rules = [
+        rule.to_dict()
+        for rule in _rules_from_data(data, repo=repo)
+        if any(rule_applies_to_group(rule, group, repo) for group in group_models)
+    ]
+    # Derive the visible queue from the scoped rules on every read.  This
+    # prevents a legacy persisted queue (including stale auto labels) from
+    # exposing a foreign or no-longer-applicable decision before the next run.
+    from triage.overlap import slim_to_pr
+    from triage.queue import build_queue
+
+    queue = build_queue(
+        group_models,
+        [slim_to_pr(pr) for pr in data.get("last_prs") or []],
+        [TrustedRule.from_dict(rule) for rule in active_rules],
+        new_pr_numbers=data.get("last_new_pr_numbers") or [],
+        repo=repo,
+    )
     return {
         "groups": [
             _slim_group_for_ui(g, paths_by_gid.get(g.get("group_id") or ""))
@@ -325,10 +525,10 @@ def ui_state(path: Path = DEFAULT_STORE_PATH) -> dict[str, Any]:
         "prs": [_slim_pr_for_ui(pr) for pr in data.get("last_prs", [])],
         "edges": [],
         "group_edges": [],
-        "rules": data.get("trusted_rules", []),
+        "rules": active_rules,
         "overlap": overlap,
         "source": data.get("source", ""),
         "repo": data.get("repo", ""),
-        "queue": data.get("last_queue") or {},
+        "queue": queue,
         "new_pr_numbers": data.get("last_new_pr_numbers") or [],
     }

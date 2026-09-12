@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -16,6 +18,7 @@ DEFAULT_CACHE_DIR = Path(".triage") / "cache"
 MAX_FILE_WORKERS = 8
 PULLS_TIMEOUT = 300
 FILE_TIMEOUT = 60
+FETCH_METADATA_FILE = "fetch-metadata.json"
 
 ProgressCallback = Callable[[dict[str, Any]], None]
 
@@ -192,9 +195,107 @@ def run_gh_api(
         raise GhError("Unexpected gh api JSON shape after paginate merge")
 
 
+_OWNER_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")
+_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+_KNOWN_LEGACY_REPOSITORIES = frozenset({("omacom", "omarchy")})
+_legacy_match_index: dict[
+    tuple[str, str, str], tuple[object, object, bool]
+] = {}
+
+
+def _validate_repository(owner: str, repo: str) -> None:
+    """Reject names that could escape or alias a cache namespace."""
+    if not isinstance(owner, str) or not _OWNER_RE.fullmatch(owner):
+        raise GhError(f"Invalid GitHub repository owner: {owner!r}")
+    if (
+        not isinstance(repo, str)
+        or not _REPO_RE.fullmatch(repo)
+        or repo in {".", ".."}
+        or "/" in repo
+        or "\\" in repo
+    ):
+        raise GhError(f"Invalid GitHub repository name: {repo!r}")
+
+
 def _cache_root(owner: str, repo: str, base: Path | None = None) -> Path:
+    """Canonical, collision-free cache namespace: ``base/owner/repo``."""
+    _validate_repository(owner, repo)
+    root = base or DEFAULT_CACHE_DIR
+    return root / owner / repo
+
+
+def _legacy_cache_root(owner: str, repo: str, base: Path | None = None) -> Path:
+    """The pre-namespace cache path, used only for verified read fallback."""
+    _validate_repository(owner, repo)
     root = base or DEFAULT_CACHE_DIR
     return root / f"{owner}-{repo}"
+
+
+def _item_repository(item: dict[str, Any]) -> str | None:
+    base = item.get("base")
+    if isinstance(base, dict):
+        base_repo = base.get("repo")
+        if isinstance(base_repo, dict) and isinstance(base_repo.get("full_name"), str):
+            return base_repo["full_name"]
+    html_url = item.get("html_url")
+    if isinstance(html_url, str) and html_url.startswith("https://github.com/"):
+        path = html_url.removeprefix("https://github.com/").split("?", 1)[0]
+        parts = path.strip("/").split("/")
+        if len(parts) >= 4 and parts[2] == "pull":
+            return f"{parts[0]}/{parts[1]}"
+    return None
+
+
+def _legacy_cache_matches(owner: str, repo: str, root: Path) -> bool:
+    """Avoid reading an ambiguous flattened cache for the wrong repository."""
+    metadata_path = root / FETCH_METADATA_FILE
+    pulls_path = root / "pulls.json"
+    key = (owner, repo, str(root.resolve()))
+    metadata_signature = _path_signature(metadata_path)
+    pulls_signature = _path_signature(pulls_path)
+    indexed = _legacy_match_index.get(key)
+    if (
+        indexed is not None
+        and indexed[0] == metadata_signature
+        and indexed[1] == pulls_signature
+    ):
+        return indexed[2]
+
+    metadata = _load_json(metadata_path)
+    expected = f"{owner}/{repo}"
+    metadata_repository = (
+        metadata.get("repository") if isinstance(metadata, dict) else None
+    )
+    identity_known = isinstance(metadata_repository, str) and bool(metadata_repository)
+    if identity_known:
+        matches = metadata_repository == expected
+    else:
+        raw = _load_json(pulls_path)
+        matches = False
+        if isinstance(raw, list) and raw:
+            items = [item for item in raw if isinstance(item, dict)]
+            identities = [_item_repository(item) for item in items]
+            if items and all(identity is not None for identity in identities):
+                identity_known = True
+                matches = set(identities) == {expected}
+
+        # The original POC cache predates identity metadata. Keep its one known
+        # production namespace readable, but never write or migrate it.
+        if not identity_known:
+            matches = (owner, repo) in _KNOWN_LEGACY_REPOSITORIES
+
+    _legacy_match_index[key] = (metadata_signature, pulls_signature, matches)
+    return matches
+
+
+def _cache_read_root(owner: str, repo: str, base: Path | None = None) -> Path:
+    canonical = _cache_root(owner, repo, base)
+    if (canonical / "pulls.json").exists():
+        return canonical
+    legacy = _legacy_cache_root(owner, repo, base)
+    if legacy.exists() and _legacy_cache_matches(owner, repo, legacy):
+        return legacy
+    return canonical
 
 
 def _load_json(path: Path) -> Any | None:
@@ -258,6 +359,57 @@ def _emit_progress(
         on_progress(snapshot)
 
 
+def _utc_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _path_timestamp(path: Path) -> str | None:
+    try:
+        modified = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
+    except OSError:
+        return None
+    return modified.isoformat().replace("+00:00", "Z")
+
+
+def _pull_revision(item: dict[str, Any] | None) -> tuple[str, str] | None:
+    """Return comparable revision evidence, or None when it is incomplete."""
+    if not isinstance(item, dict):
+        return None
+    updated_at = item.get("updated_at")
+    head = item.get("head")
+    head_sha = head.get("sha") if isinstance(head, dict) else None
+    if not isinstance(updated_at, str) or not updated_at:
+        return None
+    if not isinstance(head_sha, str) or not head_sha:
+        return None
+    return updated_at, head_sha
+
+
+def _file_metadata_revision(metadata: Any, number: int) -> tuple[str, str] | None:
+    if not isinstance(metadata, dict):
+        return None
+    files = metadata.get("files")
+    if not isinstance(files, dict):
+        return None
+    entry = files.get(str(number))
+    if not isinstance(entry, dict):
+        return None
+    updated_at = entry.get("updated_at")
+    head_sha = entry.get("head_sha")
+    if not isinstance(updated_at, str) or not updated_at:
+        return None
+    if not isinstance(head_sha, str) or not head_sha:
+        return None
+    return updated_at, head_sha
+
+
+def _safe_legacy_root(owner: str, repo: str, base: Path | None) -> Path | None:
+    legacy = _legacy_cache_root(owner, repo, base)
+    if legacy.exists() and _legacy_cache_matches(owner, repo, legacy):
+        return legacy
+    return None
+
+
 def fetch_pulls_gh(
     owner: str,
     repo: str,
@@ -265,18 +417,37 @@ def fetch_pulls_gh(
     cache_dir: Path | None = None,
     progress: dict[str, Any] | None = None,
     on_progress: ProgressCallback | None = None,
+    refresh: bool = False,
+    force: bool = False,
 ) -> list[PullRequest]:
     """
     Fetch open PRs + files via `gh api` (GET only).
     limit=0 means all open PRs (paginate). Default 0 = all.
-    Caches under .triage/cache/{owner}-{repo}/.
+    Caches under .triage/cache/{owner}/{repo}/.
+    With refresh=True (or its force=True alias), re-list all open PRs and
+    re-fetch files whose updated_at/head SHA revision changed or is unknown.
+    Without refresh, a cache hit is deliberately reported as cached/stale.
     Parallelizes per-PR file fetches (max 8 workers). Still GET-only.
     """
-    ensure_gh_auth()
     repo_slug = f"{owner}/{repo}"
     root = _cache_root(owner, repo, cache_dir)
+    read_root = _cache_read_root(owner, repo, cache_dir)
+    legacy_root = _safe_legacy_root(owner, repo, cache_dir)
+    ensure_gh_auth()
     pulls_cache = root / "pulls.json"
-    files_dir = root / "files"
+    cached_pulls_path = read_root / "pulls.json"
+    metadata_path = root / FETCH_METADATA_FILE
+    metadata = _load_json(metadata_path)
+    if not isinstance(metadata, dict):
+        metadata = {}
+    metadata.setdefault("repository", repo_slug)
+    files_metadata = metadata.get("files")
+    if not isinstance(files_metadata, dict):
+        files_metadata = {}
+        metadata["files"] = files_metadata
+    legacy_metadata: Any = None
+    if legacy_root is not None:
+        legacy_metadata = _load_json(legacy_root / FETCH_METADATA_FILE)
 
     _emit_progress(
         progress,
@@ -287,18 +458,39 @@ def fetch_pulls_gh(
         message="listing open pulls",
     )
 
-    raw_pulls = _load_json(pulls_cache)
-    if raw_pulls is None:
+    old_raw_pulls = _load_json(cached_pulls_path)
+    refresh_requested = bool(refresh or force)
+    listing_fetched = old_raw_pulls is None or refresh_requested
+    listed_at: str | None = None
+    if listing_fetched:
         # Quote query so shell never sees ? — we pass argv list, but still encode
         endpoint = f"repos/{owner}/{repo}/pulls?state=open&per_page=100&sort=created&direction=desc"
         print(f"[gh] fetching pulls for {repo_slug} ...", flush=True)
         raw_pulls = run_gh_api(endpoint, paginate=True, timeout=PULLS_TIMEOUT)
         if not isinstance(raw_pulls, list):
             raise GhError("Unexpected response for pulls list")
+        listed_at = _utc_timestamp()
         _save_json(pulls_cache, raw_pulls)
+        metadata["repository"] = repo_slug
+        metadata["pulls_fetched_at"] = listed_at
+        _save_json(metadata_path, metadata)
         print(f"[gh] cached {len(raw_pulls)} pulls -> {pulls_cache}", flush=True)
+        cache_status = "refreshed" if old_raw_pulls is not None else "fresh"
     else:
-        print(f"[gh] cache hit: {pulls_cache} ({len(raw_pulls)} pulls)", flush=True)
+        raw_pulls = old_raw_pulls
+        source_metadata = _load_json(read_root / FETCH_METADATA_FILE)
+        if isinstance(source_metadata, dict):
+            candidate = source_metadata.get("pulls_fetched_at")
+            if isinstance(candidate, str) and candidate:
+                listed_at = candidate
+        if listed_at is None:
+            listed_at = _path_timestamp(cached_pulls_path)
+        cache_status = "cached_stale"
+        print(
+            f"[gh] cache hit (stale): {cached_pulls_path} ({len(raw_pulls)} pulls)"
+            + (f"; fetched {listed_at}" if listed_at else ""),
+            flush=True,
+        )
 
     if not isinstance(raw_pulls, list):
         raise GhError("Cached pulls.json is not a list")
@@ -309,6 +501,30 @@ def fetch_pulls_gh(
         selected = list(raw_pulls[: max(limit, 0)])
 
     total = len(selected)
+    partial = total < len(raw_pulls)
+    status_message = {
+        "cached_stale": "using cached/stale open-pull list",
+        "refreshed": "refreshed open-pull list",
+        "fresh": "fetched open-pull list",
+    }[cache_status]
+    if listed_at:
+        status_message += f" (as of {listed_at})"
+    if partial:
+        status_message += f"; selected {total} of {len(raw_pulls)} open pulls"
+    _emit_progress(
+        progress,
+        on_progress,
+        phase="listing",
+        done=0,
+        total=total,
+        message=status_message,
+        cache_status=cache_status,
+        fetched_at=listed_at,
+        refresh_requested=refresh_requested,
+        partial=partial,
+        selected_count=total,
+        open_count=len(raw_pulls),
+    )
     _emit_progress(
         progress,
         on_progress,
@@ -318,29 +534,66 @@ def fetch_pulls_gh(
         message=f"files 0/{total}",
     )
 
-    files_dir.mkdir(parents=True, exist_ok=True)
+    files_dir = root / "files"
     cache_lock = threading.Lock()
     progress_lock = threading.Lock()
     done_count = 0
+    cached_file_count = 0
+    fetched_file_count = 0
+    refreshed_file_count = 0
+
+    def _cached_file(number: int) -> tuple[Path, tuple[str, str] | None]:
+        canonical = files_dir / f"{number}.json"
+        if canonical.exists():
+            return canonical, _file_metadata_revision(metadata, number)
+        if legacy_root is not None:
+            legacy = legacy_root / "files" / f"{number}.json"
+            if legacy.exists():
+                return legacy, _file_metadata_revision(legacy_metadata, number)
+        return canonical, None
 
     def _fetch_one(item: dict[str, Any]) -> PullRequest:
-        nonlocal done_count
+        nonlocal done_count, cached_file_count, fetched_file_count, refreshed_file_count
         number = int(item["number"])
         files_cache = files_dir / f"{number}.json"
+        cached_files_path, cached_revision = _cached_file(number)
+        new_revision = _pull_revision(item)
+        known_revision_mismatch = (
+            cached_revision is not None
+            and new_revision is not None
+            and cached_revision != new_revision
+        )
+        unverified_after_listing = listing_fetched and (
+            cached_revision is None or new_revision is None
+        )
+        revision_changed_or_unknown = known_revision_mismatch or unverified_after_listing
         with cache_lock:
-            raw_files = _load_json(files_cache)
-        if raw_files is None:
+            raw_files = None if revision_changed_or_unknown else _load_json(cached_files_path)
+        fetched_files = raw_files is None
+        if fetched_files:
             endpoint = f"repos/{owner}/{repo}/pulls/{number}/files?per_page=100"
             print(f"[gh] fetching files for PR #{number} ...", flush=True)
             raw_files = run_gh_api(endpoint, paginate=True, timeout=FILE_TIMEOUT)
             if raw_files is None:
                 raw_files = []
+            file_fetched_at = _utc_timestamp()
             with cache_lock:
                 _save_json(files_cache, raw_files)
+                files_metadata[str(number)] = {
+                    "fetched_at": file_fetched_at,
+                    "updated_at": new_revision[0] if new_revision else None,
+                    "head_sha": new_revision[1] if new_revision else None,
+                }
         changed = _parse_files(raw_files)
         pr = _parse_pr_item(item, changed, repo_slug)
         with progress_lock:
             done_count += 1
+            if fetched_files:
+                fetched_file_count += 1
+                if revision_changed_or_unknown:
+                    refreshed_file_count += 1
+            else:
+                cached_file_count += 1
             current = done_count
             _emit_progress(
                 progress,
@@ -349,30 +602,46 @@ def fetch_pulls_gh(
                 done=current,
                 total=total,
                 message=f"files {current}/{total}",
+                cached_files=cached_file_count,
+                fetched_files=fetched_file_count,
+                refreshed_files=refreshed_file_count,
             )
         return pr
 
     results: list[PullRequest] = []
-    if total == 0:
-        return results
+    if total:
+        with ThreadPoolExecutor(max_workers=MAX_FILE_WORKERS) as pool:
+            futures = {pool.submit(_fetch_one, item): item for item in selected}
+            # Preserve selection order
+            by_number: dict[int, PullRequest] = {}
+            for fut in as_completed(futures):
+                pr = fut.result()
+                by_number[pr.number] = pr
+            for item in selected:
+                results.append(by_number[int(item["number"])])
 
-    with ThreadPoolExecutor(max_workers=MAX_FILE_WORKERS) as pool:
-        futures = {pool.submit(_fetch_one, item): item for item in selected}
-        # Preserve selection order
-        by_number: dict[int, PullRequest] = {}
-        for fut in as_completed(futures):
-            pr = fut.result()
-            by_number[pr.number] = pr
-        for item in selected:
-            results.append(by_number[int(item["number"])])
+    if fetched_file_count:
+        _save_json(metadata_path, metadata)
 
+    final_message = f"loaded {total} PRs"
+    if cache_status == "cached_stale":
+        final_message += " from cached/stale open-pull list"
+        if listed_at:
+            final_message += f" (as of {listed_at})"
+    elif cache_status == "refreshed":
+        final_message += " after refreshing open-pull list"
+    if partial:
+        final_message += f"; partial selection ({total}/{len(raw_pulls)})"
     _emit_progress(
         progress,
         on_progress,
         phase="done",
         done=total,
         total=total,
-        message=f"fetched {total} PRs",
+        message=final_message,
+        cached_files=cached_file_count,
+        fetched_files=fetched_file_count,
+        refreshed_files=refreshed_file_count,
     )
     return results
 
@@ -386,14 +655,121 @@ def gh_available() -> bool:
         return False
 
 
+_PathSignature = tuple[int, int, int, int] | None
+_pulls_index: dict[
+    tuple[str, str, str],
+    tuple[
+        _PathSignature,
+        dict[int, dict[str, Any]],
+        dict[int, tuple[str, str] | None],
+    ],
+] = {}
+_fetch_metadata_index: dict[str, tuple[_PathSignature, dict[str, Any]]] = {}
+
+
+def _path_signature(path: Path) -> _PathSignature:
+    """Cheap signature robust to in-place writes and atomic file replacement."""
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return None
+    return stat.st_mtime_ns, stat.st_ctime_ns, stat.st_ino, stat.st_size
+
+
+def _cached_pulls_indexes(
+    owner: str,
+    repo: str,
+    root: Path,
+) -> tuple[dict[int, dict[str, Any]], dict[int, tuple[str, str] | None]]:
+    pulls_path = root / "pulls.json"
+    key = (owner, repo, str(root.resolve()))
+    signature = _path_signature(pulls_path)
+    indexed = _pulls_index.get(key)
+    if indexed is None or indexed[0] != signature:
+        raw = _load_json(pulls_path)
+        metadata_by_number: dict[int, dict[str, Any]] = {}
+        revisions_by_number: dict[int, tuple[str, str] | None] = {}
+        if isinstance(raw, list):
+            for item in raw:
+                if not isinstance(item, dict) or "number" not in item:
+                    continue
+                number = int(item["number"])
+                user = ""
+                u = item.get("user")
+                if isinstance(u, dict):
+                    user = u.get("login") or ""
+                elif isinstance(u, str):
+                    user = u
+                metadata_by_number[number] = {
+                    "number": number,
+                    "title": item.get("title") or "",
+                    "body": item.get("body") or "",
+                    "user": user,
+                    "html_url": item.get("html_url") or "",
+                }
+                revisions_by_number[number] = _pull_revision(item)
+        indexed = (signature, metadata_by_number, revisions_by_number)
+        _pulls_index[key] = indexed
+    return indexed[1], indexed[2]
+
+
+def _cached_fetch_metadata(root: Path) -> dict[str, Any]:
+    path = root / FETCH_METADATA_FILE
+    key = str(root.resolve())
+    signature = _path_signature(path)
+    indexed = _fetch_metadata_index.get(key)
+    if indexed is None or indexed[0] != signature:
+        raw = _load_json(path)
+        metadata = raw if isinstance(raw, dict) else {}
+        indexed = (signature, metadata)
+        _fetch_metadata_index[key] = indexed
+    return indexed[1]
+
+
 def cached_pr_files(
     owner: str,
     repo: str,
     number: int,
     cache_dir: Path | None = None,
 ) -> list[dict[str, str]]:
-    """Read cached pull files (path + patch). Empty list on cache miss. No network."""
-    raw = _load_json(_cache_root(owner, repo, cache_dir) / "files" / f"{number}.json")
+    """Read revision-consistent cached pull files. Empty list on cache miss."""
+    number = int(number)
+    canonical_root = _cache_root(owner, repo, cache_dir)
+    canonical_pulls_exist = (canonical_root / "pulls.json").exists()
+    pulls_root = _cache_read_root(owner, repo, cache_dir)
+    pull_metadata, pull_revisions = _cached_pulls_indexes(owner, repo, pulls_root)
+
+    # A canonical open-list cache is authoritative: an omitted PR is closed (or
+    # otherwise no longer selected), and an unverifiable patch must not leak
+    # through from an older canonical or flattened cache.
+    if canonical_pulls_exist and number not in pull_metadata:
+        return []
+    pull_revision = pull_revisions.get(number)
+
+    roots = [canonical_root]
+    legacy_root = _safe_legacy_root(owner, repo, cache_dir)
+    if legacy_root is not None and legacy_root != canonical_root:
+        roots.append(legacy_root)
+
+    raw: Any = None
+    for candidate_root in roots:
+        candidate = candidate_root / "files" / f"{number}.json"
+        if not candidate.exists():
+            continue
+        file_revision = _file_metadata_revision(
+            _cached_fetch_metadata(candidate_root), number
+        )
+        if canonical_pulls_exist:
+            if pull_revision is None or file_revision != pull_revision:
+                continue
+        elif (
+            pull_revision is not None
+            and file_revision is not None
+            and pull_revision != file_revision
+        ):
+            continue
+        raw = _load_json(candidate)
+        break
     if not isinstance(raw, list):
         return []
     out: list[dict[str, str]] = []
@@ -409,9 +785,6 @@ def cached_pr_files(
     return out
 
 
-_pulls_index: dict[tuple[str, str], dict[int, dict]] = {}
-
-
 def cached_pr_meta(
     owner: str,
     repo: str,
@@ -419,26 +792,6 @@ def cached_pr_meta(
     cache_dir: Path | None = None,
 ) -> dict[str, str] | None:
     """Title/body/user from cached pulls.json. No network."""
-    key = (owner, repo)
-    if key not in _pulls_index:
-        raw = _load_json(_cache_root(owner, repo, cache_dir) / "pulls.json")
-        idx: dict[int, dict] = {}
-        if isinstance(raw, list):
-            for item in raw:
-                if not isinstance(item, dict) or "number" not in item:
-                    continue
-                user = ""
-                u = item.get("user")
-                if isinstance(u, dict):
-                    user = u.get("login") or ""
-                elif isinstance(u, str):
-                    user = u
-                idx[int(item["number"])] = {
-                    "number": int(item["number"]),
-                    "title": item.get("title") or "",
-                    "body": item.get("body") or "",
-                    "user": user,
-                    "html_url": item.get("html_url") or "",
-                }
-        _pulls_index[key] = idx
-    return _pulls_index[key].get(int(number))
+    root = _cache_read_root(owner, repo, cache_dir)
+    metadata_by_number, _ = _cached_pulls_indexes(owner, repo, root)
+    return metadata_by_number.get(int(number))

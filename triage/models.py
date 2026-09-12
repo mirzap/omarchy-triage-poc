@@ -94,6 +94,7 @@ class Group:
     file_set_signature: str = ""
     summary: str = ""
     simhash: int = 0
+    repo: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -124,6 +125,8 @@ class TrustedRule:
     shared_files: list[str]
     created_from_prs: list[int]
     simhash: int = 0
+    repo: str = ""
+    reviewed_pr_numbers: list[int] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -142,4 +145,15 @@ class TrustedRule:
                 kwargs["simhash"] = 0
         # Back-compat: missing simhash → 0 (clause skipped)
         kwargs.setdefault("simhash", 0)
+        # Legacy rules recorded the reviewed membership under created_from_prs.
+        kwargs.setdefault(
+            "reviewed_pr_numbers",
+            [int(n) for n in data.get("created_from_prs", [])],
+        )
         return cls(**kwargs)
+
+    @property
+    def reviewed_members(self) -> set[int]:
+        """PR membership that a human actually reviewed for this decision."""
+        values = self.reviewed_pr_numbers or self.created_from_prs
+        return {int(n) for n in values}
