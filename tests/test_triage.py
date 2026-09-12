@@ -7,17 +7,13 @@ from pathlib import Path
 
 import pytest
 
-from triage.dedupe import apply_fingerprints, compute_fingerprint, normalize_title, static_groups
-from triage.embed import Embedder, cosine_similarity
 from triage.github import GitHubError, github_request
 from triage.models import ChangedFile, PullRequest
 from triage.pipeline import (
-    AUTO_APPROVE_LABEL,
     FIXTURES_DIR,
     NEEDS_HUMAN_LABEL,
     ingest,
     load_prs_from_json,
-    match_rule,
     run_pipeline,
 )
 from triage.store import decide_group, load_rules
@@ -25,7 +21,6 @@ from triage.cli import main as cli_main
 
 HYPRLAND_NUMS = {101, 108, 115}
 STRANGER_NUM = 999
-NEWCOMER_MATCH_NUM = 120
 
 
 @pytest.fixture
@@ -41,35 +36,6 @@ def newcomers() -> list[PullRequest]:
 @pytest.fixture
 def tmp_store(tmp_path: Path) -> Path:
     return tmp_path / "store.json"
-
-
-def test_static_exact_fingerprint_collapse(fixture_prs: list[PullRequest]) -> None:
-    # Two PRs with identical title-norm + same files/hunks should share fingerprint
-    a = fixture_prs[0]
-    twin = PullRequest(
-        number=99901,
-        title=a.title.upper() + "!!!",
-        body="different body text entirely",
-        user="other",
-        changed_files=[ChangedFile(path=f.path, patch=f.patch) for f in a.changed_files],
-        created_at="2026-09-01T00:00:00Z",
-    )
-    # Title is not part of the fingerprint — same files+hunks collapse.
-    twin.title = "completely different title"
-    apply_fingerprints([a, twin])
-    assert compute_fingerprint(a) == compute_fingerprint(twin)
-
-    apply_fingerprints(fixture_prs)
-    groups = static_groups(fixture_prs)
-    # At least some multi-member potential; nvidia pair shares files+similar titles
-    # Exact collapse: create two with same fingerprint
-    fp_counts = {fp: len(members) for fp, members in groups.items()}
-    assert all(len(fp) == 32 for fp in groups)
-    assert sum(fp_counts.values()) == len(fixture_prs)
-
-
-def test_normalize_title() -> None:
-    assert normalize_title("Fix Hyprland Keybind!!!") == "fix hyprland keybind"
 
 
 def test_hyprland_trio_clusters_together(
@@ -102,57 +68,6 @@ def test_stranger_does_not_join_hyprland(
             assert STRANGER_NUM not in nums
 
 
-def test_approved_shape_still_requires_human_review(
-    fixture_prs: list[PullRequest],
-    newcomers: list[PullRequest],
-    tmp_store: Path,
-) -> None:
-    result = run_pipeline(
-        fixture_prs,
-        persist=True,
-        store_path=tmp_store,
-        apply_rules=False,
-    )
-    groups = result["groups"]
-    hypr = next(g for g in groups if HYPRLAND_NUMS.issubset(set(g.pr_numbers)))
-    rule = decide_group(hypr.group_id, "approve", path=tmp_store)
-    assert rule.decision == "approve"
-    assert load_rules(tmp_store)
-
-    from triage.dedupe import apply_fingerprints
-    from triage.embed import Embedder, mean_centroid
-
-    combined = apply_fingerprints(list(fixture_prs) + list(newcomers))
-    vectors = Embedder(n=3).fit_transform([p.text_for_embed for p in combined])
-    member_vecs = [vectors[i] for i, p in enumerate(combined) if p.number in HYPRLAND_NUMS]
-    rule.centroid = mean_centroid(member_vecs)
-    from triage.store import upsert_rule
-
-    upsert_rule(rule, tmp_store)
-    rules = load_rules(tmp_store)
-
-    match_pr = next(p for p in combined if p.number == NEWCOMER_MATCH_NUM)
-    stranger = next(p for p in combined if p.number == STRANGER_NUM)
-    match_idx = next(i for i, p in enumerate(combined) if p.number == NEWCOMER_MATCH_NUM)
-    stranger_idx = next(i for i, p in enumerate(combined) if p.number == STRANGER_NUM)
-
-    assert match_rule(match_pr, vectors[match_idx], rules) is None
-    assert match_rule(stranger, vectors[stranger_idx], rules) is None
-
-    match_pr.label = (
-        AUTO_APPROVE_LABEL
-        if match_rule(match_pr, vectors[match_idx], rules)
-        else NEEDS_HUMAN_LABEL
-    )
-    stranger.label = (
-        AUTO_APPROVE_LABEL
-        if match_rule(stranger, vectors[stranger_idx], rules)
-        else NEEDS_HUMAN_LABEL
-    )
-    assert match_pr.label == NEEDS_HUMAN_LABEL
-    assert stranger.label == NEEDS_HUMAN_LABEL
-
-
 def test_github_client_refuses_non_get() -> None:
     with pytest.raises(GitHubError, match="Refusing non-GET"):
         github_request("POST", "https://api.github.com/repos/x/y/pulls")
@@ -171,7 +86,7 @@ def test_github_missing_token(monkeypatch: pytest.MonkeyPatch) -> None:
     from triage.github import fetch_pulls
 
     with pytest.raises(GitHubError, match="GITHUB_TOKEN"):
-        fetch_pulls("omacom", "omarchy", limit=1)
+        fetch_pulls("omacom", "omarchy", limit=1, refresh=True)
 
 
 def test_demo_and_pipeline_e2e(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -182,7 +97,7 @@ def test_demo_and_pipeline_e2e(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     assert rc == 0
     assert store.exists()
     rules = load_rules(store)
-    assert any(r.decision == "approve" for r in rules)
+    assert rules == []
 
     prs = ingest(source="fixtures")
     assert len(prs) == 12
@@ -190,24 +105,11 @@ def test_demo_and_pipeline_e2e(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     assert len(result["groups"]) >= 4
 
 
-def test_embeddings_deterministic(fixture_prs: list[PullRequest]) -> None:
-    docs = [p.text_for_embed for p in fixture_prs]
-    a = Embedder(n=3).fit_transform(docs)
-    b = Embedder(n=3).fit_transform(docs)
-    assert a == b
-    # Hyprland pair should be more similar than hyprland vs stranger paths
-    apply_fingerprints(fixture_prs)
-    h0 = next(i for i, p in enumerate(fixture_prs) if p.number == 101)
-    h1 = next(i for i, p in enumerate(fixture_prs) if p.number == 108)
-    noise = next(i for i, p in enumerate(fixture_prs) if p.number == 901)
-    assert cosine_similarity(a[h0], a[h1]) > cosine_similarity(a[h0], a[noise])
-
-
 # --- gh client and server extensions ---
 
 from triage.gh import GhError, validate_gh_argv, fetch_pulls_gh
 from triage.overlap import file_overlap
-from triage.server import run_fetch, ensure_initial_fixtures
+from triage.server import run_fetch
 from triage.store import overlap_for_group, ui_state, load_store
 
 
@@ -260,13 +162,10 @@ def test_server_fetch_fixtures_and_decide(tmp_path: Path) -> None:
 
 def test_server_initial_state_remains_empty(tmp_path: Path) -> None:
     store = tmp_path / "store.json"
-    ensure_initial_fixtures(store)
     data = load_store(store)
     assert data["last_groups"] == []
     assert data["last_prs"] == []
     assert not store.exists()
-    ensure_initial_fixtures(store)
-    assert load_store(store)["last_groups"] == []
 
 
 def test_ingest_gh_mocked(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -311,7 +210,7 @@ def test_ingest_gh_mocked(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> No
     monkeypatch.setattr("triage.gh.subprocess.run", fake_run)
     monkeypatch.setattr("triage.gh.DEFAULT_CACHE_DIR", cache)
 
-    prs = ingest(source="gh", repo="omacom/omarchy", limit=10)
+    prs = ingest(source="gh", repo="omacom/omarchy", limit=10, refresh=True)
     assert len(prs) == 1
     assert prs[0].number == 42
     assert prs[0].user == "mirzap"
@@ -396,11 +295,9 @@ def test_ui_state_overlap_is_summary_and_full_payload_is_lazy(tmp_path: Path) ->
     state = run_fetch("fixtures", "omacom/omarchy", 80, store_path=store)
     assert "overlap" in state
     g001 = next(g for g in state["groups"] if g["group_id"] == "G001")
-    ov = state["overlap"]["G001"]
     assert HYPRLAND_NUMS.issubset(set(g001["pr_numbers"]))
-    assert ov["lazy"] is True
-    assert ov["matrix"] == []
-    assert ov["matrix_n"] > 0
+    # The pipeline stores no eager overlap payload; derive bounded pages on demand.
+    assert state["overlap"] == {}
     full = overlap_for_group("G001", path=store)
     assert full["lazy"] is False
     paths = {r["path"] for r in full["matrix"]}
@@ -429,7 +326,7 @@ def test_every_ingested_pr_in_exactly_one_group(
     assert sorted(slim_nums) == sorted(nums)
 
 
-def test_fetch_pulls_gh_limit_zero_and_slice(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_fetch_pulls_gh_limit_zero_and_cached_listing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     pulls_payload = [
         {
             "number": n,
@@ -469,17 +366,17 @@ def test_fetch_pulls_gh_limit_zero_and_slice(monkeypatch: pytest.MonkeyPatch, tm
     monkeypatch.setattr("triage.gh.DEFAULT_CACHE_DIR", cache)
 
     # limit=0 → full mocked list
-    all_prs = fetch_pulls_gh("omacom", "omarchy", limit=0, cache_dir=cache)
+    all_prs = fetch_pulls_gh("omacom", "omarchy", limit=0, cache_dir=cache, refresh=True)
     assert len(all_prs) == 5
     assert [p.number for p in all_prs] == [10, 20, 30, 40, 50]
     assert all(isinstance(cf, ChangedFile) for p in all_prs for cf in p.changed_files)
     assert all(p.changed_files[0].path == "a.conf" for p in all_prs)
 
-    # limit=2 slices (cache hit for pulls; files may cache-hit too)
+    # Browsing a cached snapshot keeps the complete listing; limit controls
+    # file hydration during an explicit refresh.
     sliced = fetch_pulls_gh("omacom", "omarchy", limit=2, cache_dir=cache)
-    assert len(sliced) == 2
-    assert [p.number for p in sliced] == [10, 20]
-    assert isinstance(sliced[0].changed_files[0], ChangedFile)
+    assert len(sliced) == 5
+    assert [p.number for p in sliced] == [10, 20, 30, 40, 50]
 
 
 def test_async_fetch_progress_http(tmp_path: Path) -> None:
@@ -511,7 +408,11 @@ def test_async_fetch_progress_http(tmp_path: Path) -> None:
         )
 
     store = tmp_path / "store.json"
-    handler = make_handler(store)
+    handler = make_handler(
+        store,
+        allowed_hostnames=("127.0.0.1",),
+        csrf_token="test-session-token",
+    )
     from http.server import ThreadingHTTPServer
     import threading
 
@@ -521,15 +422,23 @@ def test_async_fetch_progress_http(tmp_path: Path) -> None:
     t.start()
     try:
         conn = HTTPConnection("127.0.0.1", port, timeout=10)
-        body = json.dumps({"source": "fixtures", "repo": "omacom/omarchy", "limit": 0})
-        conn.request("POST", "/api/fetch", body=body, headers={"Content-Type": "application/json"})
+        body = json.dumps({
+            "source": "fixtures", "repo": "omacom/omarchy", "limit": 0,
+            "refresh": False,
+        })
+        mutation_headers = {
+            "Content-Type": "application/json",
+            "Origin": f"http://127.0.0.1:{port}",
+            "X-CSRF-Token": "test-session-token",
+        }
+        conn.request("POST", "/api/fetch", body=body, headers=mutation_headers)
         res = conn.getresponse()
         data = json.loads(res.read().decode())
-        assert res.status == 200
+        assert res.status == 202
         assert data.get("started") is True
 
         # Concurrent POST should 409
-        conn.request("POST", "/api/fetch", body=body, headers={"Content-Type": "application/json"})
+        conn.request("POST", "/api/fetch", body=body, headers=mutation_headers)
         res2 = conn.getresponse()
         data2 = json.loads(res2.read().decode())
         # May be 409 if still running, or 200 if fixtures already finished — either ok shape

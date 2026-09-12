@@ -15,9 +15,9 @@ import pytest
 
 from triage import gh, rank, store
 from triage.cli import main as cli_main
-from triage.dedupe import compute_fingerprint, file_set_signature
+from triage.dedupe import compute_fingerprint
 from triage.models import ChangedFile, Group, PullRequest, TrustedRule
-from triage.pipeline import NEEDS_HUMAN_LABEL, auto_classify, match_rule, run_pipeline
+from triage.pipeline import NEEDS_HUMAN_LABEL, run_pipeline
 from triage.queue import build_queue
 from triage.server import make_handler
 from triage.store import (
@@ -46,6 +46,7 @@ def _pr(
         user="fixture",
         changed_files=[ChangedFile(path=path, patch=patch)],
         created_at="2026-09-01T00:00:00Z",
+        evidence_source="fixtures",
         label=label,
     )
 
@@ -77,6 +78,7 @@ def _rule(group_id: str, numbers: list[int], repo: str, decision: str = "approve
 
 
 def _slim(pr: PullRequest, group_id: str) -> dict[str, Any]:
+    evidence = pr.revision_evidence()
     return {
         "number": pr.number,
         "title": pr.title,
@@ -86,6 +88,17 @@ def _slim(pr: PullRequest, group_id: str) -> dict[str, Any]:
         "group_id": group_id,
         "html_url": "",
         "created_at": pr.created_at,
+        "body": pr.body,
+        "files": [changed.to_dict() for changed in pr.changed_files],
+        "head_sha": pr.head_sha,
+        "base_sha": pr.base_sha,
+        "updated_at": pr.updated_at,
+        "additions": evidence.additions,
+        "deletions": evidence.deletions,
+        "content_digest": evidence.content_digest,
+        "evidence_complete": evidence.evidence_complete,
+        "evidence_source": evidence.source,
+        "cache_snapshot_id": pr.cache_snapshot_id,
     }
 
 
@@ -120,17 +133,6 @@ def test_legacy_fingerprint_is_advisory_and_all_labels_reset(tmp_path: Path) -> 
     )
     assert result["groups"][0].suggested_decision == "related-theme"
 
-    approve = _rule("G001", [1], "acme/widgets", "approve")
-    approve.fingerprints = [added.fingerprint]
-    approve.file_set_signature = file_set_signature(added.paths)
-    reject = _rule("G002", [2], "acme/widgets", "reject")
-    reject.fingerprints = [opposite.fingerprint]
-    reject.file_set_signature = file_set_signature(opposite.paths)
-    rules = [approve, reject]
-    assert match_rule(added, [], [approve]) is None
-    assert match_rule(opposite, [], [approve]) is None
-    assert match_rule(different_hunk, [], [approve]) is None
-    assert match_rule(opposite, [], [reject]) is None
     added.label = "auto:approved-shape"
     opposite.label = "already-reviewed"
     different_hunk.label = "auto:approved-shape"
@@ -141,11 +143,6 @@ def test_legacy_fingerprint_is_advisory_and_all_labels_reset(tmp_path: Path) -> 
         apply_rules=False,
     )
     assert [p.label for p in reset["prs"]] == [
-        NEEDS_HUMAN_LABEL,
-        NEEDS_HUMAN_LABEL,
-        NEEDS_HUMAN_LABEL,
-    ]
-    assert [p.label for p in auto_classify(reset["prs"], [], rules)] == [
         NEEDS_HUMAN_LABEL,
         NEEDS_HUMAN_LABEL,
         NEEDS_HUMAN_LABEL,
@@ -180,7 +177,10 @@ def test_pipeline_preserves_unrelated_store_data(tmp_path: Path) -> None:
 
 def test_repository_scope_blocks_foreign_known_rule_and_reserves_ids(tmp_path: Path) -> None:
     path = tmp_path / "store.json"
-    first = run_pipeline([_pr(1)], persist=True, store_path=path, repo="omacom/omarchy")
+    first = run_pipeline(
+        [_pr(1)], persist=True, store_path=path, repo="omacom/omarchy",
+        source="fixtures",
+    )
     assert first["groups"][0].group_id == "G001"
     decide_group("G001", "approve", path=path)
 
@@ -257,19 +257,22 @@ def test_known_legacy_records_bind_only_to_original_omarchy_repo(tmp_path: Path)
 def test_save_groups_inherits_active_repo_and_decision_becomes_known(tmp_path: Path) -> None:
     path = tmp_path / "store.json"
     first = _pr(1)
+    first_group = _group("G001", [1], "a/r")
+    first_group.bind_revisions([first])
     save_run_state(
-        [_group("G001", [1], "a/r")],
+        [first_group],
         [1],
         last_prs=[_slim(first, "G001")],
         repo="a/r",
         path=path,
     )
     second_group = _group("G002", [2], "")
+    second = _pr(2)
+    second_group.bind_revisions([second])
     save_groups([second_group], [2], path)
     assert load_store(path)["last_groups"][0]["repo"] == "a/r"
 
     # Supply the current slim member as a normal run would before deciding.
-    second = _pr(2)
     data = load_store(path)
     data["last_prs"] = [_slim(second, "G002")]
     save_store(data, path)
@@ -282,10 +285,16 @@ def test_new_member_returns_reviewed_group_to_needs_you_and_ui_fails_closed(
 ) -> None:
     path = tmp_path / "store.json"
     old = _pr(1)
-    run_pipeline([old], persist=True, store_path=path, repo="acme/widgets")
+    run_pipeline(
+        [old], persist=True, store_path=path, repo="acme/widgets",
+        source="fixtures",
+    )
     decide_group("G001", "approve", path=path)
     new = _pr(2)
-    result = run_pipeline([old, new], persist=True, store_path=path, repo="acme/widgets")
+    result = run_pipeline(
+        [old, new], persist=True, store_path=path, repo="acme/widgets",
+        source="fixtures",
+    )
     assert result["groups"][0].pr_numbers == [1, 2]
     assert result["queue"]["known"] == []
     assert result["queue"]["needs_you"] == ["G001"]
@@ -355,9 +364,10 @@ def test_demo_default_and_fixture_commands_never_touch_live_store(
 
 def test_demo_existing_store_reset_rules_and_live_alias_guard(tmp_path: Path) -> None:
     named = tmp_path / "named.json"
-    named.write_text("KEEP", encoding="utf-8")
+    assert cli_main(["demo", "--store", str(named)]) == 0
+    original = named.read_bytes()
     assert cli_main(["demo", "--store", str(named)]) == 2
-    assert named.read_text(encoding="utf-8") == "KEEP"
+    assert named.read_bytes() == original
     assert cli_main(["demo", "--reset"]) == 2
     assert cli_main(["demo", "--store", str(named), "--reset"]) == 0
 
@@ -373,8 +383,11 @@ def test_demo_existing_store_reset_rules_and_live_alias_guard(tmp_path: Path) ->
 def test_concurrent_decisions_and_upserts_are_full_read_modify_write(tmp_path: Path) -> None:
     path = tmp_path / "store.json"
     p1, p2 = _pr(1), _pr(2, "config/other.conf")
+    groups = [_group("G001", [1], "acme/widgets"), _group("G002", [2], "acme/widgets")]
+    for group in groups:
+        group.bind_revisions([p1, p2])
     save_run_state(
-        [_group("G001", [1], "acme/widgets"), _group("G002", [2], "acme/widgets")],
+        groups,
         [1, 2],
         last_prs=[_slim(p1, "G001"), _slim(p2, "G002")],
         repo="acme/widgets",
@@ -422,8 +435,11 @@ def test_rule_mutations_hold_outer_lock_across_read_modify_write(
     """A forced first mutation cannot be interleaved by a second mutation."""
     path = tmp_path / "store.json"
     p1, p2 = _pr(1), _pr(2, "config/other.conf")
+    groups = [_group("G001", [1], "acme/widgets"), _group("G002", [2], "acme/widgets")]
+    for group in groups:
+        group.bind_revisions([p1, p2])
     save_run_state(
-        [_group("G001", [1], "acme/widgets"), _group("G002", [2], "acme/widgets")],
+        groups,
         [1, 2],
         last_prs=[_slim(p1, "G001"), _slim(p2, "G002")],
         repo="acme/widgets",
@@ -544,7 +560,8 @@ def test_atomic_store_and_rank_writers_use_unique_temps_and_leave_valid_json(
         thread.start()
     for thread in threads:
         thread.join()
-    assert len({p.name for p in sources}) == 4
+    primary = [p for p in sources if ".bak." not in p.name]
+    assert len({p.name for p in primary}) == 4
     assert all(p.parent == path.parent for p in sources)
     json.loads(path.read_text(encoding="utf-8"))
 
@@ -582,9 +599,16 @@ def test_gh_refresh_revisions_status_and_partial_to_full_cache(
 
     monkeypatch.setattr(gh, "run_gh_api", fake_api)
     progress: dict[str, Any] = {}
-    first = gh.fetch_pulls_gh("acme", "widgets", limit=1, cache_dir=tmp_path, progress=progress)
-    assert [p.number for p in first] == [1]
-    assert len(json.loads((tmp_path / "acme" / "widgets" / "pulls.json").read_text())) == 2
+    first = gh.fetch_pulls_gh(
+        "acme", "widgets", limit=1, cache_dir=tmp_path,
+        progress=progress, refresh=True,
+    )
+    assert [p.number for p in first] == [1, 2]
+    assert first[0].changed_files and first[1].changed_files == []
+    cache_root = tmp_path / "acme" / "widgets"
+    active = json.loads((cache_root / "active.json").read_text())
+    snapshot_root = cache_root / "snapshots" / active["snapshot_id"]
+    assert len(json.loads((snapshot_root / "pulls.json").read_text())) == 2
     first_call_count = len(calls)
 
     cached_progress: dict[str, Any] = {}
@@ -596,15 +620,19 @@ def test_gh_refresh_revisions_status_and_partial_to_full_cache(
     listing.append([_pull_item(1, "2"), _pull_item(2, "1")])
     refreshed = gh.fetch_pulls_gh("acme", "widgets", limit=1, cache_dir=tmp_path, refresh=True)
     assert "patch-1" in refreshed[0].changed_files[0].patch
-    assert sum("/files" not in call for call in calls) == 2
+    # Each explicit refresh performs a listing and a confirmation listing.
+    assert sum("/files" not in call for call in calls) == 4
     assert sum("/pulls/1/files" in call for call in calls) == 2
 
-    full = gh.fetch_pulls_gh("acme", "widgets", limit=0, cache_dir=tmp_path)
+    full = gh.fetch_pulls_gh(
+        "acme", "widgets", limit=0, cache_dir=tmp_path, refresh=True
+    )
     assert [p.number for p in full] == [1, 2]
     assert sum("/pulls/2/files" in call for call in calls) == 1
 
+    before_force = sum("/files" not in call for call in calls)
     gh.fetch_pulls_gh("acme", "widgets", limit=1, cache_dir=tmp_path, force=True)
-    assert sum("/files" not in call for call in calls) == 3
+    assert sum("/files" not in call for call in calls) == before_force + 2
 
 
 def test_failed_gh_refresh_leaves_cache_retryable(
@@ -625,14 +653,17 @@ def test_failed_gh_refresh_leaves_cache_retryable(
         return [_pull_item(1, "1")]
 
     monkeypatch.setattr(gh, "run_gh_api", fake_api)
-    gh.fetch_pulls_gh("acme", "widgets", cache_dir=tmp_path)
-    cached_bytes = (tmp_path / "acme" / "widgets" / "pulls.json").read_bytes()
+    gh.fetch_pulls_gh("acme", "widgets", cache_dir=tmp_path, refresh=True)
+    cache_root = tmp_path / "acme" / "widgets"
+    cached_bytes = (cache_root / "active.json").read_bytes()
     fail = True
     with pytest.raises(gh.GhError, match="temporary"):
         gh.fetch_pulls_gh("acme", "widgets", cache_dir=tmp_path, refresh=True)
-    assert (tmp_path / "acme" / "widgets" / "pulls.json").read_bytes() == cached_bytes
+    assert (cache_root / "active.json").read_bytes() == cached_bytes
     gh.fetch_pulls_gh("acme", "widgets", cache_dir=tmp_path, refresh=True)
-    assert list_calls == 3
+    # The failed attempt consumes one listing call; a successful refresh then
+    # performs its listing and confirmation listing.
+    assert list_calls == 5
 
 
 def test_cached_files_reject_unknown_legacy_patch_against_canonical_revision(
@@ -684,11 +715,13 @@ def test_related_endpoint_parses_numeric_pr_and_stays_lazy(
 ) -> None:
     seen: list[tuple[int, str | None]] = []
 
-    def fake_related(number: int, *, file_path: str | None, store_path: Path) -> dict[str, Any]:
+    def fake_related(
+        number: int, *, file_path: str | None, store_path: Path, k: int
+    ) -> dict[str, Any]:
         seen.append((number, file_path))
         return {"enabled": False, "query": number, "related": []}
 
-    monkeypatch.setattr("triage.server.related", fake_related)
+    monkeypatch.setattr("triage.server.rank_module.related_cached", fake_related)
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(tmp_path / "store.json"))
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()

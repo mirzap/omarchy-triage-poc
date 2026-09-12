@@ -91,7 +91,9 @@ def test_clean_wheel_demo_restore_and_http_assets_outside_checkout(
     assert required <= names
 
     environment = tmp_path / "venv"
-    venv.EnvBuilder(with_pip=True).create(environment)
+    # The managed macOS interpreter is relocatable but cannot run a copied
+    # stdlib; keep the wheel environment linked to the tested interpreter.
+    venv.EnvBuilder(with_pip=True, symlinks=True).create(environment)
     python = _venv_python(environment)
     clean_env = dict(os.environ)
     clean_env.pop("PYTHONPATH", None)
