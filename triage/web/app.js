@@ -927,21 +927,35 @@
   }
 
   const LABEL_HELP = {
-    unique: "One PR. No twin with the same file-set.",
-    duplicate: "Same files and same hunk headers. Likely the same change.",
-    "related-theme": "Same files, different hunks. Related work, not the same patch.",
-    "needs-look": "No keyword hit. Read it; nothing classified it further.",
-    hardware: "Title or path mentions hardware (gpu, wifi, fingerprint, …).",
-    "update-path": "Looks like an upgrade/migrate. Can break updates.",
-    docs: "Only docs or markdown.",
-    cosmetic: "Theme, font, wallpaper, or CSS.",
-    junk: "Invite, typo, or lockfile noise.",
-    blessed: "You marked this shape as trusted.",
-    rejected: "You rejected this shape.",
-    approve: "You marked this shape as trusted.",
-    reject: "You rejected this shape.",
-    upgrade: "You marked this as can-break-upgrade.",
+    unique: "one PR",
+    duplicate: "same files, same hunks",
+    "related-theme": "same files, different hunks",
+    "needs-look": "unclassified — read it",
+    hardware: "hardware keywords",
+    "update-path": "upgrade / migrate",
+    docs: "docs only",
+    cosmetic: "theme / CSS",
+    junk: "noise",
+    blessed: "you trusted this",
+    rejected: "you rejected this",
+    approve: "you trusted this",
+    reject: "you rejected this",
+    upgrade: "you marked upgrade risk",
   };
+  const LABEL_KEY_ORDER = [
+    "related-theme",
+    "duplicate",
+    "unique",
+    "needs-look",
+    "hardware",
+    "update-path",
+    "docs",
+    "cosmetic",
+    "junk",
+    "blessed",
+    "rejected",
+    "upgrade",
+  ];
 
   function labelHelp(name) {
     return LABEL_HELP[name] || "";
@@ -960,6 +974,25 @@
     const tip = labelHelp(cls || text) || labelHelp(text);
     if (tip) el.title = tip;
     return el;
+  }
+
+  function makeLabelRow(name, cls) {
+    const row = document.createElement("div");
+    row.className = "label-row";
+    const key = cls || name;
+    row.appendChild(makePill(name, key));
+    const gloss = document.createElement("span");
+    gloss.className = "label-gloss";
+    gloss.textContent = labelHelp(key) || labelHelp(name);
+    row.appendChild(gloss);
+    return row;
+  }
+
+  function fillLabelKey() {
+    const root = $("labelKeyAll");
+    if (!root || root.dataset.ready) return;
+    LABEL_KEY_ORDER.forEach((name) => root.appendChild(makeLabelRow(name)));
+    root.dataset.ready = "1";
   }
 
   function renderDetail() {
@@ -1015,26 +1048,12 @@
 
     const pills = $("detailPills");
     pills.innerHTML = "";
-    pills.appendChild(makePill(cls));
-    pills.appendChild(makePill(decision));
+    pills.appendChild(makeLabelRow(cls));
+    pills.appendChild(makeLabelRow(decision));
     if (rule) {
-      const label =
-        rule.decision === "approve"
-          ? "blessed"
-          : rule.decision === "reject"
-            ? "rejected"
-            : rule.decision;
-      pills.appendChild(makePill(label, rule.decision === "approve" ? "blessed" : rule.decision));
+      pills.appendChild(makeLabelRow(ruleLabel(rule.decision), rule.decision === "approve" ? "blessed" : rule.decision));
     }
-    const help = $("pillHelp");
-    if (help) {
-      const bits = [cls, decision].concat(rule ? [ruleLabel(rule.decision)] : []);
-      help.textContent = bits
-        .filter(Boolean)
-        .map((k) => k + ": " + (labelHelp(k) || ""))
-        .filter((line) => line.indexOf(": ") > 0 && !line.endsWith(": "))
-        .join(" · ");
-    }
+    fillLabelKey();
     const titles = (g.title_variants || []).filter((t) => t && t !== firstTitle);
     if (titles.length) {
       $("detailMeta").textContent += " · " + titles.length + " other titles";

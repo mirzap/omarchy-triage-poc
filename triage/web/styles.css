@@ -705,22 +705,36 @@ button.user-shape:hover { color: var(--text); }
 }
 
 
-.pill-help {
-  margin-top: 8px;
+.label-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 10px;
+}
+.label-row {
+  display: grid;
+  grid-template-columns: 7.5rem 1fr;
+  gap: 10px;
+  align-items: center;
+}
+.label-row .pill {
+  justify-self: start;
+  text-align: center;
+}
+.label-gloss {
+  color: var(--muted);
   font-size: 12px;
-  line-height: 1.4;
-  max-width: 52rem;
+  letter-spacing: 0.01em;
 }
 .label-key {
-  margin-top: 8px;
-  font-size: 12px;
+  margin-top: 10px;
+}
+.label-key summary {
+  cursor: pointer;
   color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
 }
-.label-key summary { cursor: pointer; }
-.label-key dl { margin: 8px 0 0; }
-.label-key dt {
-  font-family: var(--mono);
-  color: var(--text);
-  margin-top: 6px;
-}
-.label-key dd { margin: 2px 0 0; }
+.label-key .label-stack { margin-top: 8px; }
+.label-key .label-row { grid-template-columns: 7.5rem 1fr; }

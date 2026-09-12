@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Omarchy triage</title>
-  <link rel="stylesheet" href="/styles.css?v=15" />
+  <link rel="stylesheet" href="/styles.css?v=16" />
 </head>
 <body>
   <header class="topbar">
@@ -48,22 +48,10 @@
             <div class="detail-kicker muted" id="detailKicker"></div>
             <div class="detail-title" id="detailTitle"></div>
             <div class="muted" id="detailMeta"></div>
-            <div class="detail-pills" id="detailPills"></div>
-            <div class="pill-help muted" id="pillHelp"></div>
+            <div class="label-stack" id="detailPills"></div>
             <details class="label-key">
-              <summary>What these labels mean</summary>
-              <dl>
-                <dt>related-theme</dt><dd>Same files, different hunks. Related work, not the same patch.</dd>
-                <dt>duplicate</dt><dd>Same files and same hunk headers. Likely the same change.</dd>
-                <dt>unique</dt><dd>One PR. No twin with the same file-set.</dd>
-                <dt>needs-look</dt><dd>No keyword hit. Read it; nothing classified it further.</dd>
-                <dt>hardware</dt><dd>Title or path mentions hardware (gpu, wifi, fingerprint, …).</dd>
-                <dt>update-path</dt><dd>Looks like an upgrade/migrate. Can break updates.</dd>
-                <dt>docs</dt><dd>Only docs or markdown.</dd>
-                <dt>cosmetic</dt><dd>Theme, font, wallpaper, or CSS.</dd>
-                <dt>junk</dt><dd>Invite, typo, or lockfile noise.</dd>
-                <dt>blessed / rejected / hardware / upgrade</dt><dd>Your local mark. Not sent to GitHub.</dd>
-              </dl>
+              <summary>All labels</summary>
+              <div class="label-stack" id="labelKeyAll"></div>
             </details>
           </div>
           <div class="actions">
@@ -130,6 +118,6 @@
   </main>
 
   <script src="/vendor/virtual.js"></script>
-  <script src="/app.js?v=15"></script>
+  <script src="/app.js?v=16"></script>
 </body>
 </html>
