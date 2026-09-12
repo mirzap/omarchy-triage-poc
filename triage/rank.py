@@ -29,7 +29,13 @@ _NUM = re.compile(r"\b\d{4,}\b")
 
 
 def api_key() -> str:
-    return (os.environ.get("OPENROUTER_API_KEY") or "").strip()
+    env = (os.environ.get("OPENROUTER_API_KEY") or "").strip()
+    if env:
+        return env
+    p = Path(".triage") / "openrouter.key"
+    if p.is_file():
+        return p.read_text(encoding="utf-8").strip()
+    return ""
 
 
 def normalize_patch(text: str) -> str:
