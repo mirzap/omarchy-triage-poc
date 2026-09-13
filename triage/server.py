@@ -33,8 +33,16 @@ from triage.store import (
     prs_for_path,
     ui_state,
 )
+from triage.workspaces import (
+    InvalidRepoError,
+    WorkspaceBinding,
+    WorkspaceError,
+    WorkspaceRouter,
+    canonical_repo,
+)
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
+DEFAULT_WORKSPACE_ROOT = Path(".triage/workspaces")
 MAX_BODY_BYTES = 64 * 1024
 MAX_URL_BYTES = 8 * 1024
 MAX_FETCH_LIMIT = 5_000
@@ -158,12 +166,16 @@ _fetch_lock = threading.Lock()
 _fetch_progress: dict[str, Any] = {
     "running": False, "phase": "", "done": 0, "total": 0, "error": None,
     "ready": False, "message": "", "repo": "", "refresh": False,
+    # Internal only.  It is used to prevent a progress response for one
+    # workspace from being presented as another workspace's job.
+    "store_path": "",
 }
 _fetch_thread: threading.Thread | None = None
+_fetch_terminal: list[dict[str, Any]] = []
 
 
-def _progress_unlocked() -> dict[str, Any]:
-    return {
+def _progress_unlocked(*, include_internal: bool = False) -> dict[str, Any]:
+    result = {
         "running": bool(_fetch_progress["running"]),
         "phase": _fetch_progress.get("phase") or "",
         "done": int(_fetch_progress.get("done") or 0),
@@ -174,11 +186,49 @@ def _progress_unlocked() -> dict[str, Any]:
         "repo": _fetch_progress.get("repo") or "",
         "refresh": bool(_fetch_progress.get("refresh")),
     }
+    if include_internal:
+        result["store_path"] = _fetch_progress.get("store_path") or ""
+    return result
 
 
-def get_fetch_progress() -> dict[str, Any]:
+def get_fetch_progress(*, repo: str | None = None, store_path: Path | None = None) -> dict[str, Any]:
+    """Return progress scoped to a requested workspace when provided.
+
+    The old no-argument helper remains intentionally global for embedding and
+    tests.  HTTP callers always provide the resolved repository/path in
+    multi-workspace mode, so a job for another workspace appears idle rather
+    than leaking its phase or completion to the caller.
+    """
     with _fetch_lock:
-        return _progress_unlocked()
+        progress = _progress_unlocked(include_internal=True)
+        if repo is None and store_path is None:
+            return {key: value for key, value in progress.items() if key != "store_path"}
+        wanted_repo = str(repo or "").strip().strip("/").lower()
+        wanted_path = str(Path(store_path)) if store_path is not None else ""
+        if (wanted_repo and progress.get("repo", "").strip().strip("/").lower() != wanted_repo
+                or wanted_path and progress.get("store_path") != wanted_path):
+            # Keep a small terminal cache so a completed workspace remains
+            # observable if another workspace starts before its UI poll.
+            for terminal in reversed(_fetch_terminal):
+                if (wanted_repo and terminal.get("repo", "").strip().strip("/").lower() != wanted_repo
+                        or wanted_path and terminal.get("store_path") != wanted_path):
+                    continue
+                return {key: value for key, value in terminal.items() if key != "store_path"}
+            return {
+                "running": False, "phase": "", "done": 0, "total": 0,
+                "error": None, "ready": False, "message": "",
+                "repo": wanted_repo, "refresh": False,
+            }
+        progress.pop("store_path", None)
+        return progress
+
+
+def _finish_fetch(**fields: Any) -> None:
+    """Publish and retain a terminal snapshot atomically with the job state."""
+    with _fetch_lock:
+        _fetch_progress.update(fields)
+        _fetch_terminal.append(_progress_unlocked(include_internal=True))
+        del _fetch_terminal[:-8]
 
 
 def _set_progress(**fields: Any) -> None:
@@ -221,13 +271,13 @@ def _fetch_worker(source: str, repo: str, limit: int, refresh: bool, store_path:
     local = {"phase": "starting", "done": 0, "total": 0, "message": "starting"}
     try:
         run_fetch(source, repo, limit, store_path=store_path, progress=local, refresh=refresh)
-        _set_progress(running=False, phase="done", error=None, ready=True,
+        _finish_fetch(running=False, phase="done", error=None, ready=True,
                       message=local.get("message") or "ready", done=local.get("done", 0),
                       total=local.get("total", 0))
     except Exception:  # noqa: BLE001
         traceback.print_exc()
         message = "refresh failed; the last usable snapshot was preserved"
-        _set_progress(running=False, phase="error", error=message, ready=False, message=message)
+        _finish_fetch(running=False, phase="error", error=message, ready=False, message=message)
 
 
 class FetchBusyError(RuntimeError):
@@ -244,7 +294,7 @@ def start_fetch_async(source: str, repo: str, limit: int,
             raise FetchBusyError(_progress_unlocked())
         _fetch_progress.update(running=True, phase="starting", done=0, total=0,
                                error=None, ready=False, message="starting", repo=repo,
-                               refresh=refresh)
+                               refresh=refresh, store_path=str(Path(store_path)))
         _fetch_thread = threading.Thread(
             target=_fetch_worker, args=(source, repo, limit, refresh, store_path),
             daemon=True, name="triage-fetch",
@@ -257,18 +307,9 @@ def _repo_key(value: Any) -> str:
     if not isinstance(value, str):
         raise RequestProblem(400, "invalid_repo", "repo must be owner/name")
     try:
-        repo = value.encode("utf-8", "strict").decode("utf-8").strip().strip("/").lower()
-    except UnicodeError as exc:
+        return canonical_repo(value)
+    except InvalidRepoError as exc:
         raise RequestProblem(400, "invalid_repo", "repo must be owner/name") from exc
-    if not repo or len(repo) > 200:
-        raise RequestProblem(400, "invalid_repo", "repo must be owner/name")
-    try:
-        owner, name = parse_repo(repo)
-    except ValueError as exc:
-        raise RequestProblem(400, "invalid_repo", "repo must be owner/name") from exc
-    if f"{owner}/{name}".lower() != repo:
-        raise RequestProblem(400, "invalid_repo", "repo must be canonical owner/name")
-    return repo
 
 
 def _safe_file_path(value: Any) -> str:
@@ -286,7 +327,43 @@ def _safe_file_path(value: Any) -> str:
     return path
 
 
-def _state_payload(store_path: Path) -> dict[str, Any]:
+def _empty_state(repo: str = "", *, mode: str = "multi", initialized: bool = False,
+                 legacy: bool = False) -> dict[str, Any]:
+    """Build an in-memory projection for an uninitialized workspace.
+
+    Calling ``store.load_store`` for an unknown workspace is deliberately
+    avoided: the store layer takes a lock and may create its parent directory.
+    Selection and discovery must therefore remain side-effect free.
+    """
+    data = store_module._empty_store()  # type: ignore[attr-defined]
+    data["repo"] = repo
+    state = store_module.ui_state_from_data(data)
+    state.setdefault("sync", None)
+    state["workspace"] = {
+        "mode": mode, "repo": repo, "initialized": bool(initialized),
+        "legacy": bool(legacy),
+    }
+    return state
+
+
+def _workspace_descriptor(mode: str, repo: str, binding: WorkspaceBinding | None = None,
+                          *, initialized: bool | None = None,
+                          legacy: bool | None = None) -> dict[str, Any]:
+    if initialized is None:
+        initialized = bool(binding.initialized) if binding is not None else False
+    if legacy is None:
+        legacy = bool(binding.legacy) if binding is not None else False
+    return {"mode": mode, "repo": repo, "initialized": bool(initialized),
+            "legacy": bool(legacy)}
+
+
+def _state_payload(store_path: Path, binding: WorkspaceBinding | None = None, *, mode: str = "single",
+                   repo: str | None = None) -> dict[str, Any]:
+    requested_repo = str(repo or (binding.repo if binding is not None else "") or "")
+    initialized = bool(binding.initialized) if binding is not None else True
+    legacy = bool(binding.legacy) if binding is not None else False
+    if binding is not None and not initialized:
+        return _empty_state(requested_repo, mode=mode, initialized=False, legacy=legacy)
     state = ui_state(store_path)
     repo, source = str(state.get("repo") or ""), str(state.get("source") or "")
     if repo and source in {"gh", "github"}:
@@ -320,6 +397,10 @@ def _state_payload(store_path: Path) -> dict[str, Any]:
                              "evidence_complete": False}
     else:
         state.setdefault("sync", None)
+    state["workspace"] = _workspace_descriptor(
+        mode, requested_repo or repo, binding,
+        initialized=initialized, legacy=legacy,
+    )
     return state
 
 
@@ -339,7 +420,13 @@ def _run_enrichment(pr_number: int, *, repo: str, file_path: str | None,
 
 
 class TriageHandler(BaseHTTPRequestHandler):
-    store_path: Path = DEFAULT_STORE_PATH
+    # ``store_path`` is immutable server configuration in fixed mode.  In
+    # multi mode it is None and every request binds a local path through the
+    # router; no request ever changes this class attribute.
+    store_path: Path | None = DEFAULT_STORE_PATH
+    workspace_root: Path | None = None
+    workspace_router: WorkspaceRouter | None = None
+    workspace_mode: str = "single"
     csrf_token = ""
     allowed_hostnames: tuple[str, ...] = ()
     body_timeout_seconds = BODY_TIMEOUT_SECONDS
@@ -351,6 +438,11 @@ class TriageHandler(BaseHTTPRequestHandler):
         self.rfile.close()
         self._deadline_reader = _DeadlineReader(self.connection)
         self.rfile = self._deadline_reader
+        self._request_store_path: Path | None = None
+        self._request_repo = ""
+        self._request_binding: WorkspaceBinding | None = None
+        self._request_initialized = True
+        self._request_legacy = False
 
     def handle_one_request(self) -> None:
         self._deadline_reader.set_deadline(time.monotonic() + self.body_timeout_seconds)
@@ -368,6 +460,148 @@ class TriageHandler(BaseHTTPRequestHandler):
                     })
                 except (BrokenPipeError, ConnectionResetError, OSError):
                     pass
+        finally:
+            # Keep-alive requests must not inherit the previous request's
+            # repository binding, even when a handler method returns early.
+            self._request_store_path = None
+            self._request_repo = ""
+            self._request_binding = None
+            self._request_initialized = True
+            self._request_legacy = False
+
+    def _store(self) -> Path:
+        path = self._request_store_path
+        if path is not None:
+            return path
+        if self.store_path is None:
+            raise RequestProblem(503, "workspace_unavailable", "workspace routing is unavailable")
+        return Path(self.store_path)
+
+    def _new_router(self) -> WorkspaceRouter:
+        router = self.workspace_router
+        if router is None:
+            raise RequestProblem(503, "workspace_unavailable", "workspace routing is unavailable")
+        return router
+
+    @staticmethod
+    def _resolver_problem(exc: WorkspaceError) -> RequestProblem:
+        code = str(exc.code or "workspace_unavailable")
+        if code == "unavailable":
+            code = "workspace_unavailable"
+        if code not in {"invalid_repo", "workspace_conflict", "workspace_unavailable"}:
+            code = "workspace_unavailable"
+        status = 400 if code == "invalid_repo" else 409 if code == "workspace_conflict" else 503
+        message = {
+            "invalid_repo": "repo must be owner/name",
+            "workspace_conflict": "workspace selection is ambiguous",
+            "workspace_unavailable": "workspace is unavailable",
+        }[code]
+        return RequestProblem(status, code, message)
+
+    def _route_request(self, requested: str | None, *, required: bool = False,
+                       allow_default: bool = False) -> tuple[Path, str]:
+        """Bind this request to one immutable workspace path and repository."""
+        if self.workspace_mode != "multi":
+            path = self._store()
+            # Fixed-store calls retain their existing repository guard.  A
+            # fetch may bind an empty store to its first explicitly requested
+            # repository, while detail reads still fail repository_unset.
+            requested_repo = _repo_key(requested) if requested is not None else ""
+            data = load_store(path)
+            active = str(data.get("repo") or "").strip().strip("/").lower()
+            if requested_repo and active and requested_repo != active:
+                raise RequestProblem(409, "repository_conflict",
+                                     "repository does not match this store; use a separate workspace")
+            if required and not (requested_repo or active):
+                raise RequestProblem(409, "repository_unset", "this store has no active repository")
+            effective = requested_repo or active
+            self._request_store_path = path
+            self._request_repo = effective
+            self._request_binding = None
+            self._request_initialized = path.exists()
+            self._request_legacy = False
+            return path, effective
+
+        if requested is None:
+            if not allow_default:
+                if required:
+                    raise RequestProblem(400, "missing_fields", "missing fields: repo")
+                requested = None
+            else:
+                try:
+                    requested = str(self._new_router().default_repo or "")
+                except WorkspaceError as exc:
+                    raise self._resolver_problem(exc) from exc
+        elif requested == "":
+            raise RequestProblem(400, "invalid_repo", "repo must be owner/name")
+        if requested is None or requested == "":
+            requested = "omacom/omarchy"
+        canonical = _repo_key(requested)
+        try:
+            binding = self._new_router().resolve(canonical)
+        except WorkspaceError as exc:
+            raise self._resolver_problem(exc) from exc
+        path = binding.path
+        effective = binding.repo
+        self._request_store_path = path
+        self._request_repo = effective
+        self._request_binding = binding
+        self._request_initialized = binding.initialized
+        self._request_legacy = binding.legacy
+        return path, effective
+
+    def _bound_store(self) -> dict[str, Any]:
+        if self.workspace_mode == "multi" and not self._request_initialized:
+            return store_module._empty_store()  # type: ignore[attr-defined]
+        return load_store(self._store())
+
+    def _require_initialized(self) -> None:
+        """Reject operations that would read/write an unknown store path."""
+        if self.workspace_mode == "multi" and not self._request_initialized:
+            raise RequestProblem(404, "workspace_uninitialized", "workspace is not initialized")
+
+    @staticmethod
+    def _empty_file_result(file_path: str, page: int, page_size: int) -> dict[str, Any]:
+        return {"path": file_path, "pr_count": 0, "prs": [], "page": page,
+                "page_size": page_size, "pages": 0, "next_page": None, "truncated": 0}
+
+    def _workspaces_payload(self) -> dict[str, Any]:
+        """Return bounded workspace metadata without exposing filesystem paths."""
+        if self.workspace_mode != "multi":
+            path = self._store()
+            if path.exists():
+                try:
+                    data = load_store(path)
+                except Exception as exc:
+                    raise RequestProblem(503, "workspace_unavailable", "workspace is unavailable") from exc
+            else:
+                data = store_module._empty_store()  # type: ignore[attr-defined]
+            active = str(data.get("repo") or "").strip().strip("/").lower()
+            return {
+                "mode": "single", "default_repo": active,
+                "workspaces": ([{"repo": active, "initialized": True, "legacy": False}]
+                                if active else []),
+                "truncated": False,
+            }
+        try:
+            router = self._new_router()
+            default_repo = str(router.default_repo or "omacom/omarchy").strip().strip("/").lower()
+            raw_rows = router.list_workspaces(limit=200)
+        except WorkspaceError as exc:
+            raise self._resolver_problem(exc) from exc
+        rows: list[dict[str, Any]] = []
+        for item in raw_rows or []:
+            repo = str(item.get("repo") or "").strip().strip("/").lower()
+            if not repo:
+                continue
+            rows.append({
+                "repo": repo,
+                "initialized": bool(item.get("initialized", False)),
+                "legacy": bool(item.get("legacy", False)),
+            })
+        truncated = len(rows) >= 200
+        return {"mode": "multi", "default_repo": default_repo,
+                "workspaces": rows[:200], "truncated": truncated}
 
     def _finish_ingress(self) -> None:
         self._deadline_reader.set_deadline(None)
@@ -535,7 +769,11 @@ class TriageHandler(BaseHTTPRequestHandler):
         return raw
 
     def _active_repo(self, requested: str | None = None) -> tuple[dict[str, Any], str]:
-        store = load_store(self.store_path)
+        if self._request_store_path is None:
+            # Compatibility for small direct handler helpers: route the
+            # request before applying the old fixed-store repository guard.
+            self._route_request(requested, required=requested is not None)
+        store = self._bound_store()
         active = str(store.get("repo") or "").strip().strip("/").lower()
         if requested is not None:
             repo = _repo_key(requested)
@@ -544,7 +782,7 @@ class TriageHandler(BaseHTTPRequestHandler):
                                      "repository does not match this store; use a separate workspace")
         elif not active:
             raise RequestProblem(409, "repository_unset", "this store has no active repository")
-        return store, active
+        return store, (self._request_repo or active)
 
     @staticmethod
     def _decoded_path(raw: str) -> str:
@@ -572,29 +810,53 @@ class TriageHandler(BaseHTTPRequestHandler):
                 self._send_json(200, {"csrf_token": self.csrf_token, "origin": origin,
                     "limits": {"body_bytes": MAX_BODY_BYTES, "fetch_prs": MAX_FETCH_LIMIT,
                                "enrichment_candidates": MAX_ENRICH_CANDIDATES}})
+            elif path == "/api/workspaces":
+                self._send_json(200, self._workspaces_payload())
             elif path == "/api/state":
-                self._send_json(200, _state_payload(self.store_path))
+                query = self._query(parsed, {"repo"})
+                requested = self._one(query, "repo") if "repo" in query else None
+                store_path, repo = self._route_request(
+                    requested, required=False, allow_default=True,
+                )
+                self._send_json(200, _state_payload(
+                    store_path, self._request_binding, mode=self.workspace_mode,
+                    repo=repo,
+                ))
             elif path == "/api/progress":
-                self._send_json(200, get_fetch_progress())
+                query = self._query(parsed, {"repo"})
+                requested = self._one(query, "repo") if "repo" in query else None
+                store_path, repo = self._route_request(
+                    requested, required=False, allow_default=True,
+                )
+                self._send_json(200, get_fetch_progress(repo=repo, store_path=store_path))
             elif path.startswith("/api/proposals/"):
                 proposal_id = path[len("/api/proposals/"):]
                 if not proposal_id or "/" in proposal_id:
                     raise RequestProblem(400, "invalid_proposal", "proposal_id is invalid")
                 query = self._query(parsed, {"repo"})
-                repo = self._one(query, "repo") or None
+                repo = self._one(query, "repo") if "repo" in query else None
+                store_path, active = self._route_request(
+                    repo, required=self.workspace_mode == "multi",
+                )
+                self._require_initialized()
                 proposal = store_module.inspect_proposal(
-                    proposal_id, path=self.store_path, repo=repo
+                    proposal_id, path=store_path, repo=repo or active or None
                 )
                 self._send_json(200, {"proposal": proposal.to_dict()})
             elif path == "/api/overlap":
-                query = self._query(parsed, {"group_id", "member_page", "member_page_size",
+                query = self._query(parsed, {"repo", "group_id", "member_page", "member_page_size",
                                              "row_page", "row_page_size"})
+                requested = self._one(query, "repo") if "repo" in query else None
+                store_path, _ = self._route_request(
+                    requested, required=self.workspace_mode == "multi",
+                )
                 group_id = self._one(query, "group_id")
                 if not _GROUP_ID.fullmatch(group_id):
                     raise RequestProblem(400, "invalid_group", "group_id is invalid")
+                self._require_initialized()
                 try:
                     self._send_json(200, overlap_for_group(
-                        group_id, path=self.store_path,
+                        group_id, path=store_path,
                         member_page=self._int(self._one(query, "member_page", "1"),
                                               "member_page", 1, 1_000_000),
                         member_page_size=self._int(self._one(query, "member_page_size", "24"),
@@ -609,7 +871,9 @@ class TriageHandler(BaseHTTPRequestHandler):
             elif path == "/api/pr":
                 query = self._query(parsed, {"number", "repo"})
                 number = self._int(self._one(query, "number"), "number", 1, 2_147_483_647)
-                store, repo = self._active_repo(self._one(query, "repo") or None)
+                requested = self._one(query, "repo") if "repo" in query else None
+                self._route_request(requested, required=self.workspace_mode == "multi")
+                store, repo = self._active_repo(requested)
                 if str(store.get("source") or "") == "fixtures":
                     meta = next((p for p in store.get("last_prs") or []
                                  if int(p.get("number") or 0) == number), None)
@@ -657,20 +921,32 @@ class TriageHandler(BaseHTTPRequestHandler):
                     payload["evidence_complete"] = False
                 self._send_json(200, payload)
             elif path == "/api/file":
-                query = self._query(parsed, {"path", "page", "page_size"})
-                self._send_json(200, prs_for_path(_safe_file_path(self._one(query, "path")),
-                    path=self.store_path,
-                    page=self._int(self._one(query, "page", "1"), "page", 1, 1_000_000),
-                    page_size=self._int(self._one(query, "page_size", "40"),
-                                        "page_size", 1, 40)))
+                query = self._query(parsed, {"repo", "path", "page", "page_size"})
+                requested = self._one(query, "repo") if "repo" in query else None
+                store_path, _ = self._route_request(
+                    requested, required=self.workspace_mode == "multi",
+                )
+                file_path = _safe_file_path(self._one(query, "path"))
+                page = self._int(self._one(query, "page", "1"), "page", 1, 1_000_000)
+                page_size = self._int(self._one(query, "page_size", "40"), "page_size", 1, 40)
+                if self.workspace_mode == "multi" and not self._request_initialized:
+                    self._send_json(200, self._empty_file_result(file_path, page, page_size))
+                    return
+                self._send_json(200, prs_for_path(file_path, path=store_path,
+                    page=page, page_size=page_size))
             elif path == "/api/related":
-                query = self._query(parsed, {"pr", "path", "limit"})
+                query = self._query(parsed, {"repo", "pr", "path", "limit"})
+                requested = self._one(query, "repo") if "repo" in query else None
+                store_path, _ = self._route_request(
+                    requested, required=self.workspace_mode == "multi",
+                )
+                self._require_initialized()
                 number = self._int(self._one(query, "pr"), "pr", 1, 2_147_483_647)
                 raw_path = self._one(query, "path")
                 limit = self._int(self._one(query, "limit", "5"), "limit", 1, 20)
                 self._send_json(200, _cached_related(number,
                     file_path=_safe_file_path(raw_path) if raw_path else None,
-                    store_path=self.store_path, k=limit))
+                    store_path=store_path, k=limit))
             elif path == "/api/patches":
                 self._send_json(200, self._patches(parsed))
             elif path in {"/", "/index.html"}:
@@ -741,7 +1017,33 @@ class TriageHandler(BaseHTTPRequestHandler):
         operation, args = body["operation"], body["args"]
         if not isinstance(operation, str) or not isinstance(args, dict):
             raise RequestProblem(400, "invalid_request", "operation and args are required")
-        result = service_module.dispatch_read(self.store_path, operation, args)
+        if operation != "get_workspace" and "repo" not in args:
+            raise RequestProblem(400, "missing_fields", "missing fields: repo")
+        requested = args.get("repo") if "repo" in args else None
+        store_path, repo = self._route_request(
+            requested, required=operation != "get_workspace", allow_default=True,
+        )
+        # Bind even the default get_workspace call explicitly so a service
+        # implementation cannot accidentally consult a browser/server active
+        # repository.  This is a request-local copy; caller args are untouched.
+        routed_args = dict(args)
+        if repo:
+            routed_args["repo"] = repo
+        result = service_module.dispatch_read(store_path, operation, routed_args)
+        if operation == "get_workspace" and result.get("ok") is True:
+            # Discovery is advisory metadata only.  It is resolved from the
+            # frozen router and never changes the request's selected repo.
+            try:
+                discovery = self._workspaces_payload()
+            except RequestProblem:
+                discovery = {"workspaces": [], "truncated": True}
+            data = result.get("data")
+            if isinstance(data, dict):
+                data = dict(data)
+                data["available_workspaces"] = discovery["workspaces"]
+                data["workspaces_truncated"] = bool(discovery["truncated"])
+                result = dict(result)
+                result["data"] = data
         if result.get("ok") is not True:
             error = result.get("error") or {}
             status = error.get("status", 500)
@@ -792,6 +1094,8 @@ class TriageHandler(BaseHTTPRequestHandler):
                                       "expected_snapshot_version", "idempotency_key"},
                      optional={"canonical_pr", "provenance", "context", "actor", "expected_version"})
         repo = _repo_key(body["repo"])
+        store_path, _ = self._route_request(repo, required=True)
+        self._require_initialized()
         group_id = body["group_id"]
         if not isinstance(group_id, str) or not _GROUP_ID.fullmatch(group_id):
             raise RequestProblem(400, "invalid_group", "group_id is invalid")
@@ -814,7 +1118,7 @@ class TriageHandler(BaseHTTPRequestHandler):
             expected_snapshot_version=expected_snapshot,
             idempotency_key=key, provenance=provenance, context=context,
         )
-        result = service_module.WorkspaceService(self.store_path).draft_proposal(
+        result = service_module.WorkspaceService(store_path).draft_proposal(
             request, actor=actor
         )
         if result.get("ok") is not True:
@@ -837,6 +1141,8 @@ class TriageHandler(BaseHTTPRequestHandler):
                       "expected_snapshot_version", "idempotency_key", "actor"},
         )
         repo = _repo_key(body["repo"])
+        store_path, _ = self._route_request(repo, required=True)
+        self._require_initialized()
         group_id = body["group_id"]
         if not isinstance(group_id, str) or not _GROUP_ID.fullmatch(group_id):
             raise RequestProblem(400, "invalid_group", "group_id is invalid")
@@ -847,14 +1153,15 @@ class TriageHandler(BaseHTTPRequestHandler):
         if not isinstance(actor, str) or not 1 <= len(actor.strip()) <= 256:
             raise RequestProblem(400, "invalid_actor", "actor must be 1-256 characters")
         rows = store_module.save_dispositions(
-            items, path=self.store_path, repo=repo, group_id=group_id,
+            items, path=store_path, repo=repo, group_id=group_id,
             expected_version=expected_version,
             expected_snapshot_version=expected_snapshot,
             idempotency_key=key, actor=actor.strip(), source="human",
         )
         self._send_json(200, {
             "dispositions": [row.to_dict() for row in rows],
-            "state": _state_payload(self.store_path),
+            "state": _state_payload(store_path, self._request_binding,
+                                     mode=self.workspace_mode, repo=repo),
         })
 
     def _post_proposal_transition(self, path: str, body: dict[str, Any]) -> None:
@@ -874,6 +1181,8 @@ class TriageHandler(BaseHTTPRequestHandler):
             required.add("expected_store_version")
         self._fields(body, required=required, optional=allowed - required)
         repo = _repo_key(body["repo"])
+        store_path, _ = self._route_request(repo, required=True)
+        self._require_initialized()
         expected_version, expected_snapshot = self._proposal_versions(body)
         key = self._proposal_key(body)
         actor = body["actor"]
@@ -886,7 +1195,7 @@ class TriageHandler(BaseHTTPRequestHandler):
             raise RequestProblem(400, "missing_fields", "missing fields: items")
         items = self._proposal_items(body["items"]) if action == "edit" or "items" in body else None
         kwargs: dict[str, Any] = {
-            "path": self.store_path, "repo": repo,
+            "path": store_path, "repo": repo,
             "expected_version": expected_version,
             "expected_snapshot_version": expected_snapshot,
             "idempotency_key": key, "actor": actor,
@@ -903,7 +1212,9 @@ class TriageHandler(BaseHTTPRequestHandler):
             proposal = store_module.reject_proposal(
                 proposal_id, reason=body.get("reason", "rejected by maintainer"), **kwargs
             )
-        self._send_json(200, {"proposal": proposal.to_dict(), "state": _state_payload(self.store_path)})
+        self._send_json(200, {"proposal": proposal.to_dict(),
+                              "state": _state_payload(store_path, self._request_binding,
+                                                       mode=self.workspace_mode, repo=repo)})
 
     def _post_fetch(self, body: dict[str, Any]) -> None:
         self._fields(body, required={"source", "repo", "limit", "refresh"})
@@ -911,12 +1222,13 @@ class TriageHandler(BaseHTTPRequestHandler):
         if source not in {"fixtures", "gh", "github"}:
             raise RequestProblem(400, "invalid_source", "source must be fixtures|gh|github")
         repo = _repo_key(body["repo"])
+        store_path, _ = self._route_request(repo, required=True)
         requested_limit = self._json_int(body["limit"], "limit", 0, MAX_FETCH_LIMIT)
         effective_limit = MAX_FETCH_LIMIT if requested_limit == 0 else requested_limit
         refresh = body["refresh"]
         if not isinstance(refresh, bool):
             raise RequestProblem(400, "invalid_refresh", "refresh must be a boolean")
-        store = load_store(self.store_path)
+        store = self._bound_store()
         active_repo = str(store.get("repo") or "").strip().strip("/").lower()
         active_source = str(store.get("source") or "")
         if active_repo and active_repo != repo:
@@ -929,10 +1241,13 @@ class TriageHandler(BaseHTTPRequestHandler):
                                  "source does not match this store; use a separate workspace")
         try:
             result = start_fetch_async(source, repo, effective_limit,
-                                       store_path=self.store_path, refresh=refresh)
+                                       store_path=store_path, refresh=refresh)
         except FetchBusyError as busy:
-            self._send_json(409, {"error": "fetch already running", "code": "fetch_busy",
-                                  **busy.progress})
+            # The active job belongs to another workspace.  Return its
+            # captured, path-free progress so the caller can stop polling its
+            # own workspace; a scoped GET /api/progress remains idle for B.
+            self._send_json(409, {**busy.progress,
+                                  "error": "fetch already running", "code": "fetch_busy"})
             return
         result["requested_limit"] = requested_limit
         self._send_json(202, result)
@@ -945,6 +1260,7 @@ class TriageHandler(BaseHTTPRequestHandler):
             raise RequestProblem(403, "external_consent_required",
                                  "this request must explicitly allow external processing")
         repo = _repo_key(body["repo"])
+        store_path, _ = self._route_request(repo, required=True)
         store, active = self._active_repo(repo)
         version = self._json_int(body["expected_version"], "expected_version", 0,
                                  9_007_199_254_740_991)
@@ -957,7 +1273,7 @@ class TriageHandler(BaseHTTPRequestHandler):
         limit = self._json_int(body["limit"], "limit", 1, MAX_ENRICH_CANDIDATES)
         file_path = _safe_file_path(body["path"]) if body.get("path") else None
         self._send_json(200, _run_enrichment(
-            number, repo=active, file_path=file_path, store_path=self.store_path,
+            number, repo=active, file_path=file_path, store_path=store_path,
             limit=limit, expected_version=version
         ))
 
@@ -965,6 +1281,8 @@ class TriageHandler(BaseHTTPRequestHandler):
         self._fields(body, required={"repo", "group_id", "decision", "expected_version",
                                           "idempotency_key"})
         repo = _repo_key(body["repo"])
+        store_path, _ = self._route_request(repo, required=True)
+        self._require_initialized()
         self._active_repo(repo)
         group_id = body["group_id"]
         if not isinstance(group_id, str) or not _GROUP_ID.fullmatch(group_id):
@@ -983,17 +1301,19 @@ class TriageHandler(BaseHTTPRequestHandler):
             raise RequestProblem(400, "invalid_idempotency_key",
                                  "idempotency_key must be 8-128 safe characters")
         rule = store_module.decide_group(
-            group_id, mapping[decision], path=self.store_path, expected_repo=repo,
+            group_id, mapping[decision], path=store_path, expected_repo=repo,
             expected_version=version, idempotency_key=key
         )
         self._send_json(200, {"decision": rule.to_dict(),
-                              "state": _state_payload(self.store_path)})
+                              "state": _state_payload(store_path, self._request_binding,
+                                                       mode=self.workspace_mode, repo=repo)})
 
     def _patches(self, parsed: Any) -> dict[str, Any]:
         query = self._query(parsed, {"repo", "path", "prs", "group_id", "page",
             "page_size", "patch_offset", "patch_limit"})
-        repo = _repo_key(self._one(query, "repo"))
-        store, active = self._active_repo(repo)
+        requested = self._one(query, "repo") if "repo" in query else None
+        self._route_request(requested, required=self.workspace_mode == "multi")
+        store, active = self._active_repo(requested)
         file_path = _safe_file_path(self._one(query, "path"))
         raw_prs, group_id = self._one(query, "prs"), self._one(query, "group_id")
         if bool(raw_prs) == bool(group_id):
@@ -1264,17 +1584,28 @@ class TriageHandler(BaseHTTPRequestHandler):
             self._problem(problem)
 
 
-def make_handler(store_path: Path, *, allowed_hostnames: tuple[str, ...] | None = None,
+def make_handler(store_path: Path | None, *, allowed_hostnames: tuple[str, ...] | None = None,
                  csrf_token: str | None = None,
-                 body_timeout_seconds: float = BODY_TIMEOUT_SECONDS) -> type[BaseHTTPRequestHandler]:
+                 body_timeout_seconds: float = BODY_TIMEOUT_SECONDS,
+                 workspace_root: Path | None = None) -> type[BaseHTTPRequestHandler]:
     """Create a per-server handler with a fresh, unguessable session token."""
     token = csrf_token or secrets.token_urlsafe(32)
     allowed = tuple(host.lower() for host in (allowed_hostnames or ()))
 
+    if store_path is not None and workspace_root is not None:
+        raise ValueError("--store and --workspace-root are mutually exclusive")
+    mode = "multi" if store_path is None else "single"
+    router: WorkspaceRouter | None = None
+    if mode == "multi":
+        router = WorkspaceRouter(root=Path(workspace_root or DEFAULT_WORKSPACE_ROOT))
+
     class BoundHandler(TriageHandler):
         pass
 
-    BoundHandler.store_path = store_path
+    BoundHandler.store_path = Path(store_path) if store_path is not None else None
+    BoundHandler.workspace_root = Path(workspace_root or DEFAULT_WORKSPACE_ROOT) if mode == "multi" else None
+    BoundHandler.workspace_router = router
+    BoundHandler.workspace_mode = mode
     BoundHandler.csrf_token = token
     BoundHandler.allowed_hostnames = allowed
     BoundHandler.body_timeout_seconds = body_timeout_seconds
@@ -1303,11 +1634,15 @@ def _serve_allowed_hostnames(host: str) -> tuple[str, ...]:
 
 
 def serve(host: str = "127.0.0.1", port: int = 8741, open_browser: bool = True,
-          store_path: Path = DEFAULT_STORE_PATH) -> None:
-    """Serve one local store; LAN/team exposure requires another architecture."""
+          store_path: Path | None = None,
+          workspace_root: Path | None = None) -> None:
+    """Serve fixed ``--store`` or request-routed local workspaces."""
     _validate_loopback_host(host)
+    if store_path is not None and workspace_root is not None:
+        raise ValueError("--store and --workspace-root are mutually exclusive")
     httpd = BoundedThreadingHTTPServer((host, port), make_handler(
-        store_path, allowed_hostnames=_serve_allowed_hostnames(host)
+        store_path, workspace_root=workspace_root,
+        allowed_hostnames=_serve_allowed_hostnames(host)
     ))
     actual_port = int(httpd.server_address[1])
     display_host = f"[{host}]" if ":" in host and not host.startswith("[") else host

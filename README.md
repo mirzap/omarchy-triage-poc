@@ -18,11 +18,12 @@ Open <http://127.0.0.1:8741>, select **gh**, enter the repository (for example,
 GitHub CLI first with `gh auth login` if needed. No separate `triage run`
 command is required.
 
-The server uses `.triage/store.json` by default. Starting it does not fetch
-anything; **Sync** with **refresh** checked explicitly downloads GitHub data.
-Uncheck **refresh** to load existing cached evidence without network access.
-Keep one store per repository; an existing workspace cannot be switched to a
-different repository.
+The server uses a separate workspace for each repository by default. Starting
+it does not fetch anything; **Sync** with **refresh** checked explicitly
+downloads GitHub data. Uncheck **refresh** to load existing cached evidence
+without network access. The first explicit **Sync** creates the selected
+workspace; merely entering or opening an unknown repository does not create
+files.
 
 ## Safety model
 
@@ -93,7 +94,8 @@ triage run --source github --repo omacom/omarchy --refresh
 
 `--limit N` limits file-evidence downloads, not the open-PR listing. Every PR from the complete fresh open list remains present. Outside the limit, same-revision verified evidence is reused; otherwise the PR remains as an incomplete pending stub. Refresh stages an immutable cache snapshot, revalidates the listing, and publishes it atomically. A failed refresh preserves the prior usable store view.
 
-Use a separate store for each repository. Commands refuse to replace a nonempty workspace with another repository:
+For direct CLI runs, use a separate fixed store for each repository. Commands
+refuse to replace a nonempty workspace with another repository:
 
 ```bash
 triage run --source gh --repo owner/repo --refresh \
@@ -144,6 +146,37 @@ triage serve --host 127.0.0.1 --port 8741 --store /path/to/store.json
 The server accepts only literal loopback or `localhost` binding, validates Host/Origin/session tokens for mutations, and serves static files from the installed package. It is a local review tool, not a production or team server. Python documents `http.server` as unsuitable for production because it provides only basic security checks ([Python documentation](https://docs.python.org/3/library/http.server.html)). Do not expose this process through a LAN bind, reverse proxy, tunnel, or public hostname. Authentication, roles, TLS, and repository authorization are release gates for team use.
 
 The dashboard separates cache-only loading from explicit Refresh. It shows the complete all-open list, persistent pending queues, revision/evidence status, paged file comparisons, and advisory related-PR results. Approval is disabled when the selected group lacks complete evidence.
+
+### Per-repository workspaces
+
+An ordinary `triage serve` runs in multi-workspace mode. Its default root is
+`.triage/workspaces`, with stores at
+`.triage/workspaces/<owner>/<repo>/store.json`; owner and repository names are
+normalized to lower case. The GitHub cache remains in the existing
+`.triage/cache/<owner>/<repo>/` namespace. Use `--workspace-root PATH` to
+choose another workspace root.
+
+An existing `.triage/store.json` is an unmoved legacy workspace when its JSON
+contains a valid repository identity. It remains at that path and is used for
+that repository; the server never moves or copies it into the namespaced root.
+If no valid legacy store exists, the stable default is `omacom/omarchy`.
+
+The dashboard keeps repository entry separate from the displayed state. **Open**
+selects a saved or entered workspace (including an empty, not-yet-created one);
+**Sync** explicitly fetches and publishes data for that selected repository.
+Switching repositories does not carry over decisions, proposals, progress, or
+cached evidence from the previous workspace.
+
+To keep the server on one fixed store for compatibility or embedding, pass an
+explicit `--store PATH`:
+
+```bash
+triage serve --store /path/to/repo-workspace/store.json
+```
+
+`--store` and `--workspace-root` are mutually exclusive. Fixed-store mode
+retains the existing repository guard and does not turn one JSON store into a
+multi-repository store.
 
 **Queue** organizes work into actionable piles; **Groups** browses the file-set
 groups; **All PRs** lists individual contributions. Group lists sort by PR count,

@@ -16,6 +16,7 @@ from typing import Any, Mapping
 
 from triage import gh, rank, store
 from triage.github import parse_repo
+from triage.workspaces import InvalidRepoError, canonical_repo
 from triage.models import (
     ChangedFile,
     DISPOSITIONS,
@@ -227,23 +228,12 @@ def _repo(value: Any, *, required: bool = True) -> str:
         if required:
             raise _error(409, "repository_unset", "this store has no active repository")
         return ""
-    if value == "":
-        if required:
-            raise _error(400, "invalid_repo", "repo must be a non-empty canonical owner/name")
-        return ""
-    if not isinstance(value, str):
-        raise _error(400, "invalid_repo", "repo must be canonical owner/name")
     try:
-        raw = value.encode("utf-8", "strict").decode("utf-8").strip().strip("/").lower()
-    except UnicodeError as exc:
+        return canonical_repo(value)
+    except InvalidRepoError as exc:
+        if value == "" and not required:
+            return ""
         raise _error(400, "invalid_repo", "repo must be canonical owner/name") from exc
-    try:
-        owner, name = parse_repo(raw)
-    except (TypeError, ValueError) as exc:
-        raise _error(400, "invalid_repo", "repo must be canonical owner/name") from exc
-    if f"{owner}/{name}".lower() != raw:
-        raise _error(400, "invalid_repo", "repo must be canonical owner/name")
-    return raw
 
 
 def _path(value: Any) -> str:
@@ -376,12 +366,35 @@ def _snapshot_id(data: Mapping[str, Any], source: str) -> str:
     return next(iter(values)) if len(values) == 1 and next(iter(values), "") else ""
 
 
-def _context(path: Path, args: Mapping[str, Any], *, require_repo: bool = True) -> _Context:
-    data = store.load_store(path)
-    active = _repo(data.get("repo"), required=False)
+def _empty_context_data(repo: str = "") -> dict[str, Any]:
+    """Return a store-shaped in-memory projection without touching the FS."""
+    data = dict(store._empty_store())
+    data["repo"] = repo
+    return data
+
+
+def _context(path: Path, args: Mapping[str, Any], *, require_repo: bool = True,
+             allow_missing: bool = False, default_repo: str = "") -> _Context:
     requested = _repo(args.get("repo"), required=require_repo) if require_repo else (
         _repo(args.get("repo"), required=False) if "repo" in args else ""
     )
+    if not requested and default_repo:
+        requested = _repo(default_repo, required=True)
+
+    path = Path(path)
+    # ``store.load_store`` deliberately creates its parent and sidecar lock,
+    # even for a read of a missing file.  A workspace selection must remain a
+    # pure lookup, so get_workspace can opt into an in-memory empty context.
+    missing = not path.exists() and not path.is_symlink()
+    if missing and allow_missing:
+        data = _empty_context_data(requested)
+    elif missing and require_repo:
+        raise _error(409, "repository_unset", "this store has no active repository")
+    else:
+        data = store.load_store(path)
+    active = _repo(data.get("repo"), required=False)
+    if missing and allow_missing and requested:
+        active = requested
     if require_repo and not active:
         raise _error(409, "repository_unset", "this store has no active repository")
     if requested and active and requested != active:
@@ -789,7 +802,12 @@ class WorkspaceService:
         if unknown: raise _error(400, "unknown_parameter", f"unknown parameters: {', '.join(sorted(unknown))}")
         if operation != "get_workspace" and "repo" not in args:
             raise _error(400, "missing_fields", "missing fields: repo")
-        ctx = _context(self.store_path, args, require_repo=operation != "get_workspace")
+        ctx = _context(
+            self.store_path,
+            args,
+            require_repo=operation != "get_workspace",
+            allow_missing=operation == "get_workspace",
+        )
         if operation == "get_workspace": return self._workspace(ctx)
         if operation == "list_groups": return self._groups(ctx, args)
         if operation == "search_prs": return self._prs(ctx, args)

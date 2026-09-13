@@ -66,6 +66,7 @@ a:hover { text-decoration: underline; }
 }
 .field.grow { flex: 1; }
 .field.narrow { width: 72px; }
+.field.workspace-choice { width: 178px; }
 .field input, .field select {
   background: var(--bg);
   border: 1px solid var(--border);
@@ -97,6 +98,7 @@ a:hover { text-decoration: underline; }
   white-space: nowrap;
 }
 .status-wrap { margin-left: auto; min-width: 0; text-align: right; }
+.workspace-active { color: var(--text); font-size: 10px; max-width: 420px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .status {
   color: var(--muted);
   max-width: 420px;

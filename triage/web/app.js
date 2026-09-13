@@ -18,6 +18,15 @@
     overlap: {},
     source: "",
     repo: "",
+    // The repo field is an explicit, uncommitted workspace choice.  It must
+    // never retarget the displayed snapshot merely because somebody typed.
+    repoDraft: "",
+    workspaceMode: "single",
+    defaultRepo: "",
+    workspaces: [],
+    workspaceInitialized: false,
+    workspaceLegacy: false,
+    workspaceSwitching: false,
     selectedGroupId: null,
     selectedPr: null,
     selectedFile: null,
@@ -71,7 +80,10 @@
   const virtualizerCleanup = { group: null, all: null, queue: null, member: null };
   let queueRowsCache = null;
   let fetchPollTimer = null;
+  let cancelFetchPoll = null;
+  let fetchPollOwner = null;
   let stateLoadGen = 0;
+  let workspaceGen = 0;
   let snapshotGen = 0;
   let fileQueueGen = 0;
   let relatedGen = 0;
@@ -117,6 +129,7 @@
   ];
   let resumeRepo = "";
   let urlViewFields = new Set();
+  let urlRepoExplicit = false;
 
   function storageKey(repo) {
     return "omarchy.triage.resume:" + encodeURIComponent(String(repo || ""));
@@ -158,7 +171,7 @@
   }
 
   function persistResume() {
-    const repo = state.repo || ($("repo") && $("repo").value.trim()) || "";
+    const repo = state.repo || "";
     if (!repo) return;
     const value = {};
     RESUME_FIELDS.forEach((field) => { value[field] = state[field]; });
@@ -205,7 +218,7 @@
       pile: state.queuePile || "needs_you",
     };
     return {
-      repo: state.repo || ($("repo") && $("repo").value.trim()) || "",
+      repo: state.repo || "",
       source: state.source || ($("source") && $("source").value) || "",
       store_version: Number(state.storeVersion || 0),
       snapshot_version: Number(state.snapshotVersion || 0),
@@ -286,7 +299,10 @@
     Object.assign(state, URL_DEFAULTS);
     urlViewFields = new Set();
     const q = new URLSearchParams(location.search);
-    const repoHint = q.get("repo") || ($("repo") && $("repo").value.trim()) || "omacom/omarchy";
+    urlRepoExplicit = q.has("repo") && !!q.get("repo");
+    const repoHint = q.get("repo") || "omacom/omarchy";
+    state.repoDraft = repoHint;
+    if ($("repo")) $("repo").value = repoHint;
     resumeRepo = repoHint;
     applyResume(readResume(repoHint), false);
     const has = (key, field) => q.has(key) && (urlViewFields.add(field || key), true);
@@ -312,6 +328,8 @@
 
   function writeUrl(push) {
     const q = new URLSearchParams();
+    const activeRepo = state.repo || state.repoDraft || "";
+    if (activeRepo) q.set("repo", activeRepo);
     q.set("tab", state.leftTab || "queue");
     if (state.selectedGroupId) q.set("group", state.selectedGroupId);
     if (state.selectedPr) q.set("pr", String(state.selectedPr));
@@ -330,8 +348,181 @@
     writingUrl = false;
   }
 
+  function scopedGet(path, repo) {
+    if (!repo) return path;
+    return path + (path.includes("?") ? "&" : "?") +
+      "repo=" + encodeURIComponent(repo);
+  }
+
+  function validWorkspaceRepo(repo) {
+    if (typeof repo !== "string") return false;
+    const value = repo.trim();
+    if (!value || value.length > 256 || /[\u0000-\u001f\u007f]/.test(value)) return false;
+    const parts = value.split("/");
+    return parts.length === 2 && parts.every((part) => part !== "." && part !== ".." &&
+      /^[A-Za-z0-9_.-]+$/.test(part));
+  }
+
+  function canonicalWorkspaceRepo(repo) {
+    const value = String(repo || "").trim();
+    return validWorkspaceRepo(value) ? value.toLowerCase() : "";
+  }
+
+  function renderWorkspaceControls() {
+    const active = $("activeWorkspace");
+    if (active) {
+      active.textContent = state.workspaceSwitching
+        ? "opening workspace: " + (state.repo || state.repoDraft || "?")
+        : state.repo
+          ? "active workspace: " + state.repo +
+            (state.workspaceInitialized === false ? " · empty" : "")
+          : "active workspace: none";
+    }
+    const picker = $("workspaceChoices");
+    if (!picker) return;
+    const prior = picker.value;
+    picker.innerHTML = "";
+    const blank = document.createElement("option");
+    blank.value = "";
+    blank.textContent = state.workspaces.length ? "choose saved workspace…" :
+      state.workspaceMode === "single" ? "fixed store" : "no saved workspaces";
+    picker.appendChild(blank);
+    const repos = state.workspaces.map((item) =>
+      typeof item === "string" ? item : item && item.repo
+    ).filter((repo) => validWorkspaceRepo(repo));
+    const all = [...new Set(repos.concat([state.repo, state.repoDraft].filter(validWorkspaceRepo)))];
+    all.slice(0, 200).forEach((repo) => {
+      const option = document.createElement("option");
+      option.value = repo;
+      option.textContent = repo;
+      picker.appendChild(option);
+    });
+    picker.value = all.includes(prior) ? prior : "";
+  }
+
+  function hasUnsavedDecisionEdit() {
+    const draft = state.dispositionDraft;
+    const pr = draft && draft.pr ? prByNumber(draft.pr) : null;
+    if (!draft || !pr) return false;
+    return draft.disposition !== (DISPOSITION_VALUES.includes(pr.disposition) ? pr.disposition : "pending") ||
+      String(draft.reason || "") !== String(pr.disposition_reason || "") ||
+      (draft.duplicate_of || null) !== (pr.duplicate_of || null);
+  }
+
+  function hasUnsavedProposalEdit() {
+    const proposal = state.proposal;
+    const edits = state.proposalEdits;
+    if (!proposal || !edits || !Array.isArray(edits.items)) return false;
+    const normalize = (item) => ({
+      pr: item.pr,
+      disposition: item.disposition || "pending",
+      reason: item.reason || "",
+      duplicate_of: item.duplicate_of || null,
+      revision: item.revision || null,
+      duplicate_of_revision: item.duplicate_of_revision || null,
+    });
+    const original = {
+      canonical_pr: proposal.canonical_pr || null,
+      items: (proposal.items || []).map(normalize),
+    };
+    const current = {
+      canonical_pr: edits.canonical_pr || null,
+      items: edits.items.map(normalize),
+    };
+    const rejectReason = $("proposalRejectReason");
+    return JSON.stringify(original) !== JSON.stringify(current) ||
+      !!(rejectReason && String(rejectReason.value || "").trim());
+  }
+
+  function confirmWorkspaceSwitch() {
+    const warnings = [];
+    if (hasUnsavedDecisionEdit()) warnings.push("per-PR decision edits");
+    if (hasUnsavedProposalEdit()) warnings.push("proposal edits");
+    if (!warnings.length) return true;
+    if (typeof window.confirm !== "function") return false;
+    return window.confirm("Switch workspace and discard unsaved " + warnings.join(" and ") + "?");
+  }
+
+  async function switchWorkspace(repo, options) {
+    const rawTarget = String(repo || "").trim();
+    const target = canonicalWorkspaceRepo(rawTarget);
+    if (!target) {
+      setStatus("workspace must be owner/repo using safe repository characters");
+      return false;
+    }
+    if (target === state.repo && stateInitialized && !state.workspaceSwitching) {
+      state.repoDraft = target;
+      renderWorkspaceControls();
+      return true;
+    }
+    if (state.workspaceMode === "single" && state.repo && target !== state.repo && stateInitialized) {
+      setStatus("fixed-store mode is bound to " + state.repo + "; Sync or restart with workspace mode to change it");
+      if ($("repo")) $("repo").value = state.repo;
+      state.repoDraft = state.repo;
+      renderWorkspaceControls();
+      return false;
+    }
+    if (!(options && options.skipConfirm) && !confirmWorkspaceSwitch()) return false;
+    const token = ++workspaceGen;
+    stateLoadGen += 1;
+    if (cancelFetchPoll) cancelFetchPoll();
+    else if (fetchPollTimer) clearTimeout(fetchPollTimer);
+    fetchPollTimer = null;
+    state.fetching = false;
+    const fetchButton = $("fetchBtn");
+    if (fetchButton) fetchButton.disabled = false;
+    invalidateSnapshotCaches();
+    state.repo = target;
+    state.repoDraft = target;
+    state.source = "";
+    state.groups = [];
+    state.prs = [];
+    state.proposals = [];
+    state.rules = [];
+    state.overlap = {};
+    state.queue = {};
+    state.new_pr_numbers = [];
+    state.storeVersion = 0;
+    state.snapshotVersion = 0;
+    state.sync = null;
+    state.selectedGroupId = null;
+    state.selectedPr = null;
+    state.selectedFile = null;
+    state.selectedUser = null;
+    state.workspaceInitialized = false;
+    state.workspaceLegacy = false;
+    state.workspaceSwitching = true;
+    stateInitialized = false;
+    urlViewFields = new Set();
+    resumeRepo = target;
+    applyResume(readResume(target), false);
+    state.viewRevision = Number.isSafeInteger(state.viewRevision) ? state.viewRevision + 1 : 1;
+    const repoInput = $("repo");
+    if (repoInput) repoInput.value = target;
+    if ($("listFilter")) $("listFilter").value = state.filterQuery || "";
+    paintLabelFilters();
+    paintPileNav();
+    renderWorkspaceControls();
+    if (options && options.fromUrl) {
+      setLeftTab(state.leftTab, true);
+      renderDetail();
+    } else {
+      render();
+    }
+    setStatus("opening workspace " + target + "…");
+    const loaded = await loadState(target, { token });
+    if (token === workspaceGen) {
+      state.workspaceSwitching = false;
+      renderWorkspaceControls();
+      if (!loaded) render();
+      else if (!state.selectedGroupId && !state.selectedFile) renderDetail();
+    }
+    return !!loaded;
+  }
+
   function setStatus(msg) {
-    $("status").textContent = msg;
+    const root = $("status");
+    if (root) root.textContent = msg;
   }
 
   function renderSyncMeta() {
@@ -429,6 +620,7 @@
     bodyGen += 1;
     overlapGen += 1;
     diffGen += 1;
+    proposalGen += 1;
     state.fileQueue = null;
     state.related = null;
     state.relatedKey = "";
@@ -442,6 +634,9 @@
     state.proposalEdits = null;
     state.dispositionDraft = null;
     state.dispositionBusy = false;
+    state.nextDecision = "";
+    const saveNextDecision = $("saveNextDecision");
+    if (saveNextDecision) saveNextDecision.value = "";
     lastBodyPr = null;
     Object.keys(bodyCache).forEach((key) => delete bodyCache[key]);
     for (const entry of resourceRequests.values()) entry.controller.abort();
@@ -460,12 +655,18 @@
     state.rules = data.rules || [];
     state.overlap = data.overlap || {};
     state.source = data.source || "";
-    state.repo = data.repo || "";
+    state.repo = data.repo || state.repo || "";
     state.queue = data.queue || {};
     state.new_pr_numbers = data.new_pr_numbers || [];
     state.storeVersion = Number(data.store_version || 0);
     state.snapshotVersion = Number(data.snapshot_version || 0);
     state.sync = data.sync || null;
+    const workspace = data.workspace && typeof data.workspace === "object" ? data.workspace : null;
+    state.workspaceMode = workspace && (workspace.mode === "multi" || workspace.mode === "single")
+      ? workspace.mode : state.workspaceMode;
+    state.workspaceInitialized = workspace && typeof workspace.initialized === "boolean"
+      ? workspace.initialized : !!(state.groups.length || state.prs.length || state.sync);
+    state.workspaceLegacy = !!(workspace && workspace.legacy);
     // A browser can be pointed at a different repository after a reload.
     // Rehydrate only the fields that were not explicit in the URL.
     if (state.repo && state.repo !== resumeRepo) {
@@ -477,7 +678,12 @@
     if (data.source) {
       $("source").value = ["gh", "github"].includes(data.source) ? "gh" : data.source;
     }
-    if (data.repo) $("repo").value = data.repo;
+    if (state.repo) {
+      state.repoDraft = state.repo;
+      if ($("repo")) $("repo").value = state.repo;
+    }
+    if ($("listFilter")) $("listFilter").value = state.filterQuery || "";
+    paintLabelFilters();
     if (
       state.selectedGroupId &&
       !state.groups.some((g) => g.group_id === state.selectedGroupId)
@@ -520,6 +726,7 @@
     }
     renderUserDrawer();
     renderSyncMeta();
+    renderWorkspaceControls();
     // Keep a corrupt or no-longer-valid saved target from recurring after the
     // next reload.  IDs are normalized above before this write.
     if (stateInitialized) markViewChanged(viewBefore);
@@ -1420,7 +1627,8 @@
     state.related = { loading: true };
     renderRelated();
     try {
-      let url = "/api/related?pr=" + encodeURIComponent(pr);
+      let url = "/api/related?pr=" + encodeURIComponent(pr) +
+        "&repo=" + encodeURIComponent(state.repo);
       if (path) url += "&path=" + encodeURIComponent(path);
       url += "&limit=5";
       const data = await requestOnce("related", key, url);
@@ -1624,7 +1832,8 @@
     try {
       const identity = snapshotKey() + "|" + path + "|" + page;
       const data = await requestOnce("file", identity,
-        "/api/file?path=" + encodeURIComponent(path) + "&page=" + page + "&page_size=40");
+        "/api/file?path=" + encodeURIComponent(path) + "&page=" + page +
+          "&page_size=40&repo=" + encodeURIComponent(state.repo));
       if (gen !== fileQueueGen || state.selectedFile !== path) return;
       state.fileQueue = data;
       if (isFileView()) {
@@ -2078,6 +2287,13 @@
       renderDiffs(null);
       empty.classList.remove("hidden");
       detail.classList.add("hidden");
+      empty.textContent = state.workspaceSwitching
+        ? "Opening " + (state.repo || "workspace") + "…"
+        : state.repo && state.workspaceInitialized === false
+          ? "Workspace " + state.repo + " is empty. Use Sync to fetch it explicitly."
+          : state.repo
+            ? "No group selected in " + state.repo
+            : "Open a workspace to begin";
       const saveNext = $("saveNextBtn");
       if (saveNext) saveNext.disabled = true;
       return;
@@ -2673,6 +2889,8 @@
   async function transitionProposal(action) {
     const proposal = state.proposal;
     if (!proposal || !["accept", "edit", "reject"].includes(action) || state.proposalAction) return false;
+    const workspaceToken = workspaceGen;
+    const workspaceRepo = state.repo;
     const expected = currentViewContext();
     const identity = [snapshotKey(), proposal.proposal_id, action,
       JSON.stringify(state.proposalEdits || {}), $("proposalRejectReason") && $("proposalRejectReason").value || ""].join("|");
@@ -2685,6 +2903,7 @@
     renderProposalPanel();
     try {
       const items = await proposalItemsForWrite(action);
+      if (!workspaceCurrent(workspaceRepo, workspaceToken)) return staleViewError();
       if (currentViewContext().view_revision !== expected.view_revision ||
           currentViewContext().store_version !== expected.store_version ||
           state.proposalKey !== proposal.proposal_id) {
@@ -2711,6 +2930,7 @@
       const data = await api("/api/proposals/" + encodeURIComponent(proposal.proposal_id) + "/" + action, {
         method: "POST", body: JSON.stringify(body),
       });
+      if (!workspaceCurrent(workspaceRepo, workspaceToken)) return staleViewError();
       if (currentViewContext().store_version !== expected.store_version && action !== "reject") {
         // The transition response is still authoritative; apply its returned
         // state below rather than letting another render overwrite it.
@@ -2725,6 +2945,7 @@
       setStatus(hint + " · human confirmation recorded");
       return { ok: true, proposal: state.proposal, context: currentViewContext() };
     } catch (error) {
+      if (!workspaceCurrent(workspaceRepo, workspaceToken)) return staleViewError();
       state.proposalAction = "";
       let failureMessage;
       if (error.status === 409) {
@@ -2754,6 +2975,8 @@
     }
     const expected = currentViewContext();
     const selectedPr = pr.number;
+    const workspaceToken = workspaceGen;
+    const workspaceRepo = state.repo;
     const identity = [snapshotKey(), group.group_id, selectedPr, draft.disposition,
       draft.duplicate_of || "", reason].join("|");
     let idempotencyKey = dispositionRetries.get(identity);
@@ -2765,6 +2988,7 @@
     renderDispositionPanel(group, pr);
     try {
       const evidence = await loadPrBody(selectedPr);
+      if (!workspaceCurrent(workspaceRepo, workspaceToken)) return false;
       if (currentViewContext().view_revision !== expected.view_revision || state.selectedPr !== selectedPr) {
         state.dispositionBusy = false;
         renderDispositionPanel(groupById(state.selectedGroupId), prByNumber(state.selectedPr));
@@ -2785,6 +3009,7 @@
         item.duplicate_of = canonical;
         item.duplicate_of_revision = revisionRefFromPr(canonicalPr, await loadPrBody(canonical));
       }
+      if (!workspaceCurrent(workspaceRepo, workspaceToken)) return false;
       if (currentViewContext().view_revision !== expected.view_revision || state.selectedPr !== selectedPr) {
         state.dispositionBusy = false;
         renderDetail();
@@ -2802,6 +3027,7 @@
           actor: "human",
         }),
       });
+      if (!workspaceCurrent(workspaceRepo, workspaceToken)) return false;
       dispositionRetries.delete(identity);
       state.dispositionBusy = false;
       if (data.state) applyState(data.state);
@@ -2809,6 +3035,7 @@
       setStatus("saved per-PR disposition for #" + selectedPr);
       return { ok: true, dispositions: data.dispositions || [], context: currentViewContext() };
     } catch (error) {
+      if (!workspaceCurrent(workspaceRepo, workspaceToken)) return false;
       state.dispositionBusy = false;
       renderDispositionPanel(groupById(state.selectedGroupId), prByNumber(state.selectedPr));
       if (error.status === 409) {
@@ -2841,6 +3068,7 @@
         ov = await requestOnce("overlap", snapshotKey() + "|" + g.group_id +
           "|" + memberPage + "|" + rowPage,
           "/api/overlap?group_id=" + encodeURIComponent(g.group_id) +
+          "&repo=" + encodeURIComponent(state.repo) +
           "&member_page=" + memberPage + "&member_page_size=24&row_page=" + rowPage +
           "&row_page_size=80");
         if (gen !== overlapGen || state.selectedGroupId !== g.group_id) return;
@@ -3511,6 +3739,8 @@
       return actionError("invalid_request", "proposal_id must be a bounded string.", false);
     }
     const id = input.value;
+    const workspaceToken = workspaceGen;
+    const workspaceRepo = state.repo;
     const gen = ++proposalGen;
     state.proposalLoading = true;
     state.proposalError = "";
@@ -3522,7 +3752,10 @@
       const data = await requestOnce("proposal", state.repo + "|" + id,
         "/api/proposals/" + encodeURIComponent(id) + "?repo=" + encodeURIComponent(state.repo));
       const current = checkViewContext(input.context);
-      if (!current.ok || gen !== proposalGen) return current.ok ? staleViewError() : current;
+      if (!workspaceCurrent(workspaceRepo, workspaceToken) || !current.ok || gen !== proposalGen) {
+        return workspaceCurrent(workspaceRepo, workspaceToken) && !current.ok
+          ? current : staleViewError();
+      }
       if (!data || !data.proposal || typeof data.proposal !== "object") {
         return actionError("not_found", "proposal response was empty.", false);
       }
@@ -3552,12 +3785,22 @@
       if (block) block.open = true;
       return { ok: true, proposal: data.proposal, context: currentViewContext() };
     } catch (error) {
-      if (gen !== proposalGen) return staleViewError();
+      if (gen !== proposalGen || !workspaceCurrent(workspaceRepo, workspaceToken)) return staleViewError();
       state.proposalLoading = false;
       state.proposalError = error.message || "proposal could not be loaded";
       renderProposalPanel();
       if (error.status === 404) return actionError("not_found", state.proposalError, false);
       return actionError("proposal_unavailable", state.proposalError, true);
+    } finally {
+      // A navigation can make the original context stale without starting a
+      // replacement request. Clear only this request's loading state; an
+      // overlapping proposal request owns a newer generation and is left
+      // untouched.
+      if (gen === proposalGen && workspaceCurrent(workspaceRepo, workspaceToken) &&
+          state.proposalLoading) {
+        state.proposalLoading = false;
+        renderProposalPanel();
+      }
     }
   }
 
@@ -3611,21 +3854,63 @@
     }
   }
 
-  async function loadState() {
-    const gen = ++stateLoadGen;
-    setStatus("loading…");
+  async function loadWorkspaces(options) {
+    const token = options && Number.isSafeInteger(options.token) ? options.token : workspaceGen;
+    if (token !== workspaceGen) return null;
     try {
-      const data = await api("/api/state");
-      if (gen !== stateLoadGen) return;
+      const data = await api("/api/workspaces");
+      if (token !== workspaceGen) return null;
+      if (!data || typeof data !== "object") throw new Error("workspace discovery returned no data");
+      if (data.mode === "multi" || data.mode === "single") state.workspaceMode = data.mode;
+      if (typeof data.default_repo === "string" && validWorkspaceRepo(data.default_repo)) {
+        state.defaultRepo = data.default_repo;
+      }
+      state.workspaces = Array.isArray(data.workspaces) ? data.workspaces.slice(0, 200) : [];
+      renderWorkspaceControls();
+      return data;
+    } catch (error) {
+      if (token !== workspaceGen) return null;
+      // Older fixed-store servers have no discovery route. Keep the ordinary
+      // single-workspace UI usable and let /api/state provide its metadata.
+      state.workspaceMode = "single";
+      state.workspaces = [];
+      state.defaultRepo = state.defaultRepo || state.repoDraft || "omacom/omarchy";
+      renderWorkspaceControls();
+      return null;
+    }
+  }
+
+  function workspaceCurrent(repo, token) {
+    return token === workspaceGen && repo === state.repo;
+  }
+
+  async function loadState(repoOverride, options) {
+    const target = String(repoOverride || state.repo || state.repoDraft ||
+      state.defaultRepo || "omacom/omarchy").trim();
+    const token = options && Number.isSafeInteger(options.token) ? options.token : workspaceGen;
+    const gen = ++stateLoadGen;
+    if (token !== workspaceGen) return false;
+    if (!state.repo && !stateInitialized) {
+      state.repo = target;
+      state.repoDraft = target;
+      renderWorkspaceControls();
+    }
+    setStatus("loading " + target + "…");
+    try {
+      const statePath = options && options.unscoped ? "/api/state" : scopedGet("/api/state", target);
+      const data = await api(statePath);
+      if (gen !== stateLoadGen || !workspaceCurrent(target, token)) return false;
       applyState(data);
       exposeTriageApp();
       const c = (state.queue && state.queue.counts) || {};
       setStatus(
         `${state.prs.length} PRs · ${state.groups.length} groups · ${c.needs_you || 0} need you`
       );
+      return true;
     } catch (err) {
-      if (gen !== stateLoadGen) return;
-      setStatus("error: " + err.message);
+      if (gen !== stateLoadGen || token !== workspaceGen) return false;
+      setStatus("error loading " + target + ": " + err.message);
+      return false;
     }
   }
 
@@ -3644,35 +3929,76 @@
     return phase || "fetching…";
   }
 
-  async function pollProgressUntilDone() {
+  async function pollProgressUntilDone(repo, token) {
+    const stalePollError = () => Object.assign(
+      new Error("workspace changed while Sync was running"), { code: "stale_workspace" }
+    );
+    if (!workspaceCurrent(repo, token)) return Promise.reject(stalePollError());
+    if (fetchPollOwner) {
+      return Promise.reject(new Error("another Sync poll is already active"));
+    }
     return new Promise((resolve, reject) => {
+      let settled = false;
+      const owner = { timer: null };
+      const finish = (callback, value) => {
+        if (settled) return;
+        settled = true;
+        if (fetchPollOwner === owner) {
+          if (owner.timer !== null) clearTimeout(owner.timer);
+          if (fetchPollTimer === owner.timer) fetchPollTimer = null;
+          if (cancelFetchPoll === cancel) cancelFetchPoll = null;
+          fetchPollOwner = null;
+        }
+        callback(value);
+      };
+      const cancel = () => finish(reject, stalePollError());
+      fetchPollOwner = owner;
+      cancelFetchPoll = cancel;
       const tick = async () => {
+        if (settled) return;
+        if (!workspaceCurrent(repo, token)) {
+          cancel();
+          return;
+        }
         try {
-          const p = await api("/api/progress");
+          const p = await api(scopedGet("/api/progress", repo));
+          if (settled) return;
+          if (!workspaceCurrent(repo, token)) {
+            cancel();
+            return;
+          }
           setStatus(formatProgress(p));
           if (p.error && !p.running) {
             state.fetching = false;
             $("fetchBtn").disabled = false;
-            reject(new Error(p.error));
+            finish(reject, new Error(p.error));
             return;
           }
           if (p.ready && !p.running) {
             state.fetching = false;
             $("fetchBtn").disabled = false;
-            resolve(p);
+            finish(resolve, p);
             return;
           }
           if (!p.running && !p.ready && p.phase === "error") {
             state.fetching = false;
             $("fetchBtn").disabled = false;
-            reject(new Error(p.error || "fetch failed"));
+            finish(reject, new Error(p.error || "fetch failed"));
             return;
           }
-          fetchPollTimer = setTimeout(tick, 400);
+          if (!settled && fetchPollOwner === owner) {
+            owner.timer = setTimeout(tick, 400);
+            fetchPollTimer = owner.timer;
+          }
         } catch (err) {
+          if (settled) return;
+          if (!workspaceCurrent(repo, token)) {
+            cancel();
+            return;
+          }
           state.fetching = false;
           $("fetchBtn").disabled = false;
-          reject(err);
+          finish(reject, err);
         }
       };
       tick();
@@ -3680,9 +4006,25 @@
   }
 
   async function doFetch() {
+    const draft = $("repo") && $("repo").value.trim();
+    const requestedRaw = draft || state.defaultRepo || "omacom/omarchy";
+    const requestedRepo = canonicalWorkspaceRepo(requestedRaw);
+    if (!requestedRepo) {
+      setStatus("workspace must be owner/repo using safe repository characters");
+      return;
+    }
+    if (state.workspaceSwitching) {
+      setStatus("workspace is still opening; Sync will remain explicit");
+      return;
+    }
+    if (requestedRepo !== state.repo || !stateInitialized) {
+      const opened = await switchWorkspace(requestedRepo);
+      if (!opened || state.repo !== requestedRepo) return;
+    }
+    const token = workspaceGen;
     stateLoadGen += 1;
     const source = $("source").value;
-    const repo = $("repo").value.trim() || "omacom/omarchy";
+    const repo = state.repo;
     const limit = Number($("limit").value);
     const limitVal = Number.isFinite(limit) ? limit : 0;
     const refresh = !!$("refresh").checked;
@@ -3695,44 +4037,73 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ source, repo, limit: limitVal, refresh }),
       });
-      await pollProgressUntilDone();
+      if (!workspaceCurrent(repo, token)) return;
+      await pollProgressUntilDone(repo, token);
       const gen = ++stateLoadGen;
-      const data = await api("/api/state");
-      if (gen !== stateLoadGen) return;
+      const data = await api(scopedGet("/api/state", repo));
+      if (gen !== stateLoadGen || !workspaceCurrent(repo, token)) return;
       applyState(data);
       setStatus(`${state.prs.length} PRs · ${state.groups.length} groups`);
     } catch (err) {
+      if (err.code === "stale_workspace" || !workspaceCurrent(repo, token)) return;
       if (err.status === 409 && err.data && err.data.code === "fetch_busy") {
+        if (err.data.repo && err.data.repo !== repo) {
+          setStatus("Sync is busy for " + err.data.repo + "; this workspace was not fetched");
+          return;
+        }
         setStatus(formatProgress(err.data) + " (already running)");
         try {
-          await pollProgressUntilDone();
+          await pollProgressUntilDone(repo, token);
           const gen = ++stateLoadGen;
-          const data = await api("/api/state");
-          if (gen !== stateLoadGen) return;
+          const data = await api(scopedGet("/api/state", repo));
+          if (gen !== stateLoadGen || !workspaceCurrent(repo, token)) return;
           applyState(data);
           setStatus(`${state.prs.length} PRs · ${state.groups.length} groups`);
         } catch (e2) {
-          setStatus("fetch error: " + e2.message);
+          if (e2.code !== "stale_workspace" && workspaceCurrent(repo, token)) {
+            setStatus("fetch error: " + e2.message);
+          }
         }
       } else if (err.status === 409) {
         setStatus("sync blocked: " + err.message);
       } else {
         setStatus("fetch error: " + err.message);
         try {
-          const cached = await api("/api/state");
+          const cached = await api(scopedGet("/api/state", repo));
+          if (!workspaceCurrent(repo, token)) return;
           applyState(cached);
           setStatus("sync failed; showing the last usable cached snapshot · " + err.message);
         } catch (_) {}
       }
     } finally {
-      state.fetching = false;
-      $("fetchBtn").disabled = false;
-      if (fetchPollTimer) {
+      if (workspaceCurrent(repo, token)) {
+        state.fetching = false;
+        $("fetchBtn").disabled = false;
+      }
+      if (fetchPollTimer && workspaceCurrent(repo, token)) {
         clearTimeout(fetchPollTimer);
         fetchPollTimer = null;
       }
     }
   }
+
+  const repoInput = $("repo");
+  const openWorkspaceButton = $("openWorkspaceBtn");
+  const workspaceChoices = $("workspaceChoices");
+  async function openDraftWorkspace() {
+    const target = repoInput && repoInput.value.trim();
+    await switchWorkspace(target);
+  }
+  if (openWorkspaceButton) openWorkspaceButton.addEventListener("click", openDraftWorkspace);
+  if (repoInput) repoInput.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      openDraftWorkspace();
+    }
+  });
+  if (workspaceChoices) workspaceChoices.addEventListener("change", () => {
+    if (repoInput && workspaceChoices.value) repoInput.value = workspaceChoices.value;
+  });
 
   function pendingScopeGroups() {
     if (state.leftTab === "queue" && state.queuePile === "hotspots") return [];
@@ -3760,6 +4131,8 @@
     }
     const pendingBefore = advance ? pendingScopeGroups().map((item) => item.group_id) : [];
     const currentIndex = pendingBefore.indexOf(state.selectedGroupId);
+    const workspaceToken = workspaceGen;
+    const workspaceRepo = state.repo;
     const gen = ++stateLoadGen;
     const retryIdentity = [snapshotKey(), state.selectedGroupId, decision].join("|");
     let idempotencyKey = decisionRetries.get(retryIdentity);
@@ -3782,7 +4155,7 @@
           idempotency_key: idempotencyKey,
         }),
       });
-      if (gen !== stateLoadGen) return;
+      if (gen !== stateLoadGen || !workspaceCurrent(workspaceRepo, workspaceToken)) return;
       decisionRetries.delete(retryIdentity);
       applyState(data.state);
       let nextGroupId = null;
@@ -3808,7 +4181,7 @@
         (advance ? (nextGroupId ? " · next pending group" : " · no more pending groups in this filter") : ""));
       return true;
     } catch (err) {
-      if (gen !== stateLoadGen) return;
+      if (gen !== stateLoadGen || !workspaceCurrent(workspaceRepo, workspaceToken)) return;
       if (err.status === 409) {
         setStatus("decision not saved: evidence changed; reloading the current revisions");
         await loadState();
@@ -3929,6 +4302,39 @@
   window.addEventListener("popstate", () => {
     if (writingUrl) return;
     alignSidebar = true;
+    const requestedSearch = location.search;
+    const requested = new URLSearchParams(requestedSearch);
+    const requestedRepo = requested.get("repo") || state.defaultRepo || "omacom/omarchy";
+    if (requestedRepo !== state.repo && validWorkspaceRepo(requestedRepo)) {
+      const target = requestedRepo;
+      const priorRepo = state.repo;
+      const repoInput = $("repo");
+      if (repoInput) repoInput.value = target;
+      state.repoDraft = target;
+      switchWorkspace(target, { fromUrl: true }).then((opened) => {
+        if (!opened || state.repo !== target) {
+          if (state.repo === priorRepo) writeUrl(false);
+          return;
+        }
+        // The switch intentionally clears stale selection first. Restore the
+        // exact browser URL after the destination snapshot arrives so URL
+        // fields win over that repository's saved resume.
+        writingUrl = true;
+        history.replaceState(null, "", requestedSearch || "?");
+        writingUrl = false;
+        readUrl();
+        if ($("listFilter")) $("listFilter").value = state.filterQuery;
+        selectorCache.clear();
+        queueRowsCache = null;
+        paintLabelFilters();
+        normalizeSelection();
+        setLeftTab(state.leftTab, true);
+        render();
+        if (state.selectedFile) openFileQueue(state.selectedFile, { fromUrl: true });
+        renderUserDrawer();
+      });
+      return;
+    }
     const before = viewStateKey();
     readUrl();
     if ($("listFilter")) $("listFilter").value = state.filterQuery;
@@ -3945,6 +4351,9 @@
   });
   window.addEventListener("pagehide", () => {
     cancelPendingDiffScroll();
+    if (cancelFetchPoll) cancelFetchPoll();
+    else if (fetchPollTimer) clearTimeout(fetchPollTimer);
+    fetchPollTimer = null;
     ["group", "all", "queue", "member"].forEach(disposeVirtualizer);
     for (const entry of resourceRequests.values()) entry.controller.abort();
     resourceRequests.clear();
@@ -3953,11 +4362,22 @@
     if (event.persisted) {
       // A restored page may retain a stale server snapshot and a stale set of
       // WebMCP registrations. Force a fresh context before accepting actions.
+      const token = ++workspaceGen;
+      stateLoadGen += 1;
       stateInitialized = false;
+      persistResume();
+      invalidateSnapshotCaches();
+      state.repo = "";
       state.viewRevision = Number.isSafeInteger(state.viewRevision)
         ? state.viewRevision + 1 : 1;
-      persistResume();
-      bootstrapSession(true).then(loadState).catch((error) => setStatus("session error: " + error.message));
+      bootstrapSession(true).then(async () => {
+        const discovery = await loadWorkspaces({ token });
+        if (token !== workspaceGen) return;
+        readUrl();
+        await loadState(state.repo || state.repoDraft || state.defaultRepo, {
+          token, unscoped: !discovery,
+        });
+      }).catch((error) => setStatus("session error: " + error.message));
     }
   });
 
@@ -3972,5 +4392,16 @@
   }
   paintLabelFilters();
   paintPileNav();
-  bootstrapSession(false).then(loadState).catch((error) => setStatus("session error: " + error.message));
+  renderWorkspaceControls();
+  bootstrapSession(false).then(async () => {
+    const token = workspaceGen;
+    const discovery = await loadWorkspaces({ token });
+    if (token !== workspaceGen) return;
+    const target = urlRepoExplicit
+      ? state.repoDraft
+      : (state.defaultRepo || state.repoDraft || "omacom/omarchy");
+    if (discovery && discovery.default_repo && !urlRepoExplicit) state.repoDraft = target;
+    if ($("repo")) $("repo").value = target;
+    await loadState(target, { token: workspaceGen, unscoped: !discovery });
+  }).catch((error) => setStatus("session error: " + error.message));
 })();

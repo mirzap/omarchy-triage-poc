@@ -315,7 +315,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
         host=args.host,
         port=args.port,
         open_browser=not args.no_open,
-        store_path=Path(args.store) if args.store else DEFAULT_STORE_PATH,
+        store_path=Path(args.store).expanduser() if args.store else None,
+        workspace_root=Path(args.workspace_root).expanduser()
+        if getattr(args, "workspace_root", None) else None,
     )
     return 0
 
@@ -466,7 +468,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8741)
     p_serve.add_argument("--no-open", action="store_true", help="Do not open browser")
-    p_serve.add_argument("--store", default=str(DEFAULT_STORE_PATH))
+    workspace_mode = p_serve.add_mutually_exclusive_group()
+    workspace_mode.add_argument(
+        "--store", help="Fixed single-workspace store path (legacy compatibility mode)"
+    )
+    workspace_mode.add_argument(
+        "--workspace-root", help="Root for request-routed workspaces (default: .triage/workspaces)"
+    )
     p_serve.set_defaults(func=cmd_serve)
 
     p_mcp = sub.add_parser(

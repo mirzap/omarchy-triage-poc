@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Omarchy triage</title>
-  <link rel="stylesheet" href="/styles.css?v=28" />
+  <link rel="stylesheet" href="/styles.css?v=29" />
 </head>
 <body>
   <header class="topbar">
@@ -17,9 +17,14 @@
       </select>
     </label>
     <label class="field grow">
-      <span>repo</span>
-      <input id="repo" type="text" value="omacom/omarchy" spellcheck="false" />
+      <span>workspace repo (draft)</span>
+      <input id="repo" type="text" value="omacom/omarchy" spellcheck="false" aria-describedby="activeWorkspace" />
     </label>
+    <label class="field workspace-choice">
+      <span>saved workspaces</span>
+      <select id="workspaceChoices" aria-label="Saved workspaces"><option value="">discovering…</option></select>
+    </label>
+    <button id="openWorkspaceBtn" type="button" class="btn">Open workspace</button>
     <label class="field narrow">
       <span>file cap</span>
       <input id="limit" type="number" value="0" min="0" max="5000" placeholder="0 = 5000" title="Limits file-evidence downloads; the open-PR list is not truncated" />
@@ -28,7 +33,7 @@
       <input id="refresh" type="checkbox" checked /> refresh
     </label>
     <button id="fetchBtn" type="button" class="btn primary">Sync</button>
-    <div class="status-wrap"><div id="status" class="status">idle</div><div id="syncMeta" class="sync-meta"></div><div id="agentToolsStatus" class="agent-tools-status">Browser seam ready · WebMCP adapter not loaded</div></div>
+    <div class="status-wrap"><div id="activeWorkspace" class="workspace-active">active workspace: loading…</div><div id="status" class="status">idle</div><div id="syncMeta" class="sync-meta"></div><div id="agentToolsStatus" class="agent-tools-status">Browser seam ready · WebMCP adapter not loaded</div></div>
   </header>
 
   <main class="layout">
@@ -179,7 +184,7 @@
   </main>
 
   <script src="/vendor/virtual.js"></script>
-  <script src="/app.js?v=33"></script>
+  <script src="/app.js?v=34"></script>
   <script src="/webmcp.js?v=1"></script>
 </body>
 </html>
