@@ -883,6 +883,7 @@ class TriageHandler(BaseHTTPRequestHandler):
                 self._send_json(200, {
                     "tools": list(service_module.TOOL_DEFINITIONS),
                     "draft_tool": service_module.DRAFT_PROPOSAL_TOOL_DEFINITION,
+                    "draft_tools": list(service_module.DRAFT_TOOL_DEFINITIONS),
                 })
             elif path == "/api/session":
                 self._send_json(200, {"csrf_token": self.csrf_token, "origin": origin,
@@ -1052,6 +1053,16 @@ class TriageHandler(BaseHTTPRequestHandler):
                 self._post_tool_read(body)
             elif path == "/api/proposals/draft":
                 self._post_proposal_draft(body)
+            elif path == "/api/file-reviews/draft":
+                self._post_file_review_draft(body)
+            elif path == "/api/file-reviews":
+                self._post_file_review(body)
+            elif path == "/api/file-findings":
+                self._post_file_finding(body)
+            elif path.startswith("/api/file-findings/"):
+                self._post_file_finding_action(path, body)
+            elif path.startswith("/api/file-drafts/"):
+                self._post_file_draft_adoption(path, body)
             elif path == "/api/dispositions":
                 self._post_dispositions(body)
             elif path.startswith("/api/proposals/"):
@@ -1084,6 +1095,10 @@ class TriageHandler(BaseHTTPRequestHandler):
                                       "code": "incomplete_evidence"})
             elif isinstance(exc, KeyError):
                 self._send_json(404, {"error": "target not found", "code": "not_found"})
+            elif isinstance(exc, getattr(store_module, "UnknownReviewPathError", ())):
+                self._send_json(404, {"error": "path is not part of this pull "
+                                               "request revision",
+                                      "code": "unknown_path"})
             elif isinstance(exc, ValueError):
                 self._send_json(400, {"error": "request is invalid", "code": "invalid_request"})
             else:
@@ -1241,6 +1256,197 @@ class TriageHandler(BaseHTTPRequestHandler):
             "state": _state_payload(store_path, self._request_binding,
                                      mode=self.workspace_mode, repo=repo),
         })
+
+    def _actor(self, value: Any) -> str:
+        if not isinstance(value, str) or not 1 <= len(value.strip()) <= 256:
+            raise RequestProblem(400, "invalid_actor", "actor must be 1-256 characters")
+        return value.strip()
+
+    def _review_revision(self, value: Any) -> dict[str, Any]:
+        """Every file write must name the exact revision the reviewer saw."""
+        if not isinstance(value, dict):
+            raise RequestProblem(400, "revision_required",
+                                 "this write requires an exact revision ref")
+        return value
+
+    def _review_state(self, store_path: Path, repo: str) -> dict[str, Any]:
+        return _state_payload(store_path, self._request_binding,
+                              mode=self.workspace_mode, repo=repo)
+
+    def _post_file_review(self, body: dict[str, Any]) -> None:
+        """Mark or unmark one file as human-reviewed for one exact revision."""
+        self._fields(
+            body,
+            required={"repo", "pr", "path", "reviewed", "revision",
+                      "expected_store_version", "expected_snapshot_version",
+                      "idempotency_key", "actor"},
+            optional={"note", "expected_version"},
+        )
+        repo = _repo_key(body["repo"])
+        store_path, _ = self._route_request(repo, required=True)
+        self._require_initialized()
+        number = self._json_int(body["pr"], "pr", 1, 2_147_483_647)
+        file_path = _safe_file_path(body["path"])
+        reviewed = body["reviewed"]
+        if not isinstance(reviewed, bool):
+            raise RequestProblem(400, "invalid_reviewed", "reviewed must be a boolean")
+        note = body.get("note", "")
+        if not isinstance(note, str):
+            raise RequestProblem(400, "invalid_note", "note must be a string")
+        revision = self._review_revision(body["revision"])
+        expected_version, expected_snapshot = self._proposal_versions(body)
+        result = store_module.save_file_review(
+            store_path=store_path, repo=repo, pr=number, path=file_path,
+            reviewed=reviewed, revision=revision, note=note,
+            expected_version=expected_version,
+            expected_snapshot_version=expected_snapshot,
+            idempotency_key=self._proposal_key(body),
+            actor=self._actor(body["actor"]),
+        )
+        self._send_json(200, {**result, "state": self._review_state(store_path, repo)})
+
+    def _post_file_finding(self, body: dict[str, Any]) -> None:
+        """Record one human finding about one exact file revision."""
+        self._fields(
+            body,
+            required={"repo", "pr", "path", "severity", "title", "revision",
+                      "expected_store_version", "expected_snapshot_version",
+                      "idempotency_key", "actor"},
+            optional={"explanation", "evidence", "suggested_fix", "line", "hunk",
+                      "expected_version"},
+        )
+        repo = _repo_key(body["repo"])
+        store_path, _ = self._route_request(repo, required=True)
+        self._require_initialized()
+        number = self._json_int(body["pr"], "pr", 1, 2_147_483_647)
+        file_path = _safe_file_path(body["path"])
+        line = body.get("line")
+        if line is not None:
+            line = self._json_int(line, "line", 1, 2_000_000_000)
+        texts: dict[str, Any] = {}
+        for name in ("severity", "title", "explanation", "evidence",
+                     "suggested_fix", "hunk"):
+            value = body.get(name, "")
+            if not isinstance(value, str):
+                raise RequestProblem(400, f"invalid_{name}", f"{name} must be a string")
+            texts[name] = value
+        revision = self._review_revision(body["revision"])
+        expected_version, expected_snapshot = self._proposal_versions(body)
+        result = store_module.save_file_finding(
+            store_path=store_path, repo=repo, pr=number, path=file_path,
+            line=line, revision=revision,
+            expected_version=expected_version,
+            expected_snapshot_version=expected_snapshot,
+            idempotency_key=self._proposal_key(body),
+            actor=self._actor(body["actor"]), **texts,
+        )
+        self._send_json(201, {**result, "state": self._review_state(store_path, repo)})
+
+    def _post_file_finding_action(self, path: str, body: dict[str, Any]) -> None:
+        """Resolve, reopen, or dismiss one finding; nothing else changes."""
+        remainder = path[len("/api/file-findings/"):]
+        finding_id, separator, action = remainder.partition("/")
+        if not finding_id or not separator or action not in store_module.FINDING_ACTIONS:
+            raise RequestProblem(404, "not_found", "finding route not found")
+        self._fields(
+            body,
+            required={"repo", "expected_store_version", "expected_snapshot_version",
+                      "idempotency_key", "actor"},
+            optional={"expected_version"},
+        )
+        repo = _repo_key(body["repo"])
+        store_path, _ = self._route_request(repo, required=True)
+        self._require_initialized()
+        expected_version, expected_snapshot = self._proposal_versions(body)
+        result = store_module.update_file_finding(
+            finding_id, action, store_path=store_path, repo=repo,
+            expected_version=expected_version,
+            expected_snapshot_version=expected_snapshot,
+            idempotency_key=self._proposal_key(body),
+            actor=self._actor(body["actor"]),
+        )
+        self._send_json(200, {**result, "state": self._review_state(store_path, repo)})
+
+    def _post_file_draft_adoption(self, path: str, body: dict[str, Any]) -> None:
+        """Accept or dismiss one drafted finding as a deliberate human act.
+
+        Adoption lives only on this CSRF-guarded browser route.  No MCP or
+        WebMCP tool can reach it, so an agent can propose but never accept.
+        """
+        parts = path[len("/api/file-drafts/"):].split("/")
+        if len(parts) != 4 or parts[1] != "findings" or not parts[0] or not parts[2]:
+            raise RequestProblem(404, "not_found", "draft route not found")
+        draft_id, _findings, draft_finding_id, action = parts
+        if action not in {"accept", "dismiss"}:
+            raise RequestProblem(404, "not_found", "draft route not found")
+        self._fields(
+            body,
+            required={"repo", "expected_store_version", "expected_snapshot_version",
+                      "idempotency_key", "actor"},
+            optional={"expected_version"},
+        )
+        repo = _repo_key(body["repo"])
+        store_path, _ = self._route_request(repo, required=True)
+        self._require_initialized()
+        expected_version, expected_snapshot = self._proposal_versions(body)
+        result = store_module.adopt_draft_finding(
+            draft_id, draft_finding_id, action, store_path=store_path, repo=repo,
+            expected_version=expected_version,
+            expected_snapshot_version=expected_snapshot,
+            idempotency_key=self._proposal_key(body),
+            actor=self._actor(body["actor"]),
+        )
+        self._send_json(200, {**result, "state": self._review_state(store_path, repo)})
+
+    def _post_file_review_draft(self, body: dict[str, Any]) -> None:
+        """Accept one agent file-review draft; a draft never reviews or decides."""
+        self._fields(
+            body,
+            required={"repo", "pr", "revision", "expected_store_version",
+                      "expected_snapshot_version", "idempotency_key"},
+            optional={"findings", "coverage", "provenance", "context", "actor",
+                      "expected_version"},
+        )
+        repo = _repo_key(body["repo"])
+        store_path, _ = self._route_request(repo, required=True)
+        self._require_initialized()
+        number = self._json_int(body["pr"], "pr", 1, 2_147_483_647)
+        revision = self._review_revision(body["revision"])
+        findings = body.get("findings", [])
+        coverage = body.get("coverage", [])
+        for name, rows, cap in (("findings", findings, 100), ("coverage", coverage, 500)):
+            if not isinstance(rows, list) or len(rows) > cap:
+                raise RequestProblem(400, f"invalid_{name}",
+                                     f"{name} must be a bounded list")
+            if any(not isinstance(item, dict) for item in rows):
+                raise RequestProblem(400, f"invalid_{name}",
+                                     f"each {name} entry must be an object")
+        provenance = body.get("provenance", {})
+        context = body.get("context", {})
+        if not isinstance(provenance, dict) or not isinstance(context, dict):
+            raise RequestProblem(400, "invalid_request",
+                                 "provenance and context must be objects")
+        expected_version, expected_snapshot = self._proposal_versions(body)
+        request = service_module.FileReviewDraftRequest(
+            repo=repo, pr=number, revision=revision,
+            findings=tuple(findings), coverage=tuple(coverage),
+            expected_store_version=expected_version,
+            expected_snapshot_version=expected_snapshot,
+            idempotency_key=self._proposal_key(body),
+            provenance=provenance, context=context,
+        )
+        result = service_module.WorkspaceService(store_path).draft_file_review(
+            request, actor=self._actor(body.get("actor", "agent")),
+        )
+        if result.get("ok") is not True:
+            error = result.get("error") or {}
+            status = error.get("status", 500)
+            self._send_json(status if isinstance(status, int) else 500, result)
+            return
+        response = dict(result)
+        if isinstance(result.get("data"), dict):
+            response["draft"] = result["data"].get("draft")
+        self._send_json(201, response)
 
     def _post_proposal_transition(self, path: str, body: dict[str, Any]) -> None:
         prefix = "/api/proposals/"

@@ -137,9 +137,17 @@ triage history --store /path/to/store.json
 
 CLI and HTTP decisions use the current store version and an idempotency key. Stale submissions conflict instead of overwriting newer work. Decision events retain actor, time, repository, reviewed revisions, membership snapshot, and evidence completeness.
 
-The CLI examples above decide entire groups. In the dashboard, select a PR to
-record an individual decision in the **Decision for** tray (called a
-**disposition** in the API):
+The CLI examples above write a group-only rule. The dashboard keeps three
+separate concepts, and none of them implies another:
+
+| Concept | Scope | What it records |
+|---|---|---|
+| File review | one path at one exact PR revision | that you looked at that file |
+| Finding | one path at one exact PR revision | one concrete concern |
+| PR decision | the whole pull request at one revision | Keep/Duplicate/Reject/… |
+
+In the dashboard, use **Decide PR #N** in the pull-request header to record an
+individual decision (called a **disposition** in the API):
 
 | Decision | Meaning |
 |---|---|
@@ -150,16 +158,72 @@ record an individual decision in the **Decision for** tray (called a
 | Needs hardware | Requires validation on relevant hardware |
 | Upgrade risk | Requires upgrade-compatibility review |
 
-Enter a reason and save explicitly. **Preferred PR** is the canonical candidate
-and is selectable only for a duplicate decision. Keep and duplicate decisions
-require complete evidence. Saving one PR does not decide its siblings.
+The dialog is titled *Overall decision for PR #N · all X changed files* so the
+scope is unambiguous. Saved badges and group progress change only when a human
+explicitly saves or accepts: **Save PR decision**, **Save PR decisions** in a
+bulk review, or accepting an agent proposal. Editing in the dialog, marking
+files reviewed, recording findings, and adopting a drafted finding never move
+them. Enter a reason and save explicitly. **Duplicate
+of pull request** is a pull-request-level relation; it does not claim any file
+is equivalent and it does not Keep the other PR. Keep and Duplicate require
+complete revision evidence, and no checkbox substitutes for missing evidence.
+Keeping a PR that still has unresolved findings or incomplete file coverage
+additionally requires an explicit acknowledgement. Saving one PR does not
+decide its siblings, and resetting to pending stays available.
 
-The workbench opens the selected PR's diff first. Choose a file, then use
+### File review, findings, and coverage
+
+The **File review** bar above the diff works on the selected file only:
+
+- **Mark file reviewed** records that you looked at that exact file revision.
+  It is not approval, it is not proof the file is correct, and it never changes
+  a PR decision. It requires complete patch bytes for *that* file; a missing
+  patch elsewhere in the same pull request is irrelevant.
+- **Add finding** records one concern with a severity, optional line/hunk,
+  explanation, evidence, and suggested fix. A finding about a *missing* patch
+  is explicitly allowed. Resolving, reopening, or dismissing a finding changes
+  that finding and nothing else.
+- Human review coverage and agent inspection coverage are reported separately,
+  as in "You reviewed 1/3 files, Agent inspected 2/3 files". Agent inspection
+  never counts as your review, and a file with no recorded coverage makes no
+  claim either way.
+
+Every record is bound to one exact revision. When the revision changes, older
+file reviews and findings are shown as stale and need re-review; they are never
+silently rebound. Marking every file reviewed never auto-approves a PR.
+
+Finding bodies stay collapsed until you open them, and the file list, finding
+bodies, agent drafts, and one selected draft findings are paged independently,
+each with its own explicit load-more.
+
+### Bulk PR review
+
+**Bulk PR review** in the context column replaces the old front-and-centre
+group decision buttons. Choose the affected pull requests, read the current to
+new preview with its explicit overwrite warning, give a required reason,
+confirm, and the dashboard saves one individual decision per pull request
+atomically through the existing `save_dispositions` writer, sharing one event
+for provenance. A batch is capped at 200 pull requests, the confirmation resets
+whenever the chosen set or decision changes, and a Keep batch names every pull
+request that still has unresolved findings or unreviewed files in the
+acknowledgement copy. Accepting an agent proposal that Keeps such a pull
+request asks for the same named acknowledgement, and it adopts no agent file
+findings. None of these acknowledgements weakens the evidence gate: Keep and
+Duplicate still require complete revision evidence.
+
+Historic group-only rules are displayed read-only and clearly labelled; they
+are never backfilled into individual decisions, and the dashboard no longer
+offers a control that writes one. The `triage decide` CLI command and
+`POST /api/decide` remain available for compatibility.
+
+The workbench opens the selected pull-request diff first. Choose a file, then use
 **Compare with…** to add another group member. **Save & next pending** saves
 the individual decision and advances within the current filtered group scope.
-Group-wide actions, agent drafts, descriptions, and evidence details live in
-the context column. On small screens, switch between **Work list**, **Review**,
-and **Context**; workspace controls are under **Workspaces**.
+Bulk review, agent file findings, the overall PR proposal, descriptions, and
+evidence details live in the context column, which stays collapsed by default
+and overlays the diff instead of resizing it. On small screens, switch between
+**Work list**, **Review**, and **Context**; workspace controls are under
+**Workspaces**.
 
 ## Dashboard
 
@@ -225,8 +289,8 @@ After choosing **Compare with**, choose **Auto layout**, **Side by side**, or
 at least 740 CSS pixels wide. The layout choice is remembered in this browser;
 Side by side forces two columns even in a narrower window.
 
-The right sidebar can collapse to an icon menu; each icon opens its section in an overlay drawer without resizing the diff or changing the saved collapsed state. Close the drawer with its Close button, Escape, or a click outside it.
-Its visibility is remembered in this browser and applied before first paint.
+The right sidebar starts collapsed to an icon rail at every width; each icon opens its section in an overlay drawer without resizing the diff or changing the saved collapsed state. Close the drawer with its Close button, Escape, or a click outside it.
+A saved visibility preference still wins and is applied before first paint.
 The PR description sits below the title and starts collapsed for each selected PR.
 
 ## MCP and WebMCP
@@ -259,17 +323,39 @@ This command runs a stdio bridge, not an HTTP MCP endpoint. Configure your MCP
 client to launch it. The bridge talks only to the existing loopback backend;
 it does not open the store directly or start a dashboard or synchronization.
 
-Nine read tools expose the active workspace and cached evidence:
+Ten read tools expose the active workspace and cached evidence:
 `get_workspace`, `list_groups`, `search_prs`, `get_group`, `get_pr`,
-`read_patch`, `compare_prs`, `find_related`, and `get_history`.
+`read_patch`, `compare_prs`, `find_related`, `get_history`, and
+`get_file_review`.
 Results include repository/snapshot context, pagination, and evidence limits.
 
-The tenth tool, `propose_triage`, creates a revision-bound draft with proposed
-per-PR decisions, reasons, and optional canonical references. In the dashboard,
-**Agent drafts** expands to list recent proposals for the selected group.
-It has no drafts until a proposal is created; opening a group does not run AI.
-A human can inspect, edit, accept, or reject a draft. Standalone MCP does not
-expose proposal acceptance or a dedicated proposal-list/inspection tool.
+`get_file_review` returns, for one pull-request revision, the per-file human
+review state, the separate agent inspection coverage, finding bodies, and agent
+draft summaries. Its file manifest, finding list, draft list, and one selected
+draft findings page independently (`page`, `finding_page`, `draft_page`,
+`draft_finding_page`), so no single response has to carry every finding.
+Passing `path` scopes the finding list to one file and reports which manifest
+page holds it through `focus_page`; it never rewrites `page`, so following
+`retrieval.continuations` always advances. An unknown path is an explicit
+`not_found`.
+
+Two draft-only write tools exist, and neither can approve anything:
+
+- `propose_triage` creates a revision-bound draft with proposed per-PR
+  decisions, reasons, and optional canonical references. In the dashboard,
+  **Overall PR proposal** lists recent proposals for the selected group.
+- `propose_file_review` drafts file findings and explicit inspection coverage
+  (`inspected`, `skipped`, or `missing`) for one pull-request revision. Agent
+  coverage is never inferred from the absence of a drafted finding, and clean
+  files do not need a finding. In the dashboard, **Agent file findings** lists
+  these drafts.
+
+There are no drafts until an agent creates one; opening a group or a file runs
+no AI. An external agent can read review context and submit a draft. It can
+never mark a file human-reviewed, adopt a drafted finding, or finalize a pull
+request decision: those live only behind explicit, CSRF-guarded dashboard
+controls. Standalone MCP also does not expose proposal acceptance or a
+dedicated proposal-list/inspection tool.
 
 ### Pi and OMP
 
@@ -288,11 +374,14 @@ and configuration stay private.
 
 ### Browser tools
 
-On browsers with `document.modelContext` support, the app registers the nine
-read tools plus `get_view_context`, `set_filters`, `open_target`, and
-`show_proposal`. View actions reject stale context. WebMCP does not expose
-decision acceptance, Fetch, or reset. Unsupported browsers retain the normal
-dashboard without agent tools.
+On browsers with `document.modelContext` support, the app registers the ten
+read tools, the view actions `get_view_context`, `set_filters`, `open_target`,
+and `show_proposal`, and the single draft-only write `propose_file_review`.
+`open_target` may also open the file review or agent file findings panel;
+opening a panel is not a review, an adoption, or a decision. View and draft
+actions reject stale context. WebMCP does not expose marking a file reviewed,
+adopting a drafted finding, saving a pull-request decision, Fetch, or reset.
+Unsupported browsers retain the normal dashboard without agent tools.
 
 Connecting an agent does not establish that a human examined the evidence.
 Before using a hosted model, consider that retrieved PR content may be sent to

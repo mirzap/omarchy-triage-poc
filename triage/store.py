@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -11,6 +12,7 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Mapping
@@ -26,6 +28,27 @@ from triage.models import (
     RevisionEvidence,
     TrustedRule,
     revision_snapshot_digest,
+    unified_patch_line_counts,
+)
+from triage.reviews import (
+    COVERAGE_STATUSES,
+    DraftFinding,
+    FileCoverage,
+    FileFinding,
+    FileReview,
+    FileReviewDraft,
+    MAX_DRAFT_COVERAGE,
+    MAX_DRAFT_FINDINGS,
+    ReviewValidationError,
+    finding_sort_key,
+    review_actor,
+    review_identifier,
+    review_line,
+    review_path,
+    review_severity,
+    review_text,
+    revision_key,
+    same_revision,
 )
 
 DEFAULT_STORE_DIR = Path(".triage")
@@ -35,6 +58,8 @@ MAX_SAFE_INTEGER = 9_007_199_254_740_991
 _STORE_LOCK = threading.RLock()
 _DISPOSITION_IDEMPOTENCY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{7,127}\Z")
 MAX_PROPOSAL_ITEMS = 200
+MAX_FILE_REVIEW_PAGE = 200
+MAX_FILE_REVIEW_DRAFT_PAGE = 50
 
 
 class StoreError(RuntimeError):
@@ -74,6 +99,10 @@ class StoreVersionExhaustedError(StoreError, ValueError):
     """A store version can no longer be incremented safely for browser clients."""
 
 
+class UnknownReviewPathError(ValueError):
+    """A repository path is not part of the requested pull-request revision."""
+
+
 def _repo_key(repo: str | None) -> str:
     return (repo or "").strip().strip("/").lower()
 
@@ -93,6 +122,15 @@ def _empty_store() -> dict[str, Any]:
         "proposals": [],
         "proposal_events": [],
         "proposal_idempotency": {},
+        # File-level review is additive and lives beside PR decisions.  It is
+        # never merged into ``last_prs`` so an ordinary pipeline upsert cannot
+        # overwrite or wipe it.
+        "file_reviews": [],
+        "file_findings": [],
+        "file_coverage": [],
+        "file_review_drafts": [],
+        "file_review_events": [],
+        "file_review_idempotency": {},
         "legacy_decision_history": [],
         "trusted_rules": [],
         "last_groups": [],
@@ -128,6 +166,12 @@ def _materialize_identity(data: dict[str, Any]) -> dict[str, Any]:
     data.setdefault("proposals", [])
     data.setdefault("proposal_events", [])
     data.setdefault("proposal_idempotency", {})
+    data.setdefault("file_reviews", [])
+    data.setdefault("file_findings", [])
+    data.setdefault("file_coverage", [])
+    data.setdefault("file_review_drafts", [])
+    data.setdefault("file_review_events", [])
+    data.setdefault("file_review_idempotency", {})
     data.setdefault("legacy_decision_history", [])
     data.setdefault("schema_version", STORE_SCHEMA_VERSION)
 
@@ -253,6 +297,11 @@ def _validate_store(data: Any, *, source: Path | None = None) -> dict[str, Any]:
         "disposition_events",
         "proposals",
         "proposal_events",
+        "file_reviews",
+        "file_findings",
+        "file_coverage",
+        "file_review_drafts",
+        "file_review_events",
     ):
         value = data.get(key, [])
         if not isinstance(value, list):
@@ -271,6 +320,7 @@ def _validate_store(data: Any, *, source: Path | None = None) -> dict[str, Any]:
             )
     for key in (
         "decision_idempotency", "disposition_idempotency", "proposal_idempotency",
+        "file_review_idempotency",
     ):
         if not isinstance(data.get(key, {}), dict):
             raise StoreCorruptionError(
@@ -337,9 +387,46 @@ def _validate_store(data: Any, *, source: Path | None = None) -> dict[str, Any]:
             if proposal.status not in {"draft", "accepted", "edited", "rejected"}:
                 raise ValueError("invalid proposal status")
             _check_duplicate_cycles(list(proposal.items), {})
+        _validate_review_records(data)
     except (TypeError, ValueError, KeyError) as exc:
         raise StoreCorruptionError(f"invalid store structure{location}: {exc}") from exc
     return data
+
+
+def _validate_review_records(data: Mapping[str, Any]) -> None:
+    """Reject structurally invalid file-review rows before they are published."""
+    for raw in data.get("file_reviews", []):
+        if not isinstance(raw, dict):
+            raise TypeError("file review entry is not an object")
+        review = FileReview.from_dict(raw)
+        if not review.repo:
+            raise ValueError("file review identity is incomplete")
+    for raw in data.get("file_coverage", []):
+        if not isinstance(raw, dict):
+            raise TypeError("file coverage entry is not an object")
+        coverage = FileCoverage.from_dict(raw)
+        if not coverage.repo:
+            raise ValueError("file coverage identity is incomplete")
+    finding_ids: set[str] = set()
+    for raw in data.get("file_findings", []):
+        if not isinstance(raw, dict):
+            raise TypeError("file finding entry is not an object")
+        finding = FileFinding.from_dict(raw)
+        if not finding.repo:
+            raise ValueError("file finding identity is incomplete")
+        if finding.finding_id in finding_ids:
+            raise ValueError("file finding IDs must be unique")
+        finding_ids.add(finding.finding_id)
+    draft_ids: set[str] = set()
+    for raw in data.get("file_review_drafts", []):
+        if not isinstance(raw, dict):
+            raise TypeError("file review draft entry is not an object")
+        draft = FileReviewDraft.from_dict(raw)
+        if not draft.repo:
+            raise ValueError("file review draft identity is incomplete")
+        if draft.draft_id in draft_ids:
+            raise ValueError("file review draft IDs must be unique")
+        draft_ids.add(draft.draft_id)
 
 
 def _read_store_unlocked(path: Path) -> dict[str, Any]:
@@ -2121,7 +2208,54 @@ def overlap_for_group(
 
 
 
-def _slim_pr_for_ui(pr: dict[str, Any], disposition: Disposition | None = None) -> dict[str, Any]:
+def _stale_dispositions(
+    data: Mapping[str, Any],
+    repo: str,
+    current_revisions: Mapping[int, RevisionEvidence],
+) -> dict[int, dict[str, Any]]:
+    """Project the most recent decision that no longer matches its revision.
+
+    ``active_dispositions`` deliberately drops these rows so the queue keeps
+    treating the PR as pending.  Surfacing them separately lets the UI say
+    "reviewed at an older revision" instead of "never reviewed", without
+    changing queue precedence.
+    """
+    latest: dict[int, Disposition] = {}
+    for raw in data.get("dispositions") or []:
+        if not isinstance(raw, dict) or _normal_repo(raw.get("repo")) != repo:
+            continue
+        try:
+            item = Disposition.from_dict(raw)
+        except (TypeError, ValueError, KeyError):
+            continue
+        current = current_revisions.get(item.pr)
+        if current is not None and _revision_equal(item.revision, current):
+            continue
+        prior = latest.get(item.pr)
+        if prior is None or str(item.decided_at) >= str(prior.decided_at):
+            latest[item.pr] = item
+    return {
+        number: {
+            "disposition": item.disposition,
+            "reason": item.reason,
+            "duplicate_of": item.duplicate_of,
+            "actor": item.actor,
+            "decided_at": item.decided_at,
+            "event_id": item.event_id,
+            "source": item.source,
+            "revision": item.revision.to_dict(),
+        }
+        for number, item in latest.items()
+    }
+
+
+def _slim_pr_for_ui(
+    pr: dict[str, Any],
+    disposition: Disposition | None = None,
+    *,
+    review_counts: Mapping[str, int] | None = None,
+    stale_disposition: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     paths = pr.get("paths") or []
     if not paths:
         files = pr.get("files") or []
@@ -2154,12 +2288,30 @@ def _slim_pr_for_ui(pr: dict[str, Any], disposition: Disposition | None = None) 
         out["disposition_status"] = "pending"
         out["disposition_reason"] = ""
         out["duplicate_of"] = None
+        out["disposition_actor"] = ""
+        out["disposition_at"] = ""
+        out["disposition_event_id"] = ""
+        out["disposition_source"] = ""
     else:
         out["disposition"] = disposition.disposition
         out["disposition_status"] = disposition.disposition
         out["disposition_reason"] = disposition.reason
         out["duplicate_of"] = disposition.duplicate_of
         out["disposition_revision"] = disposition.revision.to_dict()
+        out["disposition_actor"] = disposition.actor
+        out["disposition_at"] = disposition.decided_at
+        out["disposition_event_id"] = disposition.event_id
+        out["disposition_source"] = disposition.source
+    # A decision recorded against an older revision is shown as stale, never as
+    # an active status, so the pending queue stays correct.
+    out["disposition_stale"] = bool(disposition is None and stale_disposition)
+    if disposition is None and stale_disposition:
+        out["stale_disposition"] = dict(stale_disposition)
+    out["review_counts"] = dict(review_counts or {
+        "files_reviewed": 0, "files_reviewed_stale": 0,
+        "findings_open": 0, "findings_total": 0, "findings_open_stale": 0,
+        "agent_inspected": 0, "agent_skipped": 0, "agent_missing": 0,
+    })
     return out
 
 
@@ -2271,6 +2423,8 @@ def ui_state_from_data(data: dict[str, Any]) -> dict[str, Any]:
         active_disposition_by_pr[number].to_dict()
         for number in sorted(active_disposition_by_pr)
     ]
+    review_counts = review_counts_by_pr(data, repo, current_revisions)
+    stale_disposition_by_pr = _stale_dispositions(data, repo, current_revisions)
     proposal_rows = []
     for raw in (data.get("proposals") or [])[-200:]:
         if isinstance(raw, dict) and _normal_repo(raw.get("repo")) == repo:
@@ -2294,7 +2448,12 @@ def ui_state_from_data(data: dict[str, Any]) -> dict[str, Any]:
             for g in data.get("last_groups", [])
         ],
         "prs": [
-            _slim_pr_for_ui(pr, active_disposition_by_pr.get(pr.get("number")))
+            _slim_pr_for_ui(
+                pr,
+                active_disposition_by_pr.get(pr.get("number")),
+                review_counts=review_counts.get(pr.get("number")),
+                stale_disposition=stale_disposition_by_pr.get(pr.get("number")),
+            )
             for pr in data.get("last_prs", [])
         ],
         "edges": [],
@@ -2313,3 +2472,1285 @@ def ui_state_from_data(data: dict[str, Any]) -> dict[str, Any]:
 def ui_state(path: Path = DEFAULT_STORE_PATH) -> dict[str, Any]:
     """Slim dashboard payload. Full overlap matrices are lazy via overlap_for_group."""
     return ui_state_from_data(load_store(path))
+
+
+# ---------------------------------------------------------------------------
+# File-level review: human reviews, findings, and agent drafts.
+#
+# These records are independent of PR dispositions in both directions.  A file
+# write never changes a disposition, and a disposition never marks a file
+# reviewed.  Every record is bound to one exact PR revision and is projected as
+# stale, never silently rebound, once that revision changes.
+# ---------------------------------------------------------------------------
+
+
+def _file_evidence_digest(record: Mapping[str, Any]) -> str:
+    """Digest one file entry so stale evidence stays explicitly identifiable."""
+    material = {
+        "path": str(record.get("path") or ""),
+        "previous_path": str(record.get("previous_path") or ""),
+        "status": str(record.get("status") or ""),
+        "additions": record.get("additions"),
+        "deletions": record.get("deletions"),
+        "patch": str(record.get("patch") or ""),
+        "patch_complete": record.get("patch_complete") is True,
+    }
+    encoded = json.dumps(
+        material, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _file_patch_complete(record: Mapping[str, Any] | None) -> bool:
+    """Return whether this one file has complete, self-consistent patch bytes.
+
+    Completeness is judged per file.  A missing patch elsewhere in the same PR
+    never blocks reviewing a file whose own evidence is complete.
+    """
+    if not isinstance(record, Mapping):
+        return False
+    patch = record.get("patch")
+    if not isinstance(patch, str) or not patch:
+        return False
+    if record.get("patch_complete") is not True:
+        return False
+    additions, deletions = unified_patch_line_counts(patch)
+    if additions is None or deletions is None:
+        return False
+    declared_additions = record.get("additions")
+    declared_deletions = record.get("deletions")
+    if declared_additions is not None and declared_additions != additions:
+        return False
+    if declared_deletions is not None and declared_deletions != deletions:
+        return False
+    return True
+
+
+def _find_file_record(
+    files: list[dict[str, Any]], path: str
+) -> dict[str, Any] | None:
+    exact = next((item for item in files if item.get("path") == path), None)
+    if exact is not None:
+        return exact
+    return next((item for item in files if item.get("previous_path") == path), None)
+
+
+def _canonical_file_record(
+    files: list[dict[str, Any]], path: str, *, manifest_complete: bool
+) -> tuple[dict[str, Any], str]:
+    """Resolve one manifest entry and return its canonical current path.
+
+    A renamed file is addressable by its old name, but every persisted record
+    and every projection key uses the entry current ``path``.  Without this a
+    rename would split one file into two independent review identities.
+    """
+    record = _find_file_record(files, path)
+    if record is None:
+        raise UnknownReviewPathError(
+            "path is not part of this pull request revision"
+            if manifest_complete
+            else "path is not in the available evidence for this revision"
+        )
+    canonical = str(record.get("path") or "")
+    if not canonical:
+        raise StoreCorruptionError("manifest entry has no path")
+    return record, canonical
+
+
+def _revision_identity(
+    revision: Mapping[str, Any] | None, pr: int
+) -> list[str] | None:
+    """Normalize a submitted revision ref for the idempotency request identity.
+
+    Two writes that differ only by the revision they claim to target are
+    different requests.  Replaying one under the other key must be rejected as
+    a reused key rather than returning the earlier success.
+    """
+    if revision is None:
+        return None
+    if not isinstance(revision, Mapping):
+        raise ValueError("revision must be an object")
+    candidate = RevisionEvidence.from_dict({**dict(revision), "pr_number": pr})
+    return list(revision_key(candidate))
+
+
+def _pr_review_evidence(
+    data: dict[str, Any], repo: str, number: int
+) -> tuple[RevisionEvidence, list[dict[str, Any]], bool]:
+    """Return a PR current identity, its authoritative manifest, and its bounds.
+
+    The manifest comes from the same pinned fixture/cache evidence the decision
+    writers use, never from the capped ``last_prs.paths`` summary, so a path
+    beyond the 500-path UI cap is still validated exactly.  No network request
+    is made, and ``path`` is never resolved on the local filesystem.
+    """
+    rows = _raw_pr_index(data)
+    raw = rows.get(number)
+    if raw is None:
+        raise KeyError(f"PR is not in the active snapshot: {number}")
+    source = _persisted_pr_scope(raw, repo, _source_key(data.get("source")))
+    version = int(data.get("store_version", 0))
+    if source == "fixtures":
+        files = raw.get("files")
+        if not isinstance(files, list) or any(
+            not isinstance(item, dict) for item in files
+        ):
+            raise StoreCorruptionError("persisted fixture evidence is malformed")
+        candidate = PullRequest.from_dict(
+            {**raw, "changed_files": files, "evidence_source": source}
+        )
+        candidate.cache_snapshot_id = ""
+        revision = candidate.revision_evidence()
+        stored_digest = str(raw.get("content_digest") or "")
+        if not stored_digest or revision.content_digest != stored_digest:
+            raise StoreConflictError(
+                "persisted evidence does not match the stored revision",
+                code="revision_conflict", current_repo=repo, current_version=version,
+            )
+        return revision, [dict(item) for item in files], True
+    if source != "github":
+        raise IncompleteEvidenceError("the active evidence source is unsupported")
+    snapshot_id = str(raw.get("cache_snapshot_id") or "")
+    if not snapshot_id:
+        raise IncompleteEvidenceError(
+            "GitHub evidence has no immutable cache snapshot"
+        )
+    from triage import gh
+    from triage.github import parse_repo
+
+    owner, name = parse_repo(repo)
+    captured = gh.cached_pr_evidence(owner, name, number, snapshot_id=snapshot_id)
+    if not isinstance(captured, dict) or not captured:
+        raise IncompleteEvidenceError(
+            "pinned GitHub evidence is unavailable; reload Cached or Refresh GitHub"
+        )
+    if captured.get("legacy_unverified") is True:
+        raise IncompleteEvidenceError("legacy GitHub evidence is unverified")
+    if captured.get("snapshot_id") != snapshot_id:
+        raise StoreConflictError(
+            "pinned cache snapshot changed", code="snapshot_conflict",
+            current_repo=repo, current_version=version,
+        )
+    meta = captured.get("meta")
+    files = captured.get("files")
+    if not isinstance(meta, dict) or not isinstance(files, list):
+        raise StoreCorruptionError("cached evidence is malformed")
+    if any(not isinstance(item, dict) for item in files):
+        raise StoreCorruptionError("cached evidence files are malformed")
+    sync = captured.get("sync")
+    if not isinstance(sync, Mapping):
+        raise StoreCorruptionError("cached evidence sync identity is missing")
+    if (
+        sync.get("repository") != repo
+        or sync.get("snapshot_id") != snapshot_id
+        or sync.get("schema_version") != 2
+    ):
+        raise StoreCorruptionError("cached evidence sync identity does not match")
+    returned_source = captured.get(
+        "source", meta.get("source", meta.get("evidence_source"))
+    )
+    if returned_source is not None and _source_key(returned_source) != "github":
+        raise StoreCorruptionError("cached evidence source does not match")
+    if type(meta.get("number")) is not int or meta.get("number") != number:
+        raise StoreCorruptionError("cached evidence PR number does not match")
+    returned_repo = meta.get("repository")
+    if not isinstance(returned_repo, str) or not returned_repo.strip():
+        raise StoreCorruptionError("cached evidence repository identity is missing")
+    if _repo_key(returned_repo) != repo:
+        raise StoreCorruptionError("cached evidence repository does not match")
+    if meta.get("snapshot_id") != snapshot_id:
+        raise StoreCorruptionError(
+            "cached evidence metadata snapshot does not match"
+        )
+    candidate = PullRequest.from_dict({
+        **meta, "number": number, "changed_files": files,
+        "evidence_source": "github", "cache_snapshot_id": snapshot_id,
+    })
+    candidate.cache_snapshot_id = snapshot_id
+    revision = candidate.revision_evidence()
+    for field in ("head_sha", "base_sha", "updated_at"):
+        expected = str(raw.get(field) or "")
+        actual = str(getattr(candidate, field, "") or "")
+        if not expected or not actual or expected != actual:
+            raise StoreConflictError(
+                "cached evidence does not match the stored revision",
+                code="revision_conflict", current_repo=repo, current_version=version,
+            )
+    expected_digest = str(raw.get("content_digest") or "")
+    if not expected_digest or revision.content_digest != expected_digest:
+        raise StoreConflictError(
+            "cached evidence does not match the stored revision",
+            code="revision_conflict", current_repo=repo, current_version=version,
+        )
+    declared = meta.get("file_count", meta.get("changed_files_count"))
+    manifest_complete = bool(
+        meta.get("files_cap_reached") is False
+        and type(declared) is int
+        and declared == len(files)
+    )
+    return revision, [dict(item) for item in files], manifest_complete
+
+
+def _review_target(
+    data: dict[str, Any],
+    repo: str,
+    pr: int,
+    path: str,
+    supplied_revision: Mapping[str, Any] | None,
+) -> tuple[RevisionEvidence, dict[str, Any], str, str, bool]:
+    """Bind one write to an exact PR revision and an exact manifest entry."""
+    revision, files, manifest_complete = _pr_review_evidence(data, repo, pr)
+    if supplied_revision is not None:
+        if not isinstance(supplied_revision, Mapping):
+            raise ValueError("revision must be an object")
+        candidate = RevisionEvidence.from_dict(
+            {**dict(supplied_revision), "pr_number": pr}
+        )
+        if not same_revision(candidate, revision):
+            raise StoreConflictError(
+                "file review targets a stale PR revision",
+                code="revision_conflict", current_repo=repo,
+                current_version=int(data.get("store_version", 0)),
+            )
+    record, canonical = _canonical_file_record(
+        files, path, manifest_complete=manifest_complete
+    )
+    return (
+        revision, record, canonical,
+        _file_evidence_digest(record), _file_patch_complete(record),
+    )
+
+
+def _review_idempotency(
+    data: dict[str, Any], key: str, identity: Mapping[str, Any]
+) -> dict[str, Any] | None:
+    if not key:
+        return None
+    prior = (data.get("file_review_idempotency") or {}).get(key)
+    if not isinstance(prior, dict):
+        return None
+    if prior.get("request") != dict(identity):
+        raise StoreConflictError(
+            "idempotency key was already used for different input",
+            code="idempotency_key_reused",
+            current_repo=_normal_repo(data.get("repo")),
+            current_version=int(data.get("store_version", 0)),
+        )
+    result = prior.get("result")
+    return dict(result) if isinstance(result, dict) else None
+
+
+def _record_review_idempotency(
+    data: dict[str, Any], key: str, identity: Mapping[str, Any],
+    result: Mapping[str, Any],
+) -> None:
+    if key:
+        data.setdefault("file_review_idempotency", {})[key] = {
+            "request": dict(identity), "result": dict(result),
+        }
+
+
+def _append_review_event(data: dict[str, Any], event: Mapping[str, Any]) -> None:
+    # The audit trail is append-only and is never trimmed.  Review history is
+    # durable work; readers page over it instead of the writer discarding it.
+    data.setdefault("file_review_events", []).append(dict(event))
+
+
+def _same_file_key(
+    raw: Any, repo: str, pr: int, path: str, revision: RevisionEvidence
+) -> bool:
+    if not isinstance(raw, dict) or _normal_repo(raw.get("repo")) != repo:
+        return False
+    if raw.get("pr", raw.get("pr_number")) != pr or raw.get("path") != path:
+        return False
+    try:
+        bound = RevisionEvidence.from_dict(raw.get("revision") or {})
+    except (TypeError, ValueError, KeyError):
+        return False
+    return same_revision(bound, revision)
+
+
+def _positive_pr(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError("pr must be a positive integer")
+    return value
+
+
+def save_file_review(
+    *,
+    store_path: Path = DEFAULT_STORE_PATH,
+    repo: str,
+    pr: int,
+    path: str,
+    reviewed: bool,
+    revision: Mapping[str, Any] | None = None,
+    note: str = "",
+    expected_version: int | None = None,
+    expected_snapshot_version: int | None = None,
+    idempotency_key: str | None = None,
+    actor: str = "human",
+) -> dict[str, Any]:
+    """Record or clear one human file review for one exact revision.
+
+    Marking a file reviewed is not approval and never changes a PR
+    disposition.  It requires complete patch evidence for *this* file only; a
+    missing patch elsewhere in the same pull request is irrelevant here.
+    """
+    key = _safe_disposition_key(idempotency_key)
+    actor = review_actor(actor, "human")
+    number = _positive_pr(pr)
+    file_path = review_path(path)
+    note_text = review_text(note, "note", limit=1000)
+    if not isinstance(reviewed, bool):
+        raise ValueError("reviewed must be a boolean")
+    revision_ref = _revision_identity(revision, number)
+    with _store_lock(store_path, exclusive=True) as resolved:
+        data = _read_store_unlocked(resolved)
+        active_repo, current_version, current_snapshot = _check_write_versions(
+            data, repo, expected_version=None, expected_snapshot_version=None,
+        )
+        identity = {
+            "kind": "file_review", "repo": active_repo, "pr": number,
+            "path": file_path, "reviewed": reviewed, "note": note_text,
+            "actor": actor, "revision": revision_ref,
+        }
+        prior = _review_idempotency(data, key, identity)
+        if prior is not None:
+            return prior
+        if (
+            expected_snapshot_version is not None
+            and expected_snapshot_version != current_snapshot
+        ):
+            raise StoreConflictError(
+                "repository snapshot changed", code="stale_snapshot_version",
+                current_repo=active_repo, current_version=current_version,
+            )
+        if expected_version is not None and expected_version != current_version:
+            raise StoreConflictError(
+                "store changed", code="stale_store_version",
+                current_repo=active_repo, current_version=current_version,
+            )
+        evidence, _record, canonical_path, digest, patch_complete = _review_target(
+            data, active_repo, number, file_path, revision
+        )
+        if reviewed and not patch_complete:
+            raise IncompleteEvidenceError(
+                "this file has no complete patch evidence; record a finding "
+                "about the missing patch instead of marking it reviewed"
+            )
+        now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+        event_id = f"file-review-{uuid.uuid4()}"
+        review = FileReview(
+            repo=active_repo, pr=number, path=canonical_path, revision=evidence,
+            reviewed=reviewed, actor=actor, reviewed_at=now, event_id=event_id,
+            source="human", note=note_text, file_digest=digest,
+        )
+        data["file_reviews"] = [
+            raw for raw in data.get("file_reviews") or []
+            if not _same_file_key(raw, active_repo, number, canonical_path, evidence)
+        ] + [review.to_dict()]
+        _append_review_event(data, {
+            "event_id": event_id, "kind": "file_review", "repo": active_repo,
+            "pr": number, "path": canonical_path, "reviewed": reviewed,
+            "actor": actor, "source": "human", "at": now,
+            "revision": evidence.to_dict(),
+        })
+        result = {"file_review": review.to_dict()}
+        _record_review_idempotency(data, key, identity, result)
+        data["store_version"] = _next_version(current_version, field="store_version")
+        _commit_store_unlocked(data, resolved)
+        return result
+
+
+def save_file_finding(
+    *,
+    store_path: Path = DEFAULT_STORE_PATH,
+    repo: str,
+    pr: int,
+    path: str,
+    severity: str,
+    title: str,
+    explanation: str = "",
+    evidence: str = "",
+    suggested_fix: str = "",
+    line: int | None = None,
+    hunk: str = "",
+    revision: Mapping[str, Any] | None = None,
+    expected_version: int | None = None,
+    expected_snapshot_version: int | None = None,
+    idempotency_key: str | None = None,
+    actor: str = "human",
+) -> dict[str, Any]:
+    """Record one human finding about an exact file revision.
+
+    A finding is explicitly allowed when the patch itself is missing; that is
+    often the only honest thing a reviewer can say about such a file.
+    """
+    key = _safe_disposition_key(idempotency_key)
+    actor = review_actor(actor, "human")
+    number = _positive_pr(pr)
+    file_path = review_path(path)
+    fields = {
+        "severity": review_severity(severity),
+        "title": review_text(title, "title", limit=200, required=True),
+        "explanation": review_text(explanation, "explanation", limit=4000),
+        "evidence": review_text(evidence, "evidence", limit=4000),
+        "suggested_fix": review_text(suggested_fix, "suggested_fix", limit=4000),
+        "line": review_line(line),
+        "hunk": review_text(hunk, "hunk", limit=200),
+    }
+    revision_ref = _revision_identity(revision, number)
+    with _store_lock(store_path, exclusive=True) as resolved:
+        data = _read_store_unlocked(resolved)
+        active_repo, current_version, current_snapshot = _check_write_versions(
+            data, repo, expected_version=None, expected_snapshot_version=None,
+        )
+        identity = {
+            "kind": "file_finding", "repo": active_repo, "pr": number,
+            "path": file_path, "actor": actor, "revision": revision_ref, **fields,
+        }
+        prior = _review_idempotency(data, key, identity)
+        if prior is not None:
+            return prior
+        if (
+            expected_snapshot_version is not None
+            and expected_snapshot_version != current_snapshot
+        ):
+            raise StoreConflictError(
+                "repository snapshot changed", code="stale_snapshot_version",
+                current_repo=active_repo, current_version=current_version,
+            )
+        if expected_version is not None and expected_version != current_version:
+            raise StoreConflictError(
+                "store changed", code="stale_store_version",
+                current_repo=active_repo, current_version=current_version,
+            )
+        bound, _record, canonical_path, digest, patch_complete = _review_target(
+            data, active_repo, number, file_path, revision
+        )
+        now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+        finding = FileFinding(
+            finding_id=f"finding-{uuid.uuid4()}", repo=active_repo, pr=number,
+            path=canonical_path, revision=bound, status="open", author=actor,
+            source="human", origin="human", created_at=now, updated_at=now,
+            file_digest=digest, about_missing_patch=not patch_complete, **fields,
+        )
+        data.setdefault("file_findings", []).append(finding.to_dict())
+        _append_review_event(data, {
+            "event_id": f"file-finding-{uuid.uuid4()}", "kind": "file_finding",
+            "action": "create", "repo": active_repo, "pr": number,
+            "path": canonical_path, "finding_id": finding.finding_id,
+            "actor": actor, "source": "human", "at": now,
+            "revision": bound.to_dict(),
+        })
+        result = {"finding": finding.to_dict()}
+        _record_review_idempotency(data, key, identity, result)
+        data["store_version"] = _next_version(current_version, field="store_version")
+        _commit_store_unlocked(data, resolved)
+        return result
+
+
+FINDING_ACTIONS = {"resolve": "resolved", "reopen": "open", "dismiss": "dismissed"}
+
+
+def update_file_finding(
+    finding_id: str,
+    action: str,
+    *,
+    store_path: Path = DEFAULT_STORE_PATH,
+    repo: str,
+    expected_version: int | None = None,
+    expected_snapshot_version: int | None = None,
+    idempotency_key: str | None = None,
+    actor: str = "human",
+) -> dict[str, Any]:
+    """Resolve, reopen, or dismiss one finding.
+
+    This changes the finding and nothing else.  It never records a file
+    review, never changes a PR disposition, and never rebinds stale evidence
+    to the current revision.
+    """
+    key = _safe_disposition_key(idempotency_key)
+    actor = review_actor(actor, "human")
+    identifier = review_identifier(finding_id, "finding_id")
+    if action not in FINDING_ACTIONS:
+        raise ValueError("action must be resolve|reopen|dismiss")
+    with _store_lock(store_path, exclusive=True) as resolved:
+        data = _read_store_unlocked(resolved)
+        active_repo, current_version, current_snapshot = _check_write_versions(
+            data, repo, expected_version=None, expected_snapshot_version=None,
+        )
+        identity = {
+            "kind": "file_finding_status", "repo": active_repo,
+            "finding_id": identifier, "action": action, "actor": actor,
+        }
+        prior = _review_idempotency(data, key, identity)
+        if prior is not None:
+            return prior
+        if (
+            expected_snapshot_version is not None
+            and expected_snapshot_version != current_snapshot
+        ):
+            raise StoreConflictError(
+                "repository snapshot changed", code="stale_snapshot_version",
+                current_repo=active_repo, current_version=current_version,
+            )
+        if expected_version is not None and expected_version != current_version:
+            raise StoreConflictError(
+                "store changed", code="stale_store_version",
+                current_repo=active_repo, current_version=current_version,
+            )
+        rows = data.setdefault("file_findings", [])
+        matches = [
+            index for index, raw in enumerate(rows)
+            if isinstance(raw, dict) and raw.get("finding_id") == identifier
+        ]
+        if len(matches) != 1:
+            if not matches:
+                raise KeyError(f"finding not found: {identifier}")
+            raise StoreCorruptionError(f"finding ID is not unique: {identifier}")
+        index = matches[0]
+        finding = FileFinding.from_dict(rows[index])
+        if _normal_repo(finding.repo) != active_repo:
+            raise StoreConflictError(
+                "finding repository does not match this store",
+                code="repository_conflict", current_repo=active_repo,
+                current_version=current_version,
+            )
+        now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+        updated = replace(
+            finding, status=FINDING_ACTIONS[action], updated_at=now,
+            status_actor=actor, status_at=now,
+        )
+        rows[index] = updated.to_dict()
+        _append_review_event(data, {
+            "event_id": f"file-finding-{uuid.uuid4()}", "kind": "file_finding",
+            "action": action, "repo": active_repo, "pr": updated.pr,
+            "path": updated.path, "finding_id": identifier, "actor": actor,
+            "source": "human", "at": now, "revision": updated.revision.to_dict(),
+        })
+        result = {"finding": updated.to_dict()}
+        _record_review_idempotency(data, key, identity, result)
+        data["store_version"] = _next_version(current_version, field="store_version")
+        _commit_store_unlocked(data, resolved)
+        return result
+
+
+def draft_file_review(
+    *,
+    store_path: Path = DEFAULT_STORE_PATH,
+    repo: str,
+    pr: int,
+    revision: Mapping[str, Any] | None = None,
+    findings: list[Mapping[str, Any]] | None = None,
+    coverage: list[Mapping[str, Any]] | None = None,
+    provenance: Mapping[str, Any] | None = None,
+    context: Mapping[str, Any] | None = None,
+    expected_version: int | None = None,
+    expected_snapshot_version: int | None = None,
+    idempotency_key: str | None = None,
+    actor: str = "agent",
+) -> dict[str, Any]:
+    """Persist one agent file-review draft; drafts are never reviews.
+
+    This writer can only add proposed findings and explicit coverage.  It
+    cannot mark a file human-reviewed, adopt a finding, or touch any PR
+    disposition, so exposing it to an external agent stays safe.
+    """
+    key = _safe_disposition_key(idempotency_key)
+    actor = review_actor(actor, "agent")
+    number = _positive_pr(pr)
+    raw_findings = list(findings or [])
+    raw_coverage = list(coverage or [])
+    if not raw_findings and not raw_coverage:
+        raise ValueError("a draft needs at least one finding or coverage record")
+    if len(raw_findings) > MAX_DRAFT_FINDINGS:
+        raise ValueError("a draft cannot exceed 100 findings")
+    if len(raw_coverage) > MAX_DRAFT_COVERAGE:
+        raise ValueError("a draft cannot exceed 500 coverage records")
+    revision_ref = _revision_identity(revision, number)
+    with _store_lock(store_path, exclusive=True) as resolved:
+        data = _read_store_unlocked(resolved)
+        active_repo, current_version, current_snapshot = _check_write_versions(
+            data, repo, expected_version=None, expected_snapshot_version=None,
+        )
+        identity = {
+            "kind": "file_review_draft", "repo": active_repo, "pr": number,
+            "actor": actor, "revision": revision_ref,
+            "findings": [dict(item) for item in raw_findings],
+            "coverage": [dict(item) for item in raw_coverage],
+            "provenance": dict(provenance or {}), "context": dict(context or {}),
+        }
+        prior = _review_idempotency(data, key, identity)
+        if prior is not None:
+            return prior
+        if (
+            expected_snapshot_version is not None
+            and expected_snapshot_version != current_snapshot
+        ):
+            raise StoreConflictError(
+                "repository snapshot changed", code="stale_snapshot_version",
+                current_repo=active_repo, current_version=current_version,
+            )
+        if expected_version is not None and expected_version != current_version:
+            raise StoreConflictError(
+                "store changed", code="stale_store_version",
+                current_repo=active_repo, current_version=current_version,
+            )
+        bound, files, manifest_complete = _pr_review_evidence(
+            data, active_repo, number
+        )
+        if revision is not None:
+            if not isinstance(revision, Mapping):
+                raise ValueError("revision must be an object")
+            supplied = RevisionEvidence.from_dict(
+                {**dict(revision), "pr_number": number}
+            )
+            if not same_revision(supplied, bound):
+                raise StoreConflictError(
+                    "draft targets a stale PR revision", code="revision_conflict",
+                    current_repo=active_repo, current_version=current_version,
+                )
+        now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+        draft_id = f"file-draft-{uuid.uuid4()}"
+        drafted: list[DraftFinding] = []
+        for item in raw_findings:
+            if not isinstance(item, Mapping):
+                raise ValueError("each drafted finding must be an object")
+            record, file_path = _canonical_file_record(
+                files, review_path(item.get("path")),
+                manifest_complete=manifest_complete,
+            )
+            drafted.append(DraftFinding(
+                draft_finding_id=f"df-{uuid.uuid4()}",
+                path=file_path,
+                severity=review_severity(item.get("severity")),
+                title=review_text(item.get("title"), "title", limit=200, required=True),
+                explanation=review_text(
+                    item.get("explanation"), "explanation", limit=4000
+                ),
+                evidence=review_text(item.get("evidence"), "evidence", limit=4000),
+                suggested_fix=review_text(
+                    item.get("suggested_fix"), "suggested_fix", limit=4000
+                ),
+                line=review_line(item.get("line")),
+                hunk=review_text(item.get("hunk"), "hunk", limit=200),
+                status="pending",
+                about_missing_patch=not _file_patch_complete(record),
+            ))
+        coverage_rows: list[FileCoverage] = []
+        seen_paths: set[str] = set()
+        for item in raw_coverage:
+            if not isinstance(item, Mapping):
+                raise ValueError("each coverage record must be an object")
+            record, file_path = _canonical_file_record(
+                files, review_path(item.get("path")),
+                manifest_complete=manifest_complete,
+            )
+            if file_path in seen_paths:
+                raise ValueError("coverage paths must be unique")
+            seen_paths.add(file_path)
+            status = item.get("status")
+            if status not in COVERAGE_STATUSES:
+                raise ValueError("coverage status must be inspected|skipped|missing")
+            if status == "inspected" and not str(record.get("patch") or ""):
+                raise ValueError(
+                    "inspected coverage requires available patch bytes; record "
+                    "missing instead"
+                )
+            coverage_rows.append(FileCoverage(
+                repo=active_repo, pr=number, path=file_path, revision=bound,
+                status=status,
+                note=review_text(item.get("note"), "note", limit=1000),
+                actor=actor, recorded_at=now, draft_id=draft_id,
+            ))
+        summary = {
+            name: sum(1 for row in coverage_rows if row.status == name)
+            for name in COVERAGE_STATUSES
+        }
+        draft = FileReviewDraft(
+            draft_id=draft_id, repo=active_repo, pr=number, revision=bound,
+            findings=tuple(drafted), coverage_summary=summary,
+            coverage_paths=tuple(row.path for row in coverage_rows),
+            provenance={
+                **dict(provenance or {}),
+                # Agent input may add provenance, but never impersonate a human
+                # or rewrite when this draft was created.
+                "actor": actor, "source": "agent", "created_at": now,
+            },
+            context={
+                **dict(context or {}), "repo": active_repo,
+                "store_version": current_version,
+                "snapshot_version": current_snapshot,
+                "manifest_complete": manifest_complete,
+            },
+            created_at=now, updated_at=now,
+        )
+        drafts = data.setdefault("file_review_drafts", [])
+        drafts.append(draft.to_dict())
+        updated_paths = {row.path for row in coverage_rows}
+        data["file_coverage"] = [
+            raw for raw in data.get("file_coverage") or []
+            if not (
+                isinstance(raw, dict)
+                and raw.get("path") in updated_paths
+                and _same_file_key(
+                    raw, active_repo, number, str(raw.get("path") or ""), bound
+                )
+            )
+        ] + [row.to_dict() for row in coverage_rows]
+        _append_review_event(data, {
+            "event_id": f"file-draft-{uuid.uuid4()}", "kind": "file_review_draft",
+            "action": "draft", "repo": active_repo, "pr": number,
+            "draft_id": draft_id, "actor": actor, "source": "agent", "at": now,
+            "finding_count": len(drafted), "coverage_summary": summary,
+            "revision": bound.to_dict(),
+        })
+        result = {"draft": draft.to_dict()}
+        _record_review_idempotency(data, key, identity, result)
+        data["store_version"] = _next_version(current_version, field="store_version")
+        _commit_store_unlocked(data, resolved)
+        return result
+
+
+def adopt_draft_finding(
+    draft_id: str,
+    draft_finding_id: str,
+    action: str,
+    *,
+    store_path: Path = DEFAULT_STORE_PATH,
+    repo: str,
+    expected_version: int | None = None,
+    expected_snapshot_version: int | None = None,
+    idempotency_key: str | None = None,
+    actor: str = "human",
+) -> dict[str, Any]:
+    """Accept or dismiss one drafted finding as a deliberate human act.
+
+    Adoption is intentionally reachable only from a human mutation endpoint.
+    It creates at most one finding, records who adopted it, and never applies
+    a PR decision of any kind.
+    """
+    key = _safe_disposition_key(idempotency_key)
+    actor = review_actor(actor, "human")
+    draft_key = review_identifier(draft_id, "draft_id")
+    finding_key = review_identifier(draft_finding_id, "draft_finding_id")
+    if action not in {"accept", "dismiss"}:
+        raise ValueError("action must be accept|dismiss")
+    with _store_lock(store_path, exclusive=True) as resolved:
+        data = _read_store_unlocked(resolved)
+        active_repo, current_version, current_snapshot = _check_write_versions(
+            data, repo, expected_version=None, expected_snapshot_version=None,
+        )
+        identity = {
+            "kind": "adopt_draft_finding", "repo": active_repo,
+            "draft_id": draft_key, "draft_finding_id": finding_key,
+            "action": action, "actor": actor,
+        }
+        prior = _review_idempotency(data, key, identity)
+        if prior is not None:
+            return prior
+        if (
+            expected_snapshot_version is not None
+            and expected_snapshot_version != current_snapshot
+        ):
+            raise StoreConflictError(
+                "repository snapshot changed", code="stale_snapshot_version",
+                current_repo=active_repo, current_version=current_version,
+            )
+        if expected_version is not None and expected_version != current_version:
+            raise StoreConflictError(
+                "store changed", code="stale_store_version",
+                current_repo=active_repo, current_version=current_version,
+            )
+        drafts = data.setdefault("file_review_drafts", [])
+        matches = [
+            index for index, raw in enumerate(drafts)
+            if isinstance(raw, dict) and raw.get("draft_id") == draft_key
+        ]
+        if len(matches) != 1:
+            if not matches:
+                raise KeyError(f"draft not found: {draft_key}")
+            raise StoreCorruptionError(f"draft ID is not unique: {draft_key}")
+        index = matches[0]
+        draft = FileReviewDraft.from_dict(drafts[index])
+        if _normal_repo(draft.repo) != active_repo:
+            raise StoreConflictError(
+                "draft repository does not match this store",
+                code="repository_conflict", current_repo=active_repo,
+                current_version=current_version,
+            )
+        selected = [
+            item for item in draft.findings if item.draft_finding_id == finding_key
+        ]
+        if not selected:
+            raise KeyError(f"drafted finding not found: {finding_key}")
+        drafted = selected[0]
+        if drafted.status != "pending":
+            # An already-decided drafted finding is returned unchanged so a
+            # repeated click cannot create a second copy of the same concern.
+            return {"draft": draft.to_dict(), "finding": None, "changed": False}
+        bound, files, manifest_complete = _pr_review_evidence(
+            data, active_repo, draft.pr
+        )
+        if not same_revision(draft.revision, bound):
+            raise StoreConflictError(
+                "this draft was written against an older revision; re-run the "
+                "agent before adopting it",
+                code="revision_conflict", current_repo=active_repo,
+                current_version=current_version,
+            )
+        now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+        created: FileFinding | None = None
+        if action == "accept":
+            record, canonical_path = _canonical_file_record(
+                files, drafted.path, manifest_complete=manifest_complete
+            )
+            created = FileFinding(
+                finding_id=f"finding-{uuid.uuid4()}", repo=active_repo,
+                pr=draft.pr, path=canonical_path, revision=bound,
+                severity=drafted.severity, title=drafted.title,
+                explanation=drafted.explanation, evidence=drafted.evidence,
+                suggested_fix=drafted.suggested_fix, status="open",
+                line=drafted.line, hunk=drafted.hunk,
+                # The original author stays visible; the human who accepted it
+                # is recorded separately rather than overwriting provenance.
+                author=str(draft.provenance.get("actor") or "agent"),
+                source="agent", origin="agent_draft", draft_id=draft_key,
+                draft_finding_id=finding_key, created_at=now, updated_at=now,
+                adopted_by=actor, adopted_at=now,
+                file_digest=_file_evidence_digest(record),
+                about_missing_patch=not _file_patch_complete(record),
+            )
+            data.setdefault("file_findings", []).append(created.to_dict())
+        decided = replace(
+            drafted, status="accepted" if action == "accept" else "dismissed",
+            decided_by=actor, decided_at=now,
+            adopted_finding_id=created.finding_id if created is not None else "",
+        )
+        updated_draft = replace(
+            draft,
+            findings=tuple(
+                decided if item.draft_finding_id == finding_key else item
+                for item in draft.findings
+            ),
+            updated_at=now,
+        )
+        drafts[index] = updated_draft.to_dict()
+        _append_review_event(data, {
+            "event_id": f"file-draft-{uuid.uuid4()}", "kind": "file_review_draft",
+            "action": action, "repo": active_repo, "pr": draft.pr,
+            "path": drafted.path, "draft_id": draft_key,
+            "draft_finding_id": finding_key,
+            "finding_id": created.finding_id if created is not None else "",
+            "actor": actor, "source": "human", "at": now,
+            "revision": bound.to_dict(),
+        })
+        result = {
+            "draft": updated_draft.to_dict(),
+            "finding": created.to_dict() if created is not None else None,
+            "changed": True,
+        }
+        _record_review_idempotency(data, key, identity, result)
+        data["store_version"] = _next_version(current_version, field="store_version")
+        _commit_store_unlocked(data, resolved)
+        return result
+
+
+def _review_rows_for_pr(
+    data: Mapping[str, Any], repo: str, pr: int
+) -> tuple[list[FileReview], list[FileFinding], list[FileCoverage]]:
+    """Collect every persisted file record for one PR, stale rows included."""
+    def scoped(rows: Any) -> list[dict[str, Any]]:
+        return [
+            raw for raw in rows or []
+            if isinstance(raw, dict)
+            and _normal_repo(raw.get("repo")) == repo
+            and raw.get("pr", raw.get("pr_number")) == pr
+        ]
+
+    reviews: list[FileReview] = []
+    findings: list[FileFinding] = []
+    coverage: list[FileCoverage] = []
+    for raw in scoped(data.get("file_reviews")):
+        try:
+            reviews.append(FileReview.from_dict(raw))
+        except (TypeError, ValueError, KeyError):
+            continue
+    for raw in scoped(data.get("file_findings")):
+        try:
+            findings.append(FileFinding.from_dict(raw))
+        except (TypeError, ValueError, KeyError):
+            continue
+    for raw in scoped(data.get("file_coverage")):
+        try:
+            coverage.append(FileCoverage.from_dict(raw))
+        except (TypeError, ValueError, KeyError):
+            continue
+    return reviews, findings, coverage
+
+
+def review_counts_by_pr(
+    data: Mapping[str, Any],
+    repo: str,
+    current_revisions: Mapping[int, RevisionEvidence],
+) -> dict[int, dict[str, int]]:
+    """Compact per-PR review counters for list rows and PR headers.
+
+    This deliberately returns counters only.  Manifests and finding bodies stay
+    in the dedicated paged file-review read so no list payload has to carry
+    them.
+    """
+    counts: dict[int, dict[str, int]] = {}
+
+    def bucket(number: Any) -> dict[str, int] | None:
+        if not isinstance(number, int) or isinstance(number, bool):
+            return None
+        return counts.setdefault(number, {
+            "files_reviewed": 0, "files_reviewed_stale": 0,
+            "findings_open": 0, "findings_total": 0, "findings_open_stale": 0,
+            "agent_inspected": 0, "agent_skipped": 0, "agent_missing": 0,
+        })
+
+    def current(number: int, revision: RevisionEvidence) -> bool:
+        active = current_revisions.get(number)
+        return active is not None and same_revision(revision, active)
+
+    for raw in data.get("file_reviews") or []:
+        if not isinstance(raw, dict) or _normal_repo(raw.get("repo")) != repo:
+            continue
+        try:
+            review = FileReview.from_dict(raw)
+        except (TypeError, ValueError, KeyError):
+            continue
+        row = bucket(review.pr)
+        if row is None or not review.reviewed:
+            continue
+        key = "files_reviewed" if current(review.pr, review.revision) else "files_reviewed_stale"
+        row[key] += 1
+    for raw in data.get("file_findings") or []:
+        if not isinstance(raw, dict) or _normal_repo(raw.get("repo")) != repo:
+            continue
+        try:
+            finding = FileFinding.from_dict(raw)
+        except (TypeError, ValueError, KeyError):
+            continue
+        row = bucket(finding.pr)
+        if row is None:
+            continue
+        if not current(finding.pr, finding.revision):
+            if finding.status == "open":
+                row["findings_open_stale"] += 1
+            continue
+        row["findings_total"] += 1
+        if finding.status == "open":
+            row["findings_open"] += 1
+    for raw in data.get("file_coverage") or []:
+        if not isinstance(raw, dict) or _normal_repo(raw.get("repo")) != repo:
+            continue
+        try:
+            item = FileCoverage.from_dict(raw)
+        except (TypeError, ValueError, KeyError):
+            continue
+        row = bucket(item.pr)
+        if row is None or not current(item.pr, item.revision):
+            continue
+        row["agent_" + item.status] += 1
+    return counts
+
+
+def _review_page(
+    rows: list[Any], page: int, page_size: int, *, limit: int, name: str
+) -> tuple[list[Any], dict[str, Any]]:
+    """Page one independent list and report an honest continuation."""
+    if isinstance(page, bool) or not isinstance(page, int) or page < 1:
+        raise ValueError(f"{name}_page must be a positive integer")
+    if (
+        isinstance(page_size, bool)
+        or not isinstance(page_size, int)
+        or not 1 <= page_size <= limit
+    ):
+        raise ValueError(f"{name}_page_size must be between 1 and {limit}")
+    total = len(rows)
+    pages = (total + page_size - 1) // page_size
+    start = (page - 1) * page_size
+    selected = rows[start:start + page_size]
+    return selected, {
+        f"{name}_page": page,
+        f"{name}_page_size": page_size,
+        f"{name}_count": total,
+        f"{name}_pages": pages,
+        f"next_{name}_page": page + 1 if page < pages else None,
+        f"{name}_remaining": max(0, total - min(total, start + page_size)),
+    }
+
+
+def file_review_state(
+    *,
+    store_path: Path = DEFAULT_STORE_PATH,
+    repo: str,
+    pr: int,
+    page: int = 1,
+    page_size: int = 50,
+    path: str | None = None,
+    finding_page: int = 1,
+    finding_page_size: int = 20,
+    draft_page: int = 1,
+    draft_page_size: int = 5,
+    draft_id: str | None = None,
+    draft_finding_page: int = 1,
+    draft_finding_page_size: int = 20,
+) -> dict[str, Any]:
+    """Return one file-review view for one exact pull-request revision.
+
+    Human review and agent inspection are reported as two separate coverages.
+    Neither is derived from the other, and a record bound to an older revision
+    is reported as stale rather than silently rebound to the current one.
+
+    The manifest, finding bodies, draft summaries, and one draft findings are
+    four independently paged lists.  File pages carry counters only, so no body
+    array is duplicated across pages and no single response has to contain
+    every finding.  ``path`` filters the finding list and reports which manifest
+    page holds that file; it never rewrites ``page``, so following
+    ``next_page`` always advances.
+    """
+    number = _positive_pr(pr)
+    if isinstance(page, bool) or not isinstance(page, int) or page < 1:
+        raise ValueError("page must be a positive integer")
+    if (
+        isinstance(page_size, bool)
+        or not isinstance(page_size, int)
+        or not 1 <= page_size <= MAX_FILE_REVIEW_PAGE
+    ):
+        raise ValueError("page_size must be between 1 and 200")
+    focus = review_path(path) if path else ""
+    selected_draft = review_identifier(draft_id, "draft_id") if draft_id else ""
+    data = load_store(store_path)
+    active_repo = _normal_repo(data.get("repo"))
+    if not active_repo or _normal_repo(repo) != active_repo:
+        raise StoreConflictError(
+            "repository does not match this store", code="repository_conflict",
+            current_repo=active_repo, current_version=int(data.get("store_version", 0)),
+        )
+    revision, files, manifest_complete = _pr_review_evidence(
+        data, active_repo, number
+    )
+    reviews, findings, coverage = _review_rows_for_pr(data, active_repo, number)
+    current_reviews = {
+        item.path: item for item in reviews if same_revision(item.revision, revision)
+    }
+    stale_review_paths = {
+        item.path for item in reviews
+        if item.reviewed and not same_revision(item.revision, revision)
+    }
+    current_coverage = {
+        item.path: item for item in coverage if same_revision(item.revision, revision)
+    }
+    current_findings: dict[str, list[FileFinding]] = {}
+    stale_findings: list[FileFinding] = []
+    for item in findings:
+        if same_revision(item.revision, revision):
+            current_findings.setdefault(item.path, []).append(item)
+        else:
+            stale_findings.append(item)
+    stale_by_path: dict[str, list[FileFinding]] = {}
+    for item in stale_findings:
+        stale_by_path.setdefault(item.path, []).append(item)
+
+    ordered = sorted(files, key=lambda item: str(item.get("path") or ""))
+    rows: list[dict[str, Any]] = []
+    for record in ordered:
+        file_path = str(record.get("path") or "")
+        if not file_path:
+            continue
+        human = current_reviews.get(file_path)
+        agent = current_coverage.get(file_path)
+        bucket = current_findings.get(file_path, [])
+        stale_bucket = stale_by_path.get(file_path, [])
+        patch_complete = _file_patch_complete(record)
+        rows.append({
+            "path": file_path,
+            "previous_path": str(record.get("previous_path") or ""),
+            "status": str(record.get("status") or ""),
+            "additions": record.get("additions"),
+            "deletions": record.get("deletions"),
+            "patch_available": bool(str(record.get("patch") or "")),
+            "patch_complete": patch_complete,
+            # A missing or partial patch can never be marked reviewed, but a
+            # finding about that missing evidence is always allowed.
+            "can_mark_reviewed": patch_complete,
+            "human": {
+                "reviewed": bool(human.reviewed) if human is not None else False,
+                "actor": human.actor if human is not None else "",
+                "at": human.reviewed_at if human is not None else "",
+                "event_id": human.event_id if human is not None else "",
+                "note": human.note if human is not None else "",
+                "stale_history": file_path in stale_review_paths,
+            },
+            "agent": {
+                "status": agent.status if agent is not None else "",
+                "actor": agent.actor if agent is not None else "",
+                "at": agent.recorded_at if agent is not None else "",
+                "note": agent.note if agent is not None else "",
+                "draft_id": agent.draft_id if agent is not None else "",
+            },
+            "findings": {
+                "total": len(bucket),
+                "open": sum(1 for item in bucket if item.status == "open"),
+                "resolved": sum(1 for item in bucket if item.status == "resolved"),
+                "dismissed": sum(1 for item in bucket if item.status == "dismissed"),
+                "stale_open": sum(1 for item in stale_bucket if item.status == "open"),
+            },
+        })
+
+    focus_page: int | None = None
+    if focus:
+        # The focused path only reports which manifest page holds it and scopes
+        # the finding list.  It never rewrites ``page``, so a caller following
+        # ``next_page`` with the same arguments always advances.
+        index = next(
+            (position for position, row in enumerate(rows) if row["path"] == focus),
+            None,
+        )
+        if index is None:
+            raise UnknownReviewPathError(
+                "path is not part of this pull request revision"
+                if manifest_complete
+                else "path is not in the available evidence for this revision"
+            )
+        focus_page = index // page_size + 1
+
+    selected, file_page_info = _review_page(
+        rows, page, page_size, limit=MAX_FILE_REVIEW_PAGE, name="file",
+    )
+
+    # Findings are their own list, not a per-file-page attachment, so a body is
+    # never repeated across manifest pages and never forced into one response.
+    scoped_current = [
+        item for bucket_items in current_findings.values() for item in bucket_items
+        if not focus or item.path == focus
+    ]
+    scoped_stale = [
+        item for item in stale_findings if not focus or item.path == focus
+    ]
+    finding_rows = [
+        {**item.to_dict(), "stale": False}
+        for item in sorted(scoped_current, key=finding_sort_key)
+    ] + [
+        {**item.to_dict(), "stale": True}
+        for item in sorted(scoped_stale, key=finding_sort_key)
+    ]
+    finding_page_rows, finding_page_info = _review_page(
+        finding_rows, finding_page, finding_page_size,
+        limit=MAX_FILE_REVIEW_PAGE, name="finding",
+    )
+
+    drafts = [
+        FileReviewDraft.from_dict(raw)
+        for raw in data.get("file_review_drafts") or []
+        if isinstance(raw, dict)
+        and _normal_repo(raw.get("repo")) == active_repo
+        and raw.get("pr", raw.get("pr_number")) == number
+    ]
+    # Newest first: the useful draft is usually the most recent one, and every
+    # older draft stays reachable through draft_page.
+    drafts.sort(key=lambda item: (item.created_at, item.draft_id), reverse=True)
+    shown_drafts, draft_page_info = _review_page(
+        drafts, draft_page, draft_page_size,
+        limit=MAX_FILE_REVIEW_DRAFT_PAGE, name="draft",
+    )
+    draft_rows = []
+    for draft in shown_drafts:
+        stale = not same_revision(draft.revision, revision)
+        draft_rows.append({
+            "draft_id": draft.draft_id,
+            "pr": draft.pr,
+            "created_at": draft.created_at,
+            "updated_at": draft.updated_at,
+            "actor": str(draft.provenance.get("actor") or ""),
+            "source": str(draft.provenance.get("source") or "agent"),
+            "stale": stale,
+            "revision": draft.revision.to_dict(),
+            "coverage_summary": dict(draft.coverage_summary),
+            "coverage_path_count": len(draft.coverage_paths),
+            "finding_count": len(draft.findings),
+            "pending": sum(1 for item in draft.findings if item.status == "pending"),
+            "accepted": sum(1 for item in draft.findings if item.status == "accepted"),
+            "dismissed": sum(1 for item in draft.findings if item.status == "dismissed"),
+        })
+    # Drafted finding bodies arrive only for one explicitly selected draft, and
+    # they are paged too, so a 100-finding draft never lands in one response.
+    draft_finding_rows: list[dict[str, Any]] = []
+    draft_finding_info = {
+        "draft_finding_page": 1, "draft_finding_page_size": draft_finding_page_size,
+        "draft_finding_count": 0, "draft_finding_pages": 0,
+        "next_draft_finding_page": None, "draft_finding_remaining": 0,
+    }
+    if selected_draft:
+        chosen = next(
+            (item for item in drafts if item.draft_id == selected_draft), None
+        )
+        if chosen is None:
+            raise KeyError(f"draft not found for this pull request: {selected_draft}")
+        bodies = [
+            {**item.to_dict(), "draft_id": chosen.draft_id,
+             "stale": not same_revision(chosen.revision, revision)}
+            for item in chosen.findings
+        ]
+        draft_finding_rows, draft_finding_info = _review_page(
+            bodies, draft_finding_page, draft_finding_page_size,
+            limit=MAX_FILE_REVIEW_PAGE, name="draft_finding",
+        )
+    reviewed_paths = {
+        row["path"] for row in rows if row["human"]["reviewed"] is True
+    }
+    return {
+        "repo": active_repo,
+        "pr": number,
+        "revision": revision.to_dict(),
+        "evidence_complete": revision.evidence_complete,
+        "manifest_complete": manifest_complete,
+        "files": selected,
+        "file_count": file_page_info["file_count"],
+        "page": file_page_info["file_page"],
+        "page_size": file_page_info["file_page_size"],
+        "pages": file_page_info["file_pages"],
+        "next_page": file_page_info["next_file_page"],
+        "truncated": file_page_info["file_remaining"],
+        "focus_path": focus,
+        "focus_page": focus_page,
+        "coverage": {
+            "files_total": len(rows),
+            "human_reviewed": len(reviewed_paths),
+            "human_pending": max(0, len(rows) - len(reviewed_paths)),
+            "human_stale": len(stale_review_paths - reviewed_paths),
+            "agent_inspected": sum(
+                1 for row in rows if row["agent"]["status"] == "inspected"
+            ),
+            "agent_skipped": sum(
+                1 for row in rows if row["agent"]["status"] == "skipped"
+            ),
+            "agent_missing": sum(
+                1 for row in rows if row["agent"]["status"] == "missing"
+            ),
+            "agent_unrecorded": sum(1 for row in rows if not row["agent"]["status"]),
+            "missing_patch": sum(1 for row in rows if not row["patch_complete"]),
+        },
+        "findings": finding_page_rows,
+        **finding_page_info,
+        "findings_total": sum(len(items) for items in current_findings.values()),
+        "findings_open_total": sum(
+            1 for items in current_findings.values() for item in items
+            if item.status == "open"
+        ),
+        "stale_findings_open_total": sum(
+            1 for item in stale_findings if item.status == "open"
+        ),
+        "drafts": draft_rows,
+        **draft_page_info,
+        "draft_id": selected_draft,
+        "draft_findings": draft_finding_rows,
+        **draft_finding_info,
+        "store_version": int(data.get("store_version", 0)),
+        "snapshot_version": int(data.get("snapshot_version", 0)),
+    }

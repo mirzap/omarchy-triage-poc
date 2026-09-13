@@ -43,7 +43,10 @@ def test_javascript_syntax_and_security_contracts() -> None:
     source = APP.read_text(encoding="utf-8")
     assert 'fetch("/api/session"' in source
     assert '"X-CSRF-Token": token' in source
-    assert "expected_version: state.storeVersion" in source
+    # Every mutation pins both the store and the repository snapshot. The old
+    # group-rule button path was removed from the UI; its API remains.
+    assert "expected_store_version: expected.store_version" in source
+    assert "expected_snapshot_version: expected.snapshot_version" in source
     assert "idempotency_key: idempotencyKey" in source
     assert "allow_external: true" in source
     assert "function loadRelatedIfOpen" in source

@@ -4,9 +4,9 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Triage Workspace</title>
-  <script src="/preferences.js?v=2"></script>
+  <script src="/preferences.js?v=3"></script>
   <link rel="stylesheet" href="/styles.css?v=32" />
-  <link rel="stylesheet" href="/workbench.css?v=6" />
+  <link rel="stylesheet" href="/workbench.css?v=8" />
 </head>
 <body>
   <header class="topbar">
@@ -108,6 +108,7 @@
         </div>
         <div id="fileNavigatorList" class="file-navigator-list" aria-label="Changed files"></div>
         <button id="fileNavigatorMore" class="btn file-navigator-more" type="button" hidden>Load more files</button>
+        <button id="fileNavigatorReviewMore" class="btn file-navigator-more" type="button" hidden>Load review status for more files</button>
       </section>
     </aside>
 
@@ -124,43 +125,36 @@
             </details>
             <div class="muted" id="detailMeta"></div>
           </div>
-          <button id="contextToggle" class="btn subtle" type="button" aria-controls="reviewContext" aria-expanded="false">Sidebar</button>
+          <div class="detail-actions">
+            <div class="pr-decision-status">
+              <span id="prDecisionBadge" class="pr-decision-badge">Not reviewed</span>
+            </div>
+            <button id="prDecisionBtn" class="btn accent" type="button" aria-haspopup="dialog">Decide PR</button>
+            <button id="contextToggle" class="btn subtle" type="button" aria-controls="reviewContext" aria-expanded="false">Sidebar</button>
+          </div>
         </div>
-<div id="reviewFiles" class="review-files" aria-label="Changed files"></div><div class="review-scroll">        <div class="block" id="diffBlock">
+<div id="reviewFiles" class="review-files" aria-label="Changed files"></div>
+<div id="fileReviewBar" class="file-review-bar" aria-label="File review"></div>
+<div class="review-scroll">        <details class="block file-findings" id="fileFindingsBlock">
+          <summary id="fileFindingsSummary" class="queue-toggle">Findings for this file</summary>
+          <div id="fileFindingsMeta" class="muted"></div>
+          <div id="fileFindingsList" class="file-findings-list"></div>
+          <button id="fileFindingsMore" class="btn" type="button" hidden>Load more findings</button>
+        </details>
+        <div class="block" id="diffBlock">
           <h3>Diff</h3>
           <div id="diffMeta" class="muted diff-hint"></div>
           <div id="diffPanels" class="diff-panels">
             <div class="muted diff-hint">Pick a file above to compare hunks.</div>
           </div>
         </div>
-</div><div id="decisionWarning" class="decision-warning" role="status"></div>        <section id="prDispositionPanel" class="block disposition-panel" hidden>
-          <div class="panel-heading">
-            <h3>Decision for</h3>
-            <span id="dispositionPrLabel" class="muted"></span>
-          </div>
-          <div id="decisionChips" class="decision-chips" role="group" aria-label="Decision for selected PR"></div>
-          <div class="disposition-form" id="dispositionEditor">
-            <label class="sr-only"><span>Decision</span><select id="dispositionSelect">
-              <option value="pending">pending</option>
-              <option value="keep">keep</option>
-              <option value="duplicate">duplicate</option>
-              <option value="reject">reject</option>
-              <option value="needs_hardware">needs hardware</option>
-              <option value="upgrade">can break upgrade</option>
-            </select></label>
-            <label id="canonicalWrap"><span>Preferred PR</span><select id="dispositionCanonical"><option value="">choose…</option></select></label>
-            <label class="wide"><span>reason (required)</span><textarea id="dispositionReason" rows="2" maxlength="1000" placeholder="Why did you choose this decision?"></textarea></label>
-            <button id="dispositionSaveBtn" type="button" class="btn accent">Save decision</button>
-          <button id="dispositionNextBtn" type="button" class="btn primary">Save &amp; next pending</button>
-            <button id="dispositionCancelBtn" type="button" class="btn">Cancel</button>
-          </div>
-          <div id="dispositionHint" class="muted"></div>
-        </section>
+</div><div id="decisionWarning" class="decision-warning" role="status"></div>
 </div>
 <nav class="context-rail" aria-label="Sidebar sections">
   <button class="btn" type="button" data-context-section="membersBlock" aria-label="Group members" title="Group members"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="9" cy="8" r="3"/><path d="M3 21v-3a6 6 0 0 1 12 0v3M16 5a3 3 0 0 1 0 6m2 3a5 5 0 0 1 3 5v2"/></svg></button>
-  <button class="btn" type="button" data-context-section="groupActions" aria-label="Group decisions" title="Group decisions"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L20 5M20 12v8H4V4h10"/></svg></button>
-  <button class="btn" type="button" data-context-section="proposalChooser" aria-label="Agent drafts" title="Agent drafts"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 3H4v18h16V11M10 14l1-4 8-8 3 3-8 8-4 1Z"/></svg></button>
+  <button class="btn" type="button" data-context-section="groupActions" aria-label="Bulk PR review" title="Bulk PR review"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L20 5M20 12v8H4V4h10"/></svg></button>
+  <button class="btn" type="button" data-context-section="fileDraftsBlock" aria-label="Agent file findings" title="Agent file findings"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h10l6 6v10H4Z"/><path d="M14 4v6h6M8 14h8M8 17h5"/></svg></button>
+  <button class="btn" type="button" data-context-section="proposalChooser" aria-label="Overall PR proposal" title="Overall PR proposal"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 3H4v18h16V11M10 14l1-4 8-8 3 3-8 8-4 1Z"/></svg></button>
   <button class="btn" type="button" data-context-section="relatedBlock" aria-label="Related patches" title="Related patches"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m10 13 4-4M8 16l-2 2a4 4 0 0 1-6-6l5-5a4 4 0 0 1 6 0m2 1 2-2a4 4 0 0 1 6 6l-5 5a4 4 0 0 1-6 0"/></svg></button>
   <button class="btn" type="button" data-context-section="overlapBlock" aria-label="File overlap" title="File overlap"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="12" height="12" rx="2"/><rect x="9" y="9" width="12" height="12" rx="2"/></svg></button>
   <button class="btn" type="button" data-context-section="evidenceDetails" aria-label="Evidence and labels" title="Evidence and labels"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 2 8 4v6c0 5-8 10-8 10S4 17 4 12V6l8-4Z"/><path d="m8 12 3 3 5-6"/></svg></button>
@@ -174,17 +168,24 @@
           </div>
         </div>
 <p class="context-note">Shared files suggest a connection, not equivalent changes.</p>
-<details class="block more-block" id="groupActions"><summary class="queue-toggle">Group decisions</summary><p class="muted">Applies locally to every current member revision. Not a GitHub approval.</p>          <div class="actions">
-            <button id="blessBtn" type="button" class="btn accent">Approve reviewed revisions</button>
-            <button id="hardwareBtn" type="button" class="btn">Needs hardware</button>
-            <button id="upgradeBtn" type="button" class="btn warn">Can break upgrade</button>
-            <button id="rejectBtn" type="button" class="btn danger">Reject</button>
-            <label class="save-next-choice"><span>save &amp; next decision</span><select id="saveNextDecision"><option value="">choose…</option><option value="approve">approve</option><option value="hardware">needs hardware</option><option value="upgrade">can break upgrade</option><option value="reject">reject</option></select></label>
-            <button id="saveNextBtn" type="button" class="btn" disabled>Save &amp; next pending</button>
+<details class="block more-block" id="groupActions"><summary class="queue-toggle">Bulk PR review</summary>
+          <p class="muted">Saves an individual decision for each pull request you choose. Local only; not a GitHub approval.</p>
+          <div id="groupProgress" class="group-progress"></div>
+          <div class="actions">
+            <button id="bulkReviewBtn" type="button" class="btn accent">Review multiple PRs…</button>
           </div>
+          <div id="legacyGroupRule" class="legacy-rule" hidden></div>
 </details>
+        <details class="block more-block" id="fileDraftsBlock">
+          <summary class="queue-toggle">Agent file findings <span id="fileDraftsCount"></span></summary>
+          <p class="muted">Drafted file findings and inspection coverage. Adopting one adds a finding only; it never marks a file reviewed and never decides the pull request.</p>
+          <div id="fileDraftsMeta" class="muted"></div>
+          <div id="fileDraftsList" class="file-drafts-list"></div>
+          <button id="fileDraftsMore" class="btn" type="button" hidden>Load more drafts</button>
+        </details>
         <details id="proposalChooser" class="block proposal-chooser">
-          <summary>Agent drafts <span id="proposalCount"></span></summary>
+          <summary>Overall PR proposal <span id="proposalCount"></span></summary>
+          <p class="muted">A group-scoped recommendation. Rejecting it rejects the proposal, not the pull requests.</p>
           <div class="panel-heading">
             <h3 class="sr-only">Recent proposals</h3>
             <span id="proposalChooserScope" class="muted"></span>
@@ -202,6 +203,10 @@
           <div id="proposalItems" class="proposal-items"></div>
           <label class="proposal-canonical"><span>proposal canonical PR</span><select id="proposalCanonical"><option value="">none</option></select></label>
           <label class="wide proposal-reject"><span>reject reason</span><textarea id="proposalRejectReason" rows="2" maxlength="1000" placeholder="Why this proposal is not actionable"></textarea></label>
+          <label id="proposalAckWrap" class="wide decision-ack" hidden>
+            <input id="proposalAck" type="checkbox" />
+            <span id="proposalAckText"></span>
+          </label>
           <div class="proposal-actions">
             <button id="proposalAcceptBtn" type="button" class="btn accent">Accept proposal</button>
             <button id="proposalEditBtn" type="button" class="btn">Save edits</button>
@@ -267,8 +272,115 @@
     <div id="fileNavigatorDialogBody" class="file-navigator-dialog-body"></div>
   </dialog>
 
+  <dialog id="prDecisionDialog" class="review-dialog" aria-labelledby="prDecisionTitle">
+    <form id="prDecisionForm" method="dialog" novalidate>
+      <div class="review-dialog-head">
+        <h2 id="prDecisionTitle">Overall decision for this pull request</h2>
+        <p id="prDecisionScope" class="dialog-intro">This decision applies to the whole pull request.</p>
+      </div>
+      <div class="review-dialog-body">
+        <div id="prDecisionSummary" class="decision-summary"></div>
+        <div id="decisionChips" class="decision-chips" role="group" aria-label="Overall decision for this pull request"></div>
+        <div class="disposition-form" id="dispositionEditor">
+          <label id="canonicalWrap"><span>Duplicate of pull request</span><select id="dispositionCanonical"><option value="">choose…</option></select></label>
+          <label class="wide"><span>reason (required)</span><textarea id="dispositionReason" rows="3" maxlength="1000" placeholder="Why did you choose this decision?"></textarea></label>
+          <label id="decisionAckWrap" class="wide decision-ack" hidden>
+            <input id="decisionAck" type="checkbox" />
+            <span id="decisionAckText">I am keeping this pull request even though review coverage is incomplete.</span>
+          </label>
+        </div>
+        <div id="dispositionHint" class="muted"></div>
+        <div id="prDecisionError" class="dialog-error" role="alert" aria-live="assertive"></div>
+      </div>
+      <div class="dialog-actions">
+        <button id="dispositionCancelBtn" type="button" class="btn">Cancel</button>
+        <button id="dispositionNextBtn" type="button" class="btn">Save &amp; next pending</button>
+        <button id="dispositionSaveBtn" type="submit" class="btn primary">Save PR decision</button>
+      </div>
+      <span id="dispositionPrLabel" class="sr-only"></span>
+    </form>
+  </dialog>
+
+  <dialog id="findingDialog" class="review-dialog" aria-labelledby="findingDialogTitle">
+    <form id="findingForm" method="dialog" novalidate>
+      <div class="review-dialog-head">
+        <h2 id="findingDialogTitle">Add finding</h2>
+        <p id="findingScope" class="dialog-intro">A finding records one concern about this exact file revision.</p>
+      </div>
+      <div class="review-dialog-body">
+        <label class="dialog-field" for="findingSeverity"><span>severity</span>
+          <select id="findingSeverity">
+            <option value="blocker">blocker</option>
+            <option value="major">major</option>
+            <option value="minor" selected>minor</option>
+            <option value="nit">nit</option>
+            <option value="question">question</option>
+          </select>
+        </label>
+        <label class="dialog-field" for="findingTitle"><span>title (required)</span>
+          <input id="findingTitle" type="text" maxlength="200" autocomplete="off" />
+        </label>
+        <label class="dialog-field" for="findingLine"><span>line (optional)</span>
+          <input id="findingLine" type="number" min="1" step="1" inputmode="numeric" />
+        </label>
+        <label class="dialog-field" for="findingHunk"><span>hunk (optional)</span>
+          <input id="findingHunk" type="text" maxlength="200" autocomplete="off" spellcheck="false" />
+        </label>
+        <label class="dialog-field wide" for="findingExplanation"><span>explanation</span>
+          <textarea id="findingExplanation" rows="3" maxlength="4000"></textarea>
+        </label>
+        <label class="dialog-field wide" for="findingEvidence"><span>evidence</span>
+          <textarea id="findingEvidence" rows="2" maxlength="4000"></textarea>
+        </label>
+        <label class="dialog-field wide" for="findingFix"><span>suggested fix</span>
+          <textarea id="findingFix" rows="2" maxlength="4000"></textarea>
+        </label>
+        <div id="findingError" class="dialog-error" role="alert" aria-live="assertive"></div>
+      </div>
+      <div class="dialog-actions">
+        <button id="findingCancelBtn" type="button" class="btn">Cancel</button>
+        <button id="findingSaveBtn" type="submit" class="btn primary">Save finding</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="bulkReviewDialog" class="review-dialog" aria-labelledby="bulkReviewTitle">
+    <form id="bulkReviewForm" method="dialog" novalidate>
+      <div class="review-dialog-head">
+        <h2 id="bulkReviewTitle">Bulk PR review</h2>
+        <p id="bulkReviewScope" class="dialog-intro">Choose the pull requests this decision should be saved for.</p>
+      </div>
+      <div class="review-dialog-body">
+        <label class="dialog-field" for="bulkReviewDecision"><span>decision for every chosen PR</span>
+          <select id="bulkReviewDecision">
+            <option value="">choose…</option>
+            <option value="keep">keep</option>
+            <option value="reject">reject</option>
+            <option value="needs_hardware">needs hardware</option>
+            <option value="upgrade">can break upgrade</option>
+            <option value="pending">reset to pending</option>
+          </select>
+        </label>
+        <label class="dialog-field wide" for="bulkReviewReason"><span>reason (required)</span>
+          <textarea id="bulkReviewReason" rows="3" maxlength="1000" placeholder="Why does this decision apply to all chosen PRs?"></textarea>
+        </label>
+        <div id="bulkReviewList" class="bulk-review-list" role="group" aria-label="Pull requests to change"></div>
+        <div id="bulkReviewPreview" class="bulk-review-preview" aria-live="polite"></div>
+        <label class="wide decision-ack" for="bulkReviewConfirm">
+          <input id="bulkReviewConfirm" type="checkbox" />
+          <span id="bulkReviewConfirmText">I reviewed the preview above and want to overwrite these saved decisions.</span>
+        </label>
+        <div id="bulkReviewError" class="dialog-error" role="alert" aria-live="assertive"></div>
+      </div>
+      <div class="dialog-actions">
+        <button id="bulkReviewCancelBtn" type="button" class="btn">Cancel</button>
+        <button id="bulkReviewSaveBtn" type="submit" class="btn primary">Save PR decisions</button>
+      </div>
+    </form>
+  </dialog>
+
   <script src="/vendor/virtual.js"></script>
-  <script src="/app.js?v=44"></script>
-  <script src="/webmcp.js?v=2"></script>
+  <script src="/app.js?v=45"></script>
+  <script src="/webmcp.js?v=3"></script>
 </body>
 </html>

@@ -6,12 +6,17 @@
   // never be allowed to add arbitrary browser tools.
   const READ_TOOL_NAMES = [
     "get_workspace", "list_groups", "search_prs", "get_group", "get_pr",
-    "read_patch", "compare_prs", "find_related", "get_history",
+    "read_patch", "compare_prs", "find_related", "get_history", "get_file_review",
   ];
   const VIEW_TOOL_NAMES = [
     "get_view_context", "set_filters", "open_target", "show_proposal",
   ];
-  const TOOL_COUNT = READ_TOOL_NAMES.length + VIEW_TOOL_NAMES.length;
+  // The only browser write. It can create an agent draft and nothing else:
+  // there is no tool here for marking a file reviewed, adopting a drafted
+  // finding, or saving a pull-request decision.
+  const DRAFT_TOOL_NAMES = ["propose_file_review"];
+  const TOOL_COUNT = READ_TOOL_NAMES.length + VIEW_TOOL_NAMES.length +
+    DRAFT_TOOL_NAMES.length;
 
   // Descriptions are application-authored and deliberately do not include
   // titles, descriptions, patches, or other data returned by the backend.
@@ -25,6 +30,7 @@
     compare_prs: "Compare bounded patch evidence for pull requests sharing a path.",
     find_related: "Read cached, advisory related-patch results for a pull request.",
     get_history: "Read revision-bound triage history from the local workspace.",
+    get_file_review: "Read per-file human review state, separate agent inspection coverage, findings, and agent drafts for one pull-request revision. Manifest, findings, and drafts page independently.",
   });
 
   const FILTER_LABELS = [
@@ -78,7 +84,49 @@
       group_id: { type: ["string", "null"], maxLength: 256 },
       pr: { type: ["integer", "null"], minimum: 1 },
       path: { type: ["string", "null"], maxLength: 1024 },
+      panel: { type: ["string", "null"], enum: ["diff", "file_review", "agent_file_findings", null] },
     },
+    additionalProperties: false,
+  };
+  const FINDING_SEVERITIES = ["blocker", "major", "minor", "nit", "question"];
+  const COVERAGE_STATUSES = ["inspected", "skipped", "missing"];
+  const DRAFT_SCHEMA = {
+    type: "object",
+    properties: {
+      pr: { type: "integer", minimum: 1 },
+      findings: {
+        type: "array", maxItems: 100,
+        items: {
+          type: "object", additionalProperties: false,
+          properties: {
+            path: { type: "string", maxLength: 1024 },
+            severity: { type: "string", enum: FINDING_SEVERITIES },
+            title: { type: "string", minLength: 1, maxLength: 200 },
+            explanation: { type: "string", maxLength: 4000 },
+            evidence: { type: "string", maxLength: 4000 },
+            suggested_fix: { type: "string", maxLength: 4000 },
+            line: { type: "integer", minimum: 1 },
+            hunk: { type: "string", maxLength: 200 },
+          },
+          required: ["path", "severity", "title", "explanation"],
+        },
+      },
+      coverage: {
+        type: "array", maxItems: 500,
+        items: {
+          type: "object", additionalProperties: false,
+          properties: {
+            path: { type: "string", maxLength: 1024 },
+            status: { type: "string", enum: COVERAGE_STATUSES },
+            note: { type: "string", maxLength: 1000 },
+          },
+          required: ["path", "status"],
+        },
+      },
+      provenance: { type: "object" },
+      idempotency_key: { type: "string", minLength: 8, maxLength: 128 },
+    },
+    required: ["pr"],
     additionalProperties: false,
   };
   const VIEW_ACTION_SCHEMAS = Object.freeze({
@@ -108,6 +156,19 @@
       required: ["proposal_id", "if_context"],
       additionalProperties: false,
     },
+  });
+  const DRAFT_ACTION_SCHEMAS = Object.freeze({
+    propose_file_review: {
+      type: "object",
+      properties: { draft: DRAFT_SCHEMA, if_context: IF_CONTEXT_SCHEMA },
+      required: ["draft", "if_context"],
+      additionalProperties: false,
+    },
+  });
+  const DRAFT_ANNOTATIONS = Object.freeze({
+    readOnlyHint: false,
+    consequentialHint: true,
+    untrustedContentHint: false,
   });
 
   let registration = null;
@@ -245,6 +306,26 @@
     };
   }
 
+  function draftExecutor(app) {
+    return async function (args, options) {
+      const signal = options && options.signal;
+      if (aborted(signal)) throw cancellationError();
+      try {
+        const value = args && typeof args === "object" ? args : {};
+        // A draft can be committed, so it is never retried automatically and
+        // never reaches any review, adoption, or decision path.
+        const result = await Promise.resolve(
+          app.draftFileReview(value.draft, value.if_context)
+        );
+        if (aborted(signal)) throw cancellationError();
+        return result;
+      } catch (error) {
+        if (error && error.name === "AbortError") throw error;
+        return failureEnvelope(error, app);
+      }
+    };
+  }
+
   function modelContext() {
     try {
       const value = typeof document !== "undefined" ? document.modelContext : null;
@@ -271,7 +352,8 @@
         typeof app.getViewContext !== "function" ||
         typeof app.setFilters !== "function" ||
         typeof app.openTarget !== "function" ||
-        typeof app.showProposal !== "function") {
+        typeof app.showProposal !== "function" ||
+        typeof app.draftFileReview !== "function") {
       status("Browser seam waiting · dashboard actions unavailable");
       return;
     }
@@ -303,6 +385,13 @@
               : "Request display of a local triage proposal after checking the current view context.",
         inputSchema: copySchema(VIEW_ACTION_SCHEMAS[name]),
         annotations: name === "get_view_context" ? CONTEXT_ANNOTATIONS : VIEW_ANNOTATIONS,
+      }))).concat(DRAFT_TOOL_NAMES.map((name) => ({
+        name,
+        description: "Draft file findings and explicit inspection coverage for " +
+          "human review after checking the current view context. This never marks " +
+          "a file reviewed, never accepts a draft, and never decides a pull request.",
+        inputSchema: copySchema(DRAFT_ACTION_SCHEMAS[name]),
+        annotations: DRAFT_ANNOTATIONS,
       })));
 
       for (const definition of definitions) {
@@ -313,7 +402,9 @@
           annotations: definition.annotations,
           execute: READ_TOOL_NAMES.includes(definition.name)
             ? readExecutor(app, definition.name)
-            : viewExecutor(app, definition.name),
+            : DRAFT_TOOL_NAMES.includes(definition.name)
+              ? draftExecutor(app)
+              : viewExecutor(app, definition.name),
         }, { signal: record.controller.signal });
         if (registration !== record || record.generation !== generation ||
             aborted(record.controller.signal)) return;

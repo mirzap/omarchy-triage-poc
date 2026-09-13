@@ -25,10 +25,16 @@ from triage.models import (
     RevisionEvidence,
     unified_patch_line_counts,
 )
+from triage.reviews import (
+    COVERAGE_STATUSES,
+    FINDING_SEVERITIES,
+    ReviewValidationError,
+)
 
 Envelope = dict[str, Any]
 MAX_INT = 9_007_199_254_740_991
 MAX_PAGE = 80
+MAX_DRAFT_PAGE = 50
 MAX_GROUP_MEMBERS = 5_000
 MAX_PR_LIST = 200
 MAX_PATCH_CHUNK = 16_384
@@ -43,6 +49,7 @@ GROUP_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
 READ_OPERATIONS = (
     "get_workspace", "list_groups", "search_prs", "get_group", "get_pr",
     "read_patch", "compare_prs", "find_related", "get_history",
+    "get_file_review",
 )
 _READ_SET = frozenset(READ_OPERATIONS)
 _LABELS = frozenset({
@@ -107,6 +114,26 @@ class ProposalRequest:
     group_id: str
     items: tuple[Mapping[str, Any], ...]
     canonical_pr: int | None = None
+    expected_store_version: int | None = None
+    expected_snapshot_version: int | None = None
+    idempotency_key: str | None = None
+    provenance: Mapping[str, Any] | None = None
+    context: Mapping[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class FileReviewDraftRequest:
+    """Typed request for an agent file-review draft.
+
+    A draft carries proposed findings and explicit coverage only.  There is no
+    field here that could mark a file human-reviewed or decide a pull request.
+    """
+
+    repo: str
+    pr: int
+    revision: Mapping[str, Any] | None = None
+    findings: tuple[Mapping[str, Any], ...] = ()
+    coverage: tuple[Mapping[str, Any], ...] = ()
     expected_store_version: int | None = None
     expected_snapshot_version: int | None = None
     idempotency_key: str | None = None
@@ -189,6 +216,24 @@ TOOL_DEFINITIONS: tuple[dict[str, Any], ...] = (
     _tool("get_history", {"page": {"type": "integer", "minimum": 1},
         "page_size": {"type": "integer", "minimum": 1, "maximum": MAX_PAGE},
         "filters": _HISTORY_FILTER_SCHEMA}, ["repo"]),
+    _tool("get_file_review", {"pr": {"type": "integer", "minimum": 1},
+        "path": {"type": "string", "maxLength": 1024},
+        "page": {"type": "integer", "minimum": 1},
+        "page_size": {"type": "integer", "minimum": 1, "maximum": MAX_PAGE},
+        "finding_page": {"type": "integer", "minimum": 1},
+        "finding_page_size": {"type": "integer", "minimum": 1, "maximum": MAX_PAGE},
+        "draft_page": {"type": "integer", "minimum": 1},
+        "draft_page_size": {"type": "integer", "minimum": 1, "maximum": MAX_DRAFT_PAGE},
+        "draft_id": {"type": "string", "maxLength": 128},
+        "draft_finding_page": {"type": "integer", "minimum": 1},
+        "draft_finding_page_size": {"type": "integer", "minimum": 1, "maximum": MAX_PAGE}},
+        ["repo", "pr"],
+        description=("Read file review state for one pull-request revision. The "
+                     "file manifest, finding bodies, agent draft summaries, and "
+                     "one selected draft findings are four independently paged "
+                     "lists; file rows carry counters only. Pass path to scope "
+                     "findings to one file and learn which manifest page holds "
+                     "it. Results are advisory.")),
 )
 
 # Exposed for the later stdio/WebMCP adapters.  It intentionally is not in
@@ -218,6 +263,48 @@ DRAFT_PROPOSAL_TOOL_DEFINITION: dict[str, Any] = {
     }, ["repo", "group_id", "items", "expected_store_version",
         "expected_snapshot_version", "idempotency_key"]),
 }
+
+# The second draft-only write.  It can add proposed findings and explicit
+# inspection coverage; it has no representation for a human file review, a
+# draft acceptance, or a pull-request disposition.
+DRAFT_FILE_REVIEW_TOOL_DEFINITION: dict[str, Any] = {
+    "name": "propose_file_review",
+    "description": ("Draft file-level findings and explicit inspection coverage "
+                    "for human review. Never marks a file reviewed, never "
+                    "accepts a draft, and never decides a pull request."),
+    "read_only": False,
+    "draft_only": True,
+    "inputSchema": _schema({
+        "pr": {"type": "integer", "minimum": 1},
+        "revision": {"type": "object"},
+        "findings": {"type": "array", "maxItems": 100, "items": {
+            "type": "object", "additionalProperties": False, "properties": {
+                "path": {"type": "string", "maxLength": 1024},
+                "severity": {"type": "string", "enum": [*FINDING_SEVERITIES]},
+                "title": {"type": "string", "minLength": 1, "maxLength": 200},
+                "explanation": {"type": "string", "maxLength": 4000},
+                "evidence": {"type": "string", "maxLength": 4000},
+                "suggested_fix": {"type": "string", "maxLength": 4000},
+                "line": {"type": "integer", "minimum": 1},
+                "hunk": {"type": "string", "maxLength": 200},
+            }, "required": ["path", "severity", "title", "explanation"]}},
+        "coverage": {"type": "array", "maxItems": 500, "items": {
+            "type": "object", "additionalProperties": False, "properties": {
+                "path": {"type": "string", "maxLength": 1024},
+                "status": {"type": "string", "enum": [*COVERAGE_STATUSES]},
+                "note": {"type": "string", "maxLength": 1000},
+            }, "required": ["path", "status"]}},
+        "idempotency_key": {"type": "string", "minLength": 8, "maxLength": 128},
+        "provenance": {"type": "object"},
+        "context": {"type": "object"},
+    }, ["repo", "pr", "revision", "expected_store_version",
+        "expected_snapshot_version", "idempotency_key"]),
+}
+
+DRAFT_TOOL_DEFINITIONS: tuple[dict[str, Any], ...] = (
+    DRAFT_PROPOSAL_TOOL_DEFINITION,
+    DRAFT_FILE_REVIEW_TOOL_DEFINITION,
+)
 
 
 def _error(status: int, code: str, message: str, *, retryable: bool = False,
@@ -375,7 +462,13 @@ def _retrieval_plan(result: Envelope, operation: str, args: Mapping[str, Any]) -
         calls.append({"tool": operation, "args": {**pinned, "page": next_page}})
     fields = {"get_group": (("next_member_page", "member_page"), ("next_shared_file_page", "shared_file_page")),
               "get_pr": (("next_file_page", "file_page"),),
-              "read_patch": (("next_patch_offset", "patch_offset"),)}
+              "read_patch": (("next_patch_offset", "patch_offset"),),
+              # The manifest page is emitted by the generic page envelope above.
+              # These three lists are independent, so each advertises its own
+              # bounded, version-pinned continuation.
+              "get_file_review": (("next_finding_page", "finding_page"),
+                                  ("next_draft_page", "draft_page"),
+                                  ("next_draft_finding_page", "draft_finding_page"))}
     for output, parameter in fields.get(operation, ()):
         if data.get(output) is not None:
             calls.append({"tool": operation, "args": {**pinned, parameter: data[output]}})
@@ -813,6 +906,38 @@ class WorkspaceService:
         except (store.StoreError, ValueError, KeyError, TypeError) as exc:
             raise _error(400, "invalid_request", str(exc)) from exc
 
+    def draft_file_review(
+        self, request: FileReviewDraftRequest, *, actor: str = "agent"
+    ) -> Envelope:
+        """Create an agent file-review draft through the sole store writer."""
+        if not isinstance(request, FileReviewDraftRequest):
+            raise _error(400, "invalid_request", "request must be FileReviewDraftRequest")
+        try:
+            result = store.draft_file_review(
+                store_path=self.store_path, repo=request.repo, pr=request.pr,
+                revision=request.revision,
+                findings=[dict(item) for item in request.findings],
+                coverage=[dict(item) for item in request.coverage],
+                provenance=request.provenance, context=request.context,
+                expected_version=request.expected_store_version,
+                expected_snapshot_version=request.expected_snapshot_version,
+                idempotency_key=request.idempotency_key, actor=actor,
+            )
+            ctx = _context(self.store_path, {"repo": request.repo})
+            return _envelope(ctx, result)
+        except store.UnknownReviewPathError as exc:
+            raise _error(404, "not_found", str(exc)) from exc
+        except store.StoreConflictError as exc:
+            raise _error(409, exc.code, str(exc), retryable=True,
+                         context={"repo": exc.current_repo,
+                                  "store_version": exc.current_version}) from exc
+        except store.IncompleteEvidenceError as exc:
+            raise _error(422, "incomplete_evidence", str(exc)) from exc
+        except KeyError as exc:
+            raise _error(404, "not_found", "PR is not in the active store") from exc
+        except (store.StoreError, ReviewValidationError, ValueError, TypeError) as exc:
+            raise _error(400, "invalid_request", str(exc)) from exc
+
     def inspect_proposal(self, proposal_id: str, *, repo: str | None = None) -> Envelope:
         try:
             proposal = store.inspect_proposal(proposal_id, path=self.store_path, repo=repo)
@@ -834,6 +959,10 @@ class WorkspaceService:
             "get_pr": {"pr", "file_page", "file_page_size"}, "read_patch": {"pr", "path", "patch_offset", "patch_limit"},
             "compare_prs": {"path", "group_id", "prs", "page", "page_size", "patch_offset", "patch_limit"},
             "find_related": {"pr", "path", "limit"}, "get_history": {"page", "page_size", "filters"},
+            "get_file_review": {"pr", "path", "page", "page_size", "finding_page",
+                                "finding_page_size", "draft_page", "draft_page_size",
+                                "draft_id", "draft_finding_page",
+                                "draft_finding_page_size"},
         }
         unknown = set(args) - common - per_operation[operation]
         if unknown: raise _error(400, "unknown_parameter", f"unknown parameters: {', '.join(sorted(unknown))}")
@@ -849,7 +978,8 @@ class WorkspaceService:
         handler = {"list_groups": self._groups, "search_prs": self._prs,
                    "get_group": self._group, "get_pr": self._pr, "read_patch": self._patch,
                    "compare_prs": self._compare, "find_related": self._related,
-                   "get_history": self._history}[operation]
+                   "get_history": self._history,
+                   "get_file_review": self._file_review}[operation]
         result = handler(ctx, args)
         return _retrieval_plan(result, operation, args)
 
@@ -959,7 +1089,10 @@ class WorkspaceService:
         # A disposition is a decision, not another copy of the PR's entire
         # file manifest. Manifests remain losslessly available through get_pr.
         decision_fields = {"number", "title", "disposition", "disposition_status",
-                           "disposition_reason", "duplicate_of", "disposition_revision"}
+                           "disposition_reason", "duplicate_of", "disposition_revision",
+                           "disposition_actor", "disposition_at", "disposition_event_id",
+                           "disposition_source", "disposition_stale", "stale_disposition",
+                           "review_counts"}
         state_prs = {row.get("number"): row for row in state.get("prs") or []
                      if row.get("group_id") == gid}
         payload["dispositions"] = {
@@ -982,7 +1115,10 @@ class WorkspaceService:
         state_pr = next((row for row in state.get("prs") or []
                          if row.get("number") == bundle.number), None)
         if isinstance(state_pr, Mapping):
-            for key in ("disposition", "disposition_status", "disposition_reason", "duplicate_of", "disposition_revision"):
+            for key in ("disposition", "disposition_status", "disposition_reason",
+                        "duplicate_of", "disposition_revision", "disposition_actor",
+                        "disposition_at", "disposition_event_id", "disposition_source",
+                        "disposition_stale", "stale_disposition", "review_counts"):
                 if key in state_pr:
                     payload[key] = state_pr[key]
         return _envelope(ctx, payload, evidence=_evidence_status(bundle.complete, list(bundle.reasons)))
@@ -1085,6 +1221,81 @@ class WorkspaceService:
         result["cache_only"] = True
         return _envelope(ctx, result, evidence={"complete": bool((result.get("evidence") or {}).get("query_complete", False)),
             "reasons": [] if (result.get("evidence") or {}).get("query_complete") else ["missing_revision"]})
+
+    def _file_review(self, ctx: _Context, args: Mapping[str, Any]) -> Envelope:
+        """Read paged file-review state for one exact pull-request revision.
+
+        Human review coverage and agent inspection coverage are returned as two
+        independent fields; neither is ever inferred from the other.
+        """
+        number = _positive(args.get("pr"), "pr")
+        page = _page(args.get("page"), "page", 1, MAX_INT)
+        size = _page(args.get("page_size"), "page_size", 50, MAX_PAGE)
+        finding_page = _page(args.get("finding_page"), "finding_page", 1, MAX_INT)
+        finding_size = _page(
+            args.get("finding_page_size"), "finding_page_size", 20, MAX_PAGE
+        )
+        draft_page = _page(args.get("draft_page"), "draft_page", 1, MAX_INT)
+        draft_size = _page(
+            args.get("draft_page_size"), "draft_page_size", 5, MAX_DRAFT_PAGE
+        )
+        draft_finding_page = _page(
+            args.get("draft_finding_page"), "draft_finding_page", 1, MAX_INT
+        )
+        draft_finding_size = _page(
+            args.get("draft_finding_page_size"), "draft_finding_page_size", 20, MAX_PAGE
+        )
+        draft_id = args.get("draft_id")
+        if draft_id is not None and (
+            not isinstance(draft_id, str) or not 1 <= len(draft_id) <= 128
+        ):
+            raise _error(400, "invalid_draft", "draft_id is invalid")
+        # Any continuation beyond the first page of any list must pin versions.
+        _continuation_guard(args, page=max(
+            page, finding_page, draft_page, draft_finding_page,
+        ))
+        focus = _path(args["path"]) if args.get("path") is not None else None
+        try:
+            data = store.file_review_state(
+                store_path=self.store_path, repo=ctx.repo, pr=number,
+                page=page, page_size=size, path=focus,
+                finding_page=finding_page, finding_page_size=finding_size,
+                draft_page=draft_page, draft_page_size=draft_size,
+                draft_id=draft_id,
+                draft_finding_page=draft_finding_page,
+                draft_finding_page_size=draft_finding_size,
+            )
+        except store.UnknownReviewPathError as exc:
+            raise _error(404, "not_found", str(exc)) from exc
+        except store.StoreConflictError as exc:
+            raise _error(409, exc.code, str(exc), retryable=True,
+                         context={"repo": exc.current_repo,
+                                  "store_version": exc.current_version}) from exc
+        except store.IncompleteEvidenceError as exc:
+            raise _error(422, "incomplete_evidence", str(exc)) from exc
+        except KeyError as exc:
+            raise _error(404, "not_found",
+                         "pull request or draft is not in the active store") from exc
+        except (store.StoreError, ReviewValidationError, ValueError, TypeError) as exc:
+            raise _error(400, "invalid_request", str(exc)) from exc
+        if (
+            data.get("store_version") != ctx.store_version
+            or data.get("snapshot_version") != ctx.snapshot_version
+        ):
+            raise _error(409, "stale_store_version",
+                         "store changed during this read; retry", retryable=True)
+        reasons: list[str] = []
+        if not data.get("manifest_complete"):
+            reasons.append("provider_file_cap")
+        if (data.get("coverage") or {}).get("missing_patch"):
+            reasons.append("patch_unavailable")
+        if not data.get("evidence_complete"):
+            reasons.append("source_evidence_incomplete")
+        page_info = {"page": data["page"], "page_size": data["page_size"],
+                     "total": data["file_count"], "pages": data["pages"],
+                     "next_page": data["next_page"], "truncated": data["truncated"]}
+        return _envelope(ctx, data, page=page_info,
+                         evidence=_evidence_status(not reasons, reasons))
 
     def _history(self, ctx: _Context, args: Mapping[str, Any]) -> Envelope:
         page, size = _page(args.get("page"), "page", 1, MAX_INT), _page(args.get("page_size"), "page_size", 40, MAX_PAGE)

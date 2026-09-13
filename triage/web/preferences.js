@@ -1,6 +1,8 @@
 /* Render-blocking, same-origin bootstrap: apply layout before the first paint. */
 (() => {
-  let visible = window.matchMedia("(min-width: 1201px)").matches;
+  // The sidebar is collapsed by default at every width; drawers overlay the
+  // diff instead of resizing it.  A saved preference still wins.
+  let visible = false;
   try {
     const saved = window.localStorage.getItem("triage.context-sidebar.v1");
     if (saved === "shown" || saved === "hidden") visible = saved === "shown";
