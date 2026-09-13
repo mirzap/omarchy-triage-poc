@@ -10,3 +10,8 @@ build/
 .coverage
 htmlcov/
 node_modules/
+.pi/npm/
+.mcp.json
+.env
+.env.*
+!.env.example

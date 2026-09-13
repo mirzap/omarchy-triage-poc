@@ -38,6 +38,40 @@ not retried.
 
 ## Example journey
 
+### Pi and OMP
+
+Copy `.mcp.example.json` to `.mcp.json` and replace both absolute checkout
+paths. The local `.mcp.json` is ignored by Git and defines `omarchy-triage`
+for both clients. It uses
+this checkout's `.venv/bin/python` and the live backend at `127.0.0.1:8741`,
+not the disposable fixture preview. Paths are absolute for your machine;
+update `command` and `cwd` if the checkout moves. No credentials are stored
+in this file and no global client configuration is changed.
+
+Pi's repo-local `.pi/settings.json` pins `pi-mcp-adapter@2.33.0`; its installed
+packages live in ignored `.pi/npm/`, separate from the app's npm dependencies.
+Start Pi from this repo (or restart an existing session), approve this repo's
+local configuration if prompted, and use `/mcp` to inspect `omarchy-triage`.
+Pi exposes the server through its `mcp` discovery/call tool by default.
+
+OMP reads the same root config natively. Start OMP from this repo, or run
+`/mcp reload` in an existing session, then `/mcp test omarchy-triage`.
+Keep the dashboard backend running. Connecting a client does not start,
+sync, or reset the backend; proposals still require human acceptance.
+
+To recreate the local Python environment, run:
+
+```sh
+uv venv --python 3.11 .venv
+uv pip install --python .venv/bin/python -e '.[mcp]'
+pi install npm:pi-mcp-adapter@2.33.0 --local
+```
+
+Client references: [OMP MCP configuration](https://github.com/can1357/oh-my-pi/blob/main/docs/mcp-config.md)
+and [Pi MCP adapter](https://github.com/nicobailon/pi-mcp-adapter).
+
+### Inspect and propose
+
 An MCP host can call `get_workspace` to understand the snapshot, use
 `list_groups` or `search_prs` to page through the complete queue, then inspect
 `get_group`, `get_pr`, `read_patch`, `compare_prs`, `find_related`, and

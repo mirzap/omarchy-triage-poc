@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "omarchy-triage": {
+      "command": "/absolute/path/to/omarchy-triage-poc/.venv/bin/python",
+      "args": ["-m", "triage", "mcp", "--url", "http://127.0.0.1:8741"],
+      "cwd": "/absolute/path/to/omarchy-triage-poc",
+      "env": {
+        "PYTHONDONTWRITEBYTECODE": "1"
+      }
+    }
+  }
+}
