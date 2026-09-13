@@ -2,6 +2,7 @@
 
 const assert = require("assert");
 const fs = require("fs");
+const path = require("path");
 const vm = require("vm");
 
 const source = fs.readFileSync(process.argv[2], "utf8");
@@ -487,6 +488,159 @@ vm.runInNewContext(
   await new Promise((resolve) => setImmediate(resolve));
   flushFlowFrames();
   assert.strictEqual(flowScrollCalls.length, 1, "manual intent must suppress all delayed jumps");
+})().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+
+// WebMCP registration and draft cancellation contracts use a deliberately
+// tiny mock of the current document.modelContext API. No browser automation or
+// live backend is needed to verify the narrow app seam.
+(async () => {
+  const webmcpSource = fs.readFileSync(
+    path.join(__dirname, "..", "triage", "web", "webmcp.js"), "utf8"
+  );
+  const readNames = [
+    "get_workspace", "list_groups", "search_prs", "get_group", "get_pr",
+    "read_patch", "compare_prs", "find_related", "get_history", "get_file_review",
+    "list_proposals", "get_proposal", "get_file_review_history",
+  ];
+  const definitions = readNames.map((name) => ({
+    name, inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  }));
+  const registered = [];
+  const statusNode = { textContent: "" };
+  const modelContext = {
+    registerTool(definition) {
+      registered.push(definition);
+      return Promise.resolve();
+    },
+  };
+  let conflictContext = null;
+  let draftCalls = [];
+  let firstDraftResolve = null;
+  let currentAppPr = 12;
+  let currentAppGroup = "G001";
+  const app = {
+    getViewContext() { return { repo: "acme/widgets", store_version: 4, snapshot_version: 9, view_revision: 2 }; },
+    readTool() { return Promise.resolve({ ok: true }); },
+    setFilters(_filters, ifContext) {
+      conflictContext = ifContext;
+      return { ok: false, error: { code: "stale_view", retryable: true } };
+    },
+    openTarget() { return { ok: true }; },
+    showProposal() { return { ok: true }; },
+    draftProposal(payload) {
+      if (currentAppGroup === null) assert.strictEqual(payload.group_id, "G001");
+      return Promise.resolve({ ok: true, proposal: { proposal_id: "proposal-1" }, payload });
+    },
+    draftFileReview(payload) {
+      if (currentAppPr === null) {
+        assert.strictEqual(payload.pr, 12);
+        assert.strictEqual(payload.revision.source, "fixtures");
+        assert.strictEqual(payload.idempotency_key, "stable-draft-key-12");
+      }
+      draftCalls.push(payload);
+      if (draftCalls.length === 1) {
+        return new Promise((resolve) => { firstDraftResolve = resolve; });
+      }
+      return Promise.resolve({ ok: true, draft: { draft_id: "draft-1" }, context: { repo: "acme/widgets", store_version: 4, snapshot_version: 9, view_revision: 2 } });
+    },
+  };
+  const listeners = {};
+  const window = {
+    TriageApp: app,
+    crypto: { randomUUID() { return "unused"; } },
+    addEventListener(type, listener) { listeners[type] = listener; },
+    CustomEvent: function CustomEvent(type, init) { this.type = type; this.detail = init && init.detail; },
+  };
+  const document = {
+    modelContext,
+    getElementById(id) { return id === "agentToolsStatus" ? statusNode : null; },
+  };
+  const webContext = {
+    window, document, AbortController, fetch: async () => ({
+      ok: true, json: async () => ({ tools: definitions }),
+    }),
+    console, setTimeout, clearTimeout,
+  };
+  vm.runInNewContext(webmcpSource, webContext);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepStrictEqual(
+    registered.map((tool) => tool.name),
+    readNames.concat(["get_view_context", "set_filters", "open_target", "show_proposal",
+      "propose_triage", "propose_file_review"]),
+    "all shared reads, view actions, and both draft actions must register"
+  );
+  assert.doesNotMatch(registered.map((tool) => tool.name).join(","),
+    /accept|reject|adopt|reviewed|decision/i,
+    "human-only mutators must remain absent"
+  );
+  const proposalTool = registered.find((tool) => tool.name === "propose_triage");
+  const fileTool = registered.find((tool) => tool.name === "propose_file_review");
+  assert.strictEqual(proposalTool.annotations.untrustedContentHint, true);
+  assert.strictEqual(fileTool.annotations.untrustedContentHint, true);
+  assert.match(proposalTool.description, /overall PR disposition recommendation/);
+  assert.match(proposalTool.description, /never accepts, applies, or decides/);
+  assert.match(fileTool.description, /Draft file findings/);
+  assert.strictEqual(registered.find((tool) => tool.name === "show_proposal").annotations.untrustedContentHint, true);
+  const fileDraftSchema = fileTool.inputSchema.properties.draft;
+  assert.strictEqual(fileDraftSchema.properties.findings.minItems, 1);
+  assert.strictEqual(fileDraftSchema.properties.coverage.minItems, 1);
+  assert(fileDraftSchema.properties.revision.required.includes("source"));
+  assert.strictEqual(fileDraftSchema.properties.revision.properties.source.minLength, 1);
+  assert(fileDraftSchema.anyOf.some((branch) => branch.required.includes("findings")));
+  assert(fileDraftSchema.anyOf.some((branch) => branch.required.includes("coverage")),
+    "file drafts must contain non-empty findings or coverage");
+  currentAppGroup = null;
+  const proposal = await proposalTool.execute({
+    draft: {
+      group_id: "G001",
+      items: [{ pr: 12, disposition: "keep", reason: "reviewed", revision: {
+        head_sha: "", base_sha: "", content_digest: "digest-12", source: "fixtures",
+      } }],
+      idempotency_key: "stable-proposal-key-12",
+    },
+    if_context: app.getViewContext(),
+  }, { signal: new AbortController().signal });
+  assert.strictEqual(proposal.ok, true);
+  assert.strictEqual(proposal.proposal.proposal_id, "proposal-1",
+    "overall proposal drafts must return their proposal identity");
+
+  const filtersTool = registered.find((tool) => tool.name === "set_filters");
+  const stale = { repo: "acme/widgets", store_version: 3, snapshot_version: 9, view_revision: 1 };
+  const conflict = await filtersTool.execute({ filters: { tab: "queue" }, if_context: stale }, {});
+  assert.strictEqual(conflict.ok, false);
+  assert.strictEqual(conflict.error.code, "stale_view");
+  assert.strictEqual(conflictContext, stale, "view actions must pass their exact context to the app seam");
+
+  const draftInput = {
+    draft: {
+      pr: 12,
+      revision: { head_sha: "", base_sha: "", content_digest: "digest-12", source: "fixtures" },
+      findings: [], coverage: [{ path: "src/a.js", status: "inspected" }],
+      idempotency_key: "stable-draft-key-12",
+    },
+    if_context: app.getViewContext(),
+  };
+  // The app's mutable current group/PR may disappear between agent reads and
+  // a same-key replay. The draft seam must still forward the original payload
+  // so the backend can perform idempotency lookup first.
+  currentAppPr = null;
+  const aborter = new AbortController();
+  const first = fileTool.execute(draftInput, { signal: aborter.signal });
+  aborter.abort();
+  firstDraftResolve({ ok: true, draft: { draft_id: "draft-1" }, context: app.getViewContext() });
+  const cancelled = await first;
+  assert.strictEqual(cancelled.ok, true);
+  assert.strictEqual(cancelled.cancellation.code, "cancelled_after_commit");
+  assert.strictEqual(cancelled.cancellation.recoverable, true);
+  const retried = await fileTool.execute(draftInput, { signal: new AbortController().signal });
+  assert.strictEqual(retried.ok, true);
+  assert.strictEqual(draftCalls.length, 2);
+  assert.strictEqual(draftCalls[0].idempotency_key, "stable-draft-key-12");
+  assert.strictEqual(draftCalls[1].idempotency_key, "stable-draft-key-12",
+    "a retry must reuse the caller key rather than generating a duplicate key");
 })().catch((error) => {
   console.error(error);
   process.exitCode = 1;

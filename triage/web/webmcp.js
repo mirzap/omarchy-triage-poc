@@ -7,14 +7,15 @@
   const READ_TOOL_NAMES = [
     "get_workspace", "list_groups", "search_prs", "get_group", "get_pr",
     "read_patch", "compare_prs", "find_related", "get_history", "get_file_review",
+    "list_proposals", "get_proposal", "get_file_review_history",
   ];
   const VIEW_TOOL_NAMES = [
     "get_view_context", "set_filters", "open_target", "show_proposal",
   ];
-  // The only browser write. It can create an agent draft and nothing else:
+  // The only browser writes. They can create agent drafts and nothing else:
   // there is no tool here for marking a file reviewed, adopting a drafted
   // finding, or saving a pull-request decision.
-  const DRAFT_TOOL_NAMES = ["propose_file_review"];
+  const DRAFT_TOOL_NAMES = ["propose_triage", "propose_file_review"];
   const TOOL_COUNT = READ_TOOL_NAMES.length + VIEW_TOOL_NAMES.length +
     DRAFT_TOOL_NAMES.length;
 
@@ -31,6 +32,9 @@
     find_related: "Read cached, advisory related-patch results for a pull request.",
     get_history: "Read revision-bound triage history from the local workspace.",
     get_file_review: "Read per-file human review state, separate agent inspection coverage, findings, and agent drafts for one pull-request revision. Manifest, findings, and drafts page independently.",
+    list_proposals: "Discover overall PR recommendation drafts in the active workspace.",
+    get_proposal: "Read one overall PR recommendation draft and its event history.",
+    get_file_review_history: "Read append-only file-review events and their revision status.",
   });
 
   const FILTER_LABELS = [
@@ -46,6 +50,22 @@
     group_snapshot_digest: { type: ["string", "null"], maxLength: 256 },
     pr_content_digest: { type: ["string", "null"], maxLength: 256 },
   };
+  const DRAFT_REVISION_SCHEMA = {
+    type: "object",
+    properties: {
+      pr_number: { type: "integer", minimum: 1 },
+      head_sha: { type: "string", maxLength: 256 },
+      base_sha: { type: "string", maxLength: 256 },
+      additions: { type: ["integer", "null"], minimum: 0 },
+      deletions: { type: ["integer", "null"], minimum: 0 },
+      content_digest: { type: "string", minLength: 1, maxLength: 256 },
+      evidence_complete: { type: "boolean", default: false },
+      source: { type: "string", minLength: 1, maxLength: 64 },
+      cache_snapshot_id: { type: "string", maxLength: 256, default: "" },
+    },
+    required: ["head_sha", "base_sha", "content_digest", "source"],
+    additionalProperties: false,
+  };
   const IF_CONTEXT_SCHEMA = {
     type: "object",
     properties: REVISION_PROPERTIES,
@@ -55,7 +75,7 @@
   const VIEW_ANNOTATIONS = Object.freeze({
     readOnlyHint: false,
     consequentialHint: false,
-    untrustedContentHint: false,
+    untrustedContentHint: true,
   });
   const READ_ANNOTATIONS = Object.freeze({
     readOnlyHint: true,
@@ -65,7 +85,7 @@
   const CONTEXT_ANNOTATIONS = Object.freeze({
     readOnlyHint: true,
     consequentialHint: false,
-    untrustedContentHint: false,
+    untrustedContentHint: true,
   });
 
   const FILTER_SCHEMA = {
@@ -95,7 +115,7 @@
     properties: {
       pr: { type: "integer", minimum: 1 },
       findings: {
-        type: "array", maxItems: 100,
+        type: "array", minItems: 1, maxItems: 100,
         items: {
           type: "object", additionalProperties: false,
           properties: {
@@ -112,7 +132,7 @@
         },
       },
       coverage: {
-        type: "array", maxItems: 500,
+        type: "array", minItems: 1, maxItems: 500,
         items: {
           type: "object", additionalProperties: false,
           properties: {
@@ -124,9 +144,39 @@
         },
       },
       provenance: { type: "object" },
+      revision: DRAFT_REVISION_SCHEMA,
       idempotency_key: { type: "string", minLength: 8, maxLength: 128 },
     },
-    required: ["pr"],
+    required: ["pr", "revision", "idempotency_key"],
+    anyOf: [
+      { required: ["findings"] },
+      { required: ["coverage"] },
+    ],
+    additionalProperties: false,
+  };
+  const PROPOSAL_ITEM_SCHEMA = {
+    type: "object", additionalProperties: false,
+    properties: {
+      pr: { type: "integer", minimum: 1 },
+      disposition: { type: "string", enum: ["pending", "keep", "duplicate", "reject", "needs_hardware", "upgrade"] },
+      reason: { type: "string", minLength: 1, maxLength: 1000 },
+      revision: DRAFT_REVISION_SCHEMA,
+      duplicate_of: { type: "integer", minimum: 1 },
+      duplicate_of_revision: DRAFT_REVISION_SCHEMA,
+    },
+    required: ["pr", "disposition", "reason", "revision"],
+  };
+  const PROPOSAL_DRAFT_SCHEMA = {
+    type: "object",
+    properties: {
+      group_id: { type: "string", minLength: 1, maxLength: 128, pattern: "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$" },
+      canonical_pr: { type: "integer", minimum: 1 },
+      items: { type: "array", minItems: 1, maxItems: 200, items: PROPOSAL_ITEM_SCHEMA },
+      provenance: { type: "object" },
+      context: { type: "object" },
+      idempotency_key: { type: "string", minLength: 8, maxLength: 128 },
+    },
+    required: ["group_id", "items", "idempotency_key"],
     additionalProperties: false,
   };
   const VIEW_ACTION_SCHEMAS = Object.freeze({
@@ -158,6 +208,12 @@
     },
   });
   const DRAFT_ACTION_SCHEMAS = Object.freeze({
+    propose_triage: {
+      type: "object",
+      properties: { draft: PROPOSAL_DRAFT_SCHEMA, if_context: IF_CONTEXT_SCHEMA },
+      required: ["draft", "if_context"],
+      additionalProperties: false,
+    },
     propose_file_review: {
       type: "object",
       properties: { draft: DRAFT_SCHEMA, if_context: IF_CONTEXT_SCHEMA },
@@ -168,7 +224,7 @@
   const DRAFT_ANNOTATIONS = Object.freeze({
     readOnlyHint: false,
     consequentialHint: true,
-    untrustedContentHint: false,
+    untrustedContentHint: true,
   });
 
   let registration = null;
@@ -306,7 +362,25 @@
     };
   }
 
-  function draftExecutor(app) {
+  function draftResultAfterCancellation(result, signal) {
+    if (!aborted(signal)) return result;
+    // A POST may have committed before the host cancelled the tool promise.
+    // Return the identity so the caller can recover with the same stable key;
+    // never encourage a retry with a newly generated key.
+    if (result && result.ok === true && (result.draft || result.proposal)) {
+      return {
+        ...result,
+        cancellation: {
+          code: "cancelled_after_commit",
+          message: "The draft was committed before cancellation; reuse the same idempotency_key to recover it.",
+          recoverable: true,
+        },
+      };
+    }
+    throw cancellationError();
+  }
+
+  function draftExecutor(app, name) {
     return async function (args, options) {
       const signal = options && options.signal;
       if (aborted(signal)) throw cancellationError();
@@ -314,11 +388,9 @@
         const value = args && typeof args === "object" ? args : {};
         // A draft can be committed, so it is never retried automatically and
         // never reaches any review, adoption, or decision path.
-        const result = await Promise.resolve(
-          app.draftFileReview(value.draft, value.if_context)
-        );
-        if (aborted(signal)) throw cancellationError();
-        return result;
+        const method = name === "propose_triage" ? app.draftProposal : app.draftFileReview;
+        const result = await Promise.resolve(method(value.draft, value.if_context));
+        return draftResultAfterCancellation(result, signal);
       } catch (error) {
         if (error && error.name === "AbortError") throw error;
         return failureEnvelope(error, app);
@@ -353,7 +425,8 @@
         typeof app.setFilters !== "function" ||
         typeof app.openTarget !== "function" ||
         typeof app.showProposal !== "function" ||
-        typeof app.draftFileReview !== "function") {
+        typeof app.draftFileReview !== "function" ||
+        typeof app.draftProposal !== "function") {
       status("Browser seam waiting · dashboard actions unavailable");
       return;
     }
@@ -387,9 +460,9 @@
         annotations: name === "get_view_context" ? CONTEXT_ANNOTATIONS : VIEW_ANNOTATIONS,
       }))).concat(DRAFT_TOOL_NAMES.map((name) => ({
         name,
-        description: "Draft file findings and explicit inspection coverage for " +
-          "human review after checking the current view context. This never marks " +
-          "a file reviewed, never accepts a draft, and never decides a pull request.",
+        description: name === "propose_triage"
+          ? "Draft an overall PR disposition recommendation for human review after checking the current view context. This never accepts, applies, or decides a proposal or pull request."
+          : "Draft file findings and explicit inspection coverage for human review after checking the current view context. This never marks a file reviewed, never accepts a draft, and never decides a pull request.",
         inputSchema: copySchema(DRAFT_ACTION_SCHEMAS[name]),
         annotations: DRAFT_ANNOTATIONS,
       })));
@@ -403,7 +476,7 @@
           execute: READ_TOOL_NAMES.includes(definition.name)
             ? readExecutor(app, definition.name)
             : DRAFT_TOOL_NAMES.includes(definition.name)
-              ? draftExecutor(app)
+              ? draftExecutor(app, definition.name)
               : viewExecutor(app, definition.name),
         }, { signal: record.controller.signal });
         if (registration !== record || record.generation !== generation ||

@@ -146,6 +146,7 @@
   const READ_TOOL_NAMES = [
     "get_workspace", "list_groups", "search_prs", "get_group", "get_pr",
     "read_patch", "compare_prs", "find_related", "get_history", "get_file_review",
+    "list_proposals", "get_proposal", "get_file_review_history",
   ];
   let resumeRepo = "";
   let urlViewFields = new Set();
@@ -1193,6 +1194,30 @@
       source: source.evidence_source || source.source || (pr && pr.evidence_source) || state.source || "",
       cache_snapshot_id: source.cache_snapshot_id || (pr && pr.cache_snapshot_id) || "",
     };
+  }
+
+  function validDraftRevision(value, prNumber) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+    if (Object.keys(value).some((key) => ![
+      "pr_number", "head_sha", "base_sha", "additions", "deletions",
+      "content_digest", "evidence_complete", "source", "cache_snapshot_id",
+    ].includes(key))) return false;
+    if (Object.prototype.hasOwnProperty.call(value, "pr_number") &&
+        (!Number.isSafeInteger(value.pr_number) || value.pr_number !== prNumber)) return false;
+    for (const key of ["head_sha", "base_sha"]) {
+      if (typeof value[key] !== "string" || value[key].length > 256) return false;
+    }
+    if (typeof value.content_digest !== "string" ||
+        value.content_digest.length < 1 || value.content_digest.length > 256) return false;
+    for (const key of ["additions", "deletions"]) {
+      if (value[key] !== null && value[key] !== undefined &&
+          (!Number.isSafeInteger(value[key]) || value[key] < 0)) return false;
+    }
+    if (value.evidence_complete !== undefined && typeof value.evidence_complete !== "boolean") return false;
+    if (typeof value.source !== "string" || value.source.length < 1 || value.source.length > 64) return false;
+    if (value.cache_snapshot_id !== undefined &&
+        (typeof value.cache_snapshot_id !== "string" || value.cache_snapshot_id.length > 256)) return false;
+    return true;
   }
 
   function makeIdempotencyKey(prefix) {
@@ -6087,10 +6112,7 @@
       error.code = "not_ready";
       throw error;
     }
-    const allowed = [
-      "get_workspace", "list_groups", "search_prs", "get_group", "get_pr",
-      "read_patch", "compare_prs", "find_related", "get_history", "get_file_review",
-    ];
+    const allowed = READ_TOOL_NAMES;
     if (!allowed.includes(operation)) {
       const error = new Error("unsupported read operation");
       error.code = "invalid_request";
@@ -6108,9 +6130,30 @@
     });
   }
 
-  // Draft-only agent write. There is deliberately no browser seam for marking
-  // a file reviewed, adopting a drafted finding, or saving a PR decision:
-  // those stay behind explicit human controls in the dashboard.
+  function committedDraftResult(data, field, fallbackContext, key) {
+    const value = data && (data[field] || data.data && data.data[field]);
+    if (!value || typeof value !== "object") return null;
+    return {
+      ok: true,
+      [field]: value,
+      // This context is the backend's post-write context when available. It
+      // remains useful even if the browser navigated before the response was
+      // delivered, and prevents a caller from inventing a fresh key.
+      context: data.context || fallbackContext,
+      idempotency_key: key,
+    };
+  }
+
+  function ambiguousDraftError(message, key) {
+    const result = actionError("draft_unconfirmed", message, true);
+    result.error.idempotency_key = key;
+    result.error.message += " Reuse the same idempotency_key to recover it; do not generate a new key.";
+    return result;
+  }
+
+  // Draft-only agent writes. There is deliberately no browser seam for
+  // marking a file reviewed, adopting a drafted finding, or saving a PR
+  // decision: those stay behind explicit human controls in the dashboard.
   async function draftFileReview(payload, ifContext) {
     if (!stateInitialized) {
       return actionError("not_ready", "the current repository snapshot is still loading.", true);
@@ -6123,15 +6166,16 @@
       return actionError("invalid_request", "draft must be an object.", false);
     }
     for (const key of Object.keys(value)) {
-      if (!["pr", "findings", "coverage", "provenance", "idempotency_key"].includes(key)) {
+      if (!["pr", "revision", "findings", "coverage", "provenance", "idempotency_key"].includes(key)) {
         return actionError("invalid_request", "unknown draft field: " + key, false);
       }
     }
     if (!Number.isSafeInteger(value.pr) || value.pr <= 0) {
       return actionError("invalid_request", "pr must be a positive integer.", false);
     }
-    const pr = prByNumber(value.pr);
-    if (!pr) return actionError("not_found", "PR is not in the current snapshot.", false);
+    if (!validDraftRevision(value.revision, value.pr)) {
+      return actionError("invalid_request", "revision must include head_sha, base_sha, content_digest, and source for this PR.", false);
+    }
     for (const key of ["findings", "coverage"]) {
       if (value[key] !== undefined && !Array.isArray(value[key])) {
         return actionError("invalid_request", key + " must be an array.", false);
@@ -6143,16 +6187,16 @@
       return actionError("invalid_request", "provenance must be an object.", false);
     }
     const key = value.idempotency_key;
-    if (key !== undefined &&
-        (typeof key !== "string" || key.length < 8 || key.length > 128)) {
-      return actionError("invalid_request", "idempotency_key must be 8-128 characters.", false);
+    if (typeof key !== "string" || key.length < 8 || key.length > 128) {
+      return actionError("invalid_request", "idempotency_key is required and must be 8-128 characters.", false);
     }
     const expected = guard.context;
     const workspaceToken = workspaceGen;
     const workspaceRepo = state.repo;
     try {
-      const evidence = await loadPrBody(value.pr);
-      if (!workspaceCurrent(workspaceRepo, workspaceToken)) return staleViewError();
+      if (!workspaceCurrent(workspaceRepo, workspaceToken)) {
+        return staleViewError();
+      }
       const recheck = checkViewContext(input.context);
       if (!recheck.ok) return recheck;
       const data = await api("/api/file-reviews/draft", {
@@ -6160,20 +6204,23 @@
         body: JSON.stringify({
           repo: state.repo,
           pr: value.pr,
-          revision: revisionRefFromPr(pr, evidence),
+          revision: value.revision,
           findings: value.findings || [],
           coverage: value.coverage || [],
           provenance: value.provenance || {},
           expected_store_version: expected.store_version,
           expected_snapshot_version: expected.snapshot_version,
-          idempotency_key: key || makeIdempotencyKey("file-draft"),
+          idempotency_key: key,
           actor: "agent",
         }),
       });
-      if (!workspaceCurrent(workspaceRepo, workspaceToken)) return staleViewError();
+      const committed = committedDraftResult(data, "draft", expected, key);
+      if (!committed) return ambiguousDraftError("the file-review draft response could not be identified.", key);
+      if (!workspaceCurrent(workspaceRepo, workspaceToken)) return committed;
       // A draft changes no review or decision, but it does advance the store
       // version; refresh so later guarded calls see the current context.
-      await loadState();
+      const refreshed = await loadState();
+      if (!workspaceCurrent(workspaceRepo, workspaceToken) || refreshed === false) return committed;
       if (state.selectedPr === value.pr && state.selectedFile) {
         await loadFileReview({
           reset: true,
@@ -6182,16 +6229,139 @@
       }
       setStatus("an agent drafted file findings for #" + value.pr +
         " · nothing was reviewed or decided");
-      return { ok: true, draft: data.draft || null, context: currentViewContext() };
+      return { ...committed, context: currentViewContext() };
     } catch (error) {
-      if (!workspaceCurrent(workspaceRepo, workspaceToken)) return staleViewError();
+      if (!workspaceCurrent(workspaceRepo, workspaceToken)) {
+        return ambiguousDraftError("the file-review draft could not be confirmed after the browser context changed.", key);
+      }
       if (error.data && typeof error.data === "object" && error.data.ok === false) {
         return error.data;
       }
+      if (error.status !== 409) {
+        return ambiguousDraftError(error.message || "the draft could not be confirmed.", key);
+      }
       return actionError(
-        error.status === 409 ? "stale_snapshot" : "invalid_request",
-        error.message || "the draft could not be saved.",
-        error.status === 409,
+        "stale_snapshot",
+        "the revision or snapshot changed; reread before retrying.",
+        true,
+      );
+    }
+  }
+
+  async function draftProposal(payload, ifContext) {
+    if (!stateInitialized) {
+      return actionError("not_ready", "the current repository snapshot is still loading.", true);
+    }
+    const input = actionInput(payload, ifContext, "draft");
+    const guard = checkViewContext(input.context);
+    if (!guard.ok) return guard;
+    const value = input.value;
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      return actionError("invalid_request", "draft must be an object.", false);
+    }
+    for (const key of Object.keys(value)) {
+      if (!["group_id", "canonical_pr", "items", "provenance", "context", "idempotency_key"].includes(key)) {
+        return actionError("invalid_request", "unknown draft field: " + key, false);
+      }
+    }
+    if (typeof value.group_id !== "string" ||
+        !/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(value.group_id)) {
+      return actionError("invalid_request", "group_id is invalid.", false);
+    }
+    if (!Array.isArray(value.items) || !value.items.length || value.items.length > 200) {
+      return actionError("invalid_request", "items must be a bounded non-empty array.", false);
+    }
+    if (value.canonical_pr !== undefined &&
+        (!Number.isSafeInteger(value.canonical_pr) || value.canonical_pr <= 0)) {
+      return actionError("invalid_request", "canonical_pr must be a positive integer.", false);
+    }
+    if (value.provenance !== undefined &&
+        (!value.provenance || typeof value.provenance !== "object" || Array.isArray(value.provenance))) {
+      return actionError("invalid_request", "provenance must be an object.", false);
+    }
+    if (value.context !== undefined &&
+        (!value.context || typeof value.context !== "object" || Array.isArray(value.context))) {
+      return actionError("invalid_request", "context must be an object.", false);
+    }
+    const key = value.idempotency_key;
+    if (typeof key !== "string" || key.length < 8 || key.length > 128) {
+      return actionError("invalid_request", "idempotency_key is required and must be 8-128 characters.", false);
+    }
+    const workspaceToken = workspaceGen;
+    const workspaceRepo = state.repo;
+    const items = [];
+    try {
+      for (const raw of value.items) {
+        if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+          return actionError("invalid_request", "each proposal item must be an object.", false);
+        }
+        for (const itemKey of Object.keys(raw)) {
+          if (!["pr", "disposition", "reason", "revision", "duplicate_of", "duplicate_of_revision"].includes(itemKey)) {
+            return actionError("invalid_request", "unknown proposal item field: " + itemKey, false);
+          }
+        }
+        if (!Number.isSafeInteger(raw.pr) || raw.pr <= 0) {
+          return actionError("invalid_request", "each proposal PR must be a positive integer.", false);
+        }
+        if (!["pending", "keep", "duplicate", "reject", "needs_hardware", "upgrade"].includes(raw.disposition)) {
+          return actionError("invalid_request", "proposal disposition is invalid.", false);
+        }
+        if (typeof raw.reason !== "string" || raw.reason.trim().length < 1 || raw.reason.length > 1000) {
+          return actionError("invalid_request", "each proposal item needs a reason of 1-1000 characters.", false);
+        }
+        if (!validDraftRevision(raw.revision, raw.pr)) {
+          return actionError("invalid_request", "each proposal item requires an exact revision ref.", false);
+        }
+        if (raw.disposition === "duplicate") {
+          if (!Number.isSafeInteger(raw.duplicate_of) || raw.duplicate_of <= 0 || raw.duplicate_of === raw.pr ||
+              !validDraftRevision(raw.duplicate_of_revision, raw.duplicate_of)) {
+            return actionError("invalid_request", "duplicate proposals require another positive PR and its exact revision ref.", false);
+          }
+        } else if (raw.duplicate_of !== undefined || raw.duplicate_of_revision !== undefined) {
+          return actionError("invalid_request", "duplicate fields are only valid for duplicate proposals.", false);
+        }
+        items.push({ ...raw });
+      }
+      if (!workspaceCurrent(workspaceRepo, workspaceToken)) {
+        return staleViewError();
+      }
+      const recheck = checkViewContext(input.context);
+      if (!recheck.ok) return recheck;
+      const expected = guard.context;
+      const data = await api("/api/proposals/draft", {
+        method: "POST",
+        body: JSON.stringify({
+          repo: state.repo,
+          group_id: value.group_id,
+          canonical_pr: value.canonical_pr,
+          items,
+          provenance: value.provenance || {},
+          context: value.context || {},
+          expected_store_version: expected.store_version,
+          expected_snapshot_version: expected.snapshot_version,
+          idempotency_key: key,
+          actor: "agent",
+        }),
+      });
+      const committed = committedDraftResult(data, "proposal", expected, key);
+      if (!committed) return ambiguousDraftError("the proposal draft response could not be identified.", key);
+      if (!workspaceCurrent(workspaceRepo, workspaceToken)) return committed;
+      const refreshed = await loadState();
+      if (!workspaceCurrent(workspaceRepo, workspaceToken) || refreshed === false) return committed;
+      setStatus("an agent drafted an overall PR recommendation · nothing was accepted or decided");
+      return { ...committed, context: currentViewContext() };
+    } catch (error) {
+      if (!workspaceCurrent(workspaceRepo, workspaceToken)) {
+        return ambiguousDraftError("the proposal draft could not be confirmed after the browser context changed.", key);
+      }
+      if (error.data && typeof error.data === "object" && error.data.ok === false) return error.data;
+      if (error.status !== 409) {
+        return ambiguousDraftError(error.message || "the proposal draft could not be confirmed.", key);
+      }
+      return actionError(
+        "stale_snapshot",
+        "the revision or snapshot changed; reread before retrying.",
+        true,
       );
     }
   }
@@ -6201,22 +6371,23 @@
     seamExposed = true;
     // Stable, intentionally narrow browser seam. Do not add api/session or
     // mutation helpers here: WebMCP may only read through readTool and may
-    // change the current display through the guarded view actions.  The one
-    // write is draftFileReview, which can only create an agent draft: it
-    // cannot mark a file reviewed, adopt a draft, or decide a pull request.
+    // change the current display through the guarded view actions. The two
+    // writes only create agent drafts: they cannot mark a file reviewed, adopt
+    // a draft, or decide a pull request.
     window.TriageApp = Object.freeze({
       getViewContext: () => currentViewContext(),
       setFilters,
       openTarget,
       showProposal,
       readTool,
+      draftProposal,
       draftFileReview,
     });
     if (typeof window.dispatchEvent === "function" && typeof window.CustomEvent === "function") {
       window.dispatchEvent(new window.CustomEvent("triage:ready", {
         detail: {
           capabilities: ["read_tool", "get_view_context", "set_filters", "open_target",
-            "show_proposal", "propose_file_review"],
+            "show_proposal", "propose_triage", "propose_file_review"],
           read_operations: READ_TOOL_NAMES.slice(),
         },
       }));

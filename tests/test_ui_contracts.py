@@ -12,6 +12,7 @@ from triage.store import overlap_for_group, prs_for_path
 
 ROOT = Path(__file__).parents[1]
 APP = ROOT / "triage" / "web" / "app.js"
+WEBMCP = ROOT / "triage" / "web" / "webmcp.js"
 NODE_CONTRACTS = ROOT / "tests" / "ui_contracts.cjs"
 
 
@@ -40,6 +41,10 @@ def test_javascript_syntax_and_security_contracts() -> None:
         ["node", "--check", str(APP)], capture_output=True, text=True, check=False
     )
     assert result.returncode == 0, result.stderr
+    result = subprocess.run(
+        ["node", "--check", str(WEBMCP)], capture_output=True, text=True, check=False
+    )
+    assert result.returncode == 0, result.stderr
     source = APP.read_text(encoding="utf-8")
     assert 'fetch("/api/session"' in source
     assert '"X-CSRF-Token": token' in source
@@ -57,6 +62,15 @@ def test_javascript_syntax_and_security_contracts() -> None:
     assert "_willUpdate =" not in source
     assert "virtualizer._didMount()" in source
     assert "cleanup()" in source
+    assert "draftProposal" in source
+    assert '"list_proposals", "get_proposal", "get_file_review_history"' in source
+    assert "idempotency_key is required" in source
+    assert "draft_unconfirmed" in source
+    webmcp = WEBMCP.read_text(encoding="utf-8")
+    assert 'const DRAFT_TOOL_NAMES = ["propose_triage", "propose_file_review"];' in webmcp
+    assert 'untrustedContentHint: true' in webmcp
+    assert 'required: ["pr", "revision", "idempotency_key"]' in webmcp
+    assert 'required: ["head_sha", "base_sha", "content_digest", "source"]' in webmcp
 
 
 def test_javascript_behavior_contracts() -> None:

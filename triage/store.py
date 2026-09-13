@@ -1692,6 +1692,7 @@ def draft_proposal(
         data.setdefault("proposals", []).append(proposal.to_dict())
         data.setdefault("proposal_events", []).append({
             "event_id": f"proposal-event-{uuid.uuid4()}", "proposal_id": proposal_id,
+            "repo": active_repo,
             "action": "draft", "actor": actor, "source": "agent", "at": now,
         })
         if key:
@@ -1886,6 +1887,7 @@ def _transition_proposal(
         _update_proposal_unlocked(data, updated)
         data.setdefault("proposal_events", []).append({
             "event_id": f"proposal-event-{uuid.uuid4()}", "proposal_id": proposal_id,
+            "repo": active_repo,
             "action": action, "actor": actor, "source": "human", "at": now,
             "reason": reason if action == "reject" else "",
             "items": [item.to_dict() for item in persisted_items],

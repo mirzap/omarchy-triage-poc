@@ -878,10 +878,14 @@ class TriageHandler(BaseHTTPRequestHandler):
             parsed = urlsplit(self.path)
             path = self._decoded_path(parsed.path)
             if path == "/api/tools":
-                self._send_json(200, {"tools": list(service_module.TOOL_DEFINITIONS)})
+                self._send_json(200, {
+                    "tools": list(service_module.TOOL_DEFINITIONS),
+                    "instructions": service_module.TOOL_INSTRUCTIONS,
+                })
             elif path == "/api/tools/definitions":
                 self._send_json(200, {
                     "tools": list(service_module.TOOL_DEFINITIONS),
+                    "instructions": service_module.TOOL_INSTRUCTIONS,
                     "draft_tool": service_module.DRAFT_PROPOSAL_TOOL_DEFINITION,
                     "draft_tools": list(service_module.DRAFT_TOOL_DEFINITIONS),
                 })
