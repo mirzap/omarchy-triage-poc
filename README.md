@@ -4,6 +4,26 @@ Omarchy PR triage is a local-first proof of concept for turning a large pull-req
 
 The application never writes to GitHub. It reads pull-request metadata and files, stores local JSON state, and serves a loopback-only dashboard. It does not merge, label, comment on, or approve a GitHub pull request.
 
+## Quick start: sync from the UI
+
+After [installation](#requirements-and-installation), activate your environment
+and run this from the repository directory:
+
+```bash
+triage serve --host 127.0.0.1 --port 8741
+```
+
+Open <http://127.0.0.1:8741>, select **gh**, enter the repository (for example,
+`omacom/omarchy`), leave **refresh** checked, and click **Sync**. Authenticate
+GitHub CLI first with `gh auth login` if needed. No separate `triage run`
+command is required.
+
+The server uses `.triage/store.json` by default. Starting it does not fetch
+anything; **Sync** with **refresh** checked explicitly downloads GitHub data.
+Uncheck **refresh** to load existing cached evidence without network access.
+Keep one store per repository; an existing workspace cannot be switched to a
+different repository.
+
 ## Safety model
 
 - PRs are grouped only by deterministic changed-file-set overlap. Titles, embeddings, SimHash, and coarse fingerprints do not create approval edges.
