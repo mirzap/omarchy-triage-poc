@@ -59,6 +59,11 @@ STATIC_TOOL_DESCRIPTIONS: dict[str, str] = {
 }
 
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+READ_CONTINUATION_GUIDANCE = (
+    " Follow retrieval.continuations for exact snapshot-pinned follow-up calls. "
+    "Source completeness is not retrieval completeness. If your host clips output, "
+    "reduce the supported page size or patch_limit; never retry an identical oversized call."
+)
 MAX_REQUEST_BYTES = 64 * 1024
 HTTP_TIMEOUT_SECONDS = 5.0
 MAX_SCHEMA_BYTES = 256 * 1024
@@ -473,7 +478,7 @@ def _make_forwarder(operation: str, schema: Mapping[str, Any], client: BackendCl
             }}
 
     forwarder.__name__ = f"read_{operation}"
-    forwarder.__doc__ = STATIC_TOOL_DESCRIPTIONS[operation]
+    forwarder.__doc__ = STATIC_TOOL_DESCRIPTIONS[operation] + READ_CONTINUATION_GUIDANCE
     forwarder.__signature__ = Signature(params, return_annotation=dict[str, Any])
     return forwarder
 
@@ -549,7 +554,7 @@ def build_server(client: BackendClient) -> Any:
         server.add_tool(
             forwarder,
             name=operation,
-            description=STATIC_TOOL_DESCRIPTIONS[operation],
+            description=STATIC_TOOL_DESCRIPTIONS[operation] + READ_CONTINUATION_GUIDANCE,
             annotations=ToolAnnotations(
                 readOnlyHint=True,
                 destructiveHint=False,

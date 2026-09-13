@@ -995,6 +995,8 @@
   }
 
   function invalidateSnapshotCaches() {
+    fileManifests.clear();
+    if ($("fileNavigatorDialog") && $("fileNavigatorDialog").open) $("fileNavigatorDialog").close();
     snapshotGen += 1;
     fileQueueGen += 1;
     relatedGen += 1;
@@ -1116,6 +1118,13 @@
     // next reload.  IDs are normalized above before this write.
     if (stateInitialized) markViewChanged(viewBefore);
     stateInitialized = true;
+    // First render establishes selection while read tools are still gated.
+    // Start metadata once the fully applied snapshot is ready, without timers
+    // or changing the decision/navigation readiness ordering above.
+    if (state.selectedGroupId && state.selectedPr) {
+      const entry = currentManifest();
+      if (entry && !entry.rows.length && !entry.error && entry.next !== null) loadManifestPage(entry);
+    }
     persistResume();
   }
 
@@ -1419,6 +1428,7 @@
         state.selectedFile = null;
         state.selectedUser = null;
       });
+      if (!window.matchMedia("(max-width: 700px)").matches) setFilesPane(true);
       render();
     });
     return card;
@@ -1605,10 +1615,10 @@
       changed = true;
     } else if (state.selectedFile && group) {
       const pathBelongs = pr
-        ? (pr.paths || []).includes(state.selectedFile)
+        ? prMayContainPath(pr, state.selectedFile)
         : (group.pr_numbers || []).some((number) => {
             const member = prByNumber(number);
-            return member && (member.paths || []).includes(state.selectedFile);
+            return member && prMayContainPath(member, state.selectedFile);
           });
       if (!pathBelongs) {
         state.selectedFile = null;
@@ -2663,6 +2673,12 @@
     const empty = $("detailEmpty");
     const detail = $("detail");
     const g = state.groups.find((x) => x.group_id === state.selectedGroupId);
+    if ($("navigatorFilesBtn")) $("navigatorFilesBtn").disabled = !g;
+    if (!g) {
+      if ($("fileNavigatorDialog") && $("fileNavigatorDialog").open) $("fileNavigatorDialog").close();
+      setFilesPane(false);
+      if ($("fileNavigatorList")) $("fileNavigatorList").replaceChildren();
+    }
     if (g) {
       changeView(() => {
         if (!state.selectedPr) state.selectedPr = (g.pr_numbers || [])[0] || null;
@@ -2734,7 +2750,7 @@
         meta.appendChild(ub);
       }
       meta.appendChild(
-        document.createTextNode(" · " + (pr.paths || []).length + " files · " +
+        document.createTextNode(" · " + (pr.path_count ?? (pr.paths || []).length) + " files · " +
           (pr.disposition || "pending").replace(/_/g, " "))
       );
     } else {
@@ -2811,6 +2827,7 @@
       return;
     }
     if (head) head.textContent = "Description · #" + selected;
+    if (block && lastBodyPr !== selected) block.open = false;
     lastBodyPr = selected;
     if (block && !block.open) {
       root.textContent = "Open to read this PR’s description.";
@@ -3180,44 +3197,269 @@
     render();
   }
 
+  const fileManifests = new Map();
+  let fileManifestScope = "";
+  let filesPaneActive = false;
+  let filesDialogFocus = null;
+  let filesCompare = { key: "", pr: null };
+
+  function manifestScope() {
+    return JSON.stringify([state.repo, state.snapshotVersion, state.storeVersion]);
+  }
+
+  function prMayContainPath(pr, path) {
+    if ((pr.paths || []).includes(path)) return true;
+    const entry = fileManifestScope === manifestScope() && fileManifests.get(pr.number);
+    if (entry && entry.rows.some((file) => file.path === path || file.previous_path === path)) return true;
+    if (entry && entry.next === null) return false;
+    // UI summaries are capped. An unseen path is not proof of absence; the
+    // patch endpoint remains authoritative for URL/agent-selected paths.
+    return !!pr.paths_truncated || Number(pr.path_count) > (pr.paths || []).length;
+  }
+
+  function currentManifest() {
+    const scope = manifestScope();
+    if (scope !== fileManifestScope) {
+      fileManifests.clear();
+      fileManifestScope = scope;
+    }
+    if (!state.selectedPr) return null;
+    let entry = fileManifests.get(state.selectedPr);
+    if (!entry) {
+      entry = { pr: state.selectedPr, scope, rows: [], total: null, next: 1,
+        loading: false, error: "", query: "", scroll: 0 };
+      fileManifests.set(entry.pr, entry);
+      while (fileManifests.size > 4) fileManifests.delete(fileManifests.keys().next().value);
+    }
+    return entry;
+  }
+
+  async function loadManifestPage(entry) {
+    if (!entry || entry.loading || entry.next === null) return;
+    entry.loading = true;
+    entry.error = "";
+    const groupId = state.selectedGroupId;
+    const page = entry.next;
+    const visible = () => entry.scope === manifestScope() &&
+      fileManifests.get(entry.pr) === entry && state.selectedPr === entry.pr &&
+      state.selectedGroupId === groupId;
+    renderFileNavigator(entry);
+    try {
+      const response = await readTool("get_pr", {
+        repo: state.repo, pr: entry.pr, file_page: page, file_page_size: 80,
+        expected_store_version: state.storeVersion,
+        expected_snapshot_version: state.snapshotVersion,
+      });
+      if (entry.scope !== manifestScope() || fileManifests.get(entry.pr) !== entry) return;
+      if (!response.ok) throw new Error(response.error && response.error.message || "Could not load files");
+      const data = response.data;
+      const context = response.context;
+      if (!context || context.repo !== state.repo ||
+          context.store_version !== state.storeVersion || context.snapshot_version !== state.snapshotVersion) {
+        throw new Error("Snapshot changed. Reload the workspace before loading more files.");
+      }
+      const seen = new Set(entry.rows.map((file) => file.path));
+      for (const file of data.files || []) {
+        if (validRepoPath(file.path) && !seen.has(file.path)) {
+          entry.rows.push(file);
+          seen.add(file.path);
+        }
+      }
+      entry.total = data.file_count;
+      entry.next = data.next_file_page || null;
+    } catch (error) {
+      entry.error = error.message || "Could not load files";
+    } finally {
+      entry.loading = false;
+      if (visible()) {
+        renderFileNavigator(entry);
+        const count = $("reviewFiles") && $("reviewFiles").querySelector(".file-nav-count");
+        if (count) count.textContent = manifestCount(entry);
+      }
+    }
+  }
+
+  function manifestCount(entry) {
+    if (entry.error) return entry.rows.length ? entry.rows.length + " loaded · Could not load more files" : "Could not load files";
+    return entry.total === null ? "Loading files…" : entry.rows.length + " / " + entry.total + " loaded";
+  }
+
+  function setFilesPane(active) {
+    filesPaneActive = active;
+    const dialog = $("fileNavigatorDialog");
+    const inDialog = !!(dialog && dialog.open);
+    const layout = document.querySelector(".layout");
+    if (layout) layout.classList.toggle("files-active", active);
+    if ($("worklistPane")) $("worklistPane").hidden = active && !inDialog;
+    if ($("fileNavigator")) $("fileNavigator").hidden = !active && !inDialog;
+    for (const [id, selected] of [["navigatorWorklistBtn", !active], ["navigatorFilesBtn", active]]) {
+      const button = $(id);
+      if (button) {
+        button.classList.toggle("active", selected);
+        button.setAttribute("aria-pressed", String(selected));
+      }
+    }
+  }
+
+  function openFilesNavigator() {
+    const entry = currentManifest();
+    if (!entry) return;
+    if (window.matchMedia("(max-width: 700px)").matches) {
+      const dialog = $("fileNavigatorDialog");
+      if (!dialog || dialog.open) return;
+      filesDialogFocus = document.activeElement;
+      $("fileNavigatorDialogBody").appendChild($("fileNavigator"));
+      $("fileNavigator").hidden = false;
+      $("fileNavigatorDialogTitle").textContent = "Files · #" + entry.pr;
+      dialog.showModal();
+      $("fileNavigatorSearch").focus();
+    } else setFilesPane(true);
+    renderFileNavigator(entry);
+  }
+
+  function renderFileNavigator(entry) {
+    const list = $("fileNavigatorList");
+    if (!list || !entry || entry.pr !== state.selectedPr || entry.scope !== manifestScope()) return;
+    $("fileNavigatorTitle").textContent = "Files · #" + entry.pr;
+    if ($("fileNavigatorDialogTitle")) $("fileNavigatorDialogTitle").textContent = "Files · #" + entry.pr;
+    $("fileNavigatorSearch").value = entry.query;
+    const query = entry.query.trim().toLocaleLowerCase();
+    const rows = entry.rows.filter((file) => file.path.toLocaleLowerCase().includes(query) ||
+      (file.previous_path || "").toLocaleLowerCase().includes(query));
+    $("fileNavigatorStatus").textContent = entry.error ||
+      (manifestCount(entry) + (query ? " · " + rows.length + (rows.length === 1 ? " match" : " matches") + " in loaded files" : "") +
+      (entry.next && entry.total !== null ? " · " + Math.max(0, entry.total - entry.rows.length) + " remaining" : "") +
+      (entry.loading && entry.rows.length ? " · Loading…" : ""));
+    const groups = new Map();
+    for (const file of rows) {
+      const parts = file.path.split("/");
+      const directory = parts.length === 1 ? "Repository root" : parts.slice(0, parts.length > 2 ? 2 : 1).join("/") + "/";
+      if (!groups.has(directory)) groups.set(directory, []);
+      groups.get(directory).push(file);
+    }
+    const fragment = document.createDocumentFragment();
+    for (const [directory, files] of groups) {
+      const heading = document.createElement("div");
+      heading.className = "file-nav-directory";
+      heading.textContent = directory + " · " + files.length;
+      fragment.appendChild(heading);
+      for (const file of files) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "file-nav-row" + (file.path === state.selectedFile ? " active" : "");
+        button.setAttribute("aria-pressed", String(file.path === state.selectedFile));
+        const add = (className, text) => {
+          const span = document.createElement("span"); span.className = className;
+          span.textContent = text; button.appendChild(span);
+        };
+        add("file-nav-name", file.path.split("/").pop());
+        add("file-nav-parent", file.previous_path ? file.previous_path + " → " + file.path : file.path);
+        add("file-nav-status", ({ added: "A", modified: "M", removed: "D", deleted: "D", renamed: "R" })[file.status] || file.status || "M");
+        add("file-nav-meta", (file.additions == null ? "" : "+" + file.additions) + " " +
+          (file.deletions == null ? "" : "−" + file.deletions));
+        if (!file.patch_available) add("file-nav-gap", "No patch");
+        else if (!file.patch_complete) add("file-nav-gap", "Partial patch");
+        button.onclick = () => {
+          const group = groupById(state.selectedGroupId);
+          const wasDialogOpen = $("fileNavigatorDialog").open;
+          changeView(() => { state.selectedFile = file.path; });
+          if (wasDialogOpen) $("fileNavigatorDialog").close();
+          renderReviewFiles(group);
+          if (!wasDialogOpen) {
+            const selected = list.querySelector('[aria-pressed="true"]');
+            if (selected) selected.focus({ preventScroll: true });
+          }
+          renderDiffs(group);
+          loadRelatedIfOpen(state.selectedPr, file.path);
+          if ($("fileQueueBlock").open) openFileQueue(file.path, { scroll: false });
+          writeUrl(true);
+        };
+        fragment.appendChild(button);
+      }
+    }
+    if (!rows.length) {
+      const empty = document.createElement("p");
+      empty.className = "muted";
+      empty.textContent = entry.loading ? "Loading files…" : query ? "No matching loaded files." : "No file metadata available.";
+      fragment.appendChild(empty);
+    }
+    list.replaceChildren(fragment);
+    list.scrollTop = entry.scroll;
+    const more = $("fileNavigatorMore");
+    more.hidden = entry.next === null;
+    more.disabled = entry.loading;
+    more.textContent = entry.loading ? "Loading…" : entry.error ? "Retry loading files" : "Load more files";
+    more.onclick = () => loadManifestPage(entry);
+    list.onscroll = () => { entry.scroll = list.scrollTop; };
+    $("fileNavigatorSearch").oninput = (event) => {
+      entry.query = event.target.value;
+      entry.scroll = 0;
+      renderFileNavigator(entry);
+    };
+  }
+
   function renderReviewFiles(group) {
     const root = $("reviewFiles");
     if (!root) return;
     root.replaceChildren();
-    const pr = prByNumber(state.selectedPr);
-    const paths = pr ? pr.paths || [] : [];
-    paths.forEach((path) => {
-      const button = document.createElement("button");
-      button.type = "button";
-      button.className = "btn file-choice" + (path === state.selectedFile ? " active" : "");
-      button.textContent = path;
-      button.setAttribute("aria-pressed", String(path === state.selectedFile));
-      button.addEventListener("click", () => {
-        changeView(() => { state.selectedFile = path; });
-        renderReviewFiles(group);
-        renderDiffs(group);
-        loadRelatedIfOpen(state.selectedPr, path);
-        if ($("fileQueueBlock").open) openFileQueue(path, { scroll: false });
-        writeUrl(true);
-      });
-      root.appendChild(button);
-    });
-    if (!paths.length) root.textContent = "No file evidence available for this PR.";
+    const entry = currentManifest();
+    const key = JSON.stringify([state.repo, state.selectedGroupId, state.selectedPr]);
+    if (filesCompare.key !== key) filesCompare = { key, pr: null };
+    state.fileComparePr = filesCompare.pr;
+    const open = document.createElement("button");
+    open.type = "button";
+    open.className = "btn file-nav-open";
+    open.textContent = "Files";
+    open.onclick = openFilesNavigator;
+    root.appendChild(open);
+    const path = document.createElement("span");
+    path.className = "file-nav-path";
+    path.textContent = state.selectedFile || "Select a changed file";
+    root.appendChild(path);
+    const count = document.createElement("span");
+    count.className = "file-nav-count";
+    count.textContent = entry ? manifestCount(entry) : "No PR selected";
+    root.appendChild(count);
     const compare = document.createElement("select");
-    compare.className = "btn file-choice";
+    compare.className = "btn file-nav-compare";
     compare.setAttribute("aria-label", "Compare selected PR with");
     const none = document.createElement("option");
     none.value = "";
     none.textContent = "Compare with…";
     compare.appendChild(none);
-    (group.pr_numbers || []).filter((number) => number !== state.selectedPr).forEach((number) => {
+    ((group && group.pr_numbers) || []).filter((number) => number !== state.selectedPr).forEach((number) => {
       const option = document.createElement("option");
       option.value = String(number);
       option.textContent = "#" + number;
       compare.appendChild(option);
     });
-    compare.onchange = () => renderDiffs(group, { comparePr: Number(compare.value) || null });
-    if (compare.options.length > 1) root.appendChild(compare);
+    compare.value = filesCompare.pr ? String(filesCompare.pr) : "";
+    const layout = document.createElement("select");
+    layout.className = "btn diff-layout-choice";
+    layout.setAttribute("aria-label", "Comparison layout");
+    layout.title = "Auto uses two columns when the diff area is at least 740px wide";
+    for (const [value, label] of [["auto", "Auto layout"], ["side", "Side by side"], ["stacked", "Stacked"]]) {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = label;
+      layout.appendChild(option);
+    }
+    layout.value = document.documentElement.dataset.diffLayout || "auto";
+    layout.hidden = !filesCompare.pr;
+    layout.onchange = () => {
+      document.documentElement.dataset.diffLayout = layout.value;
+      try { window.localStorage.setItem("triage.diff-layout.v1", layout.value); } catch (_) {}
+    };
+    compare.onchange = () => {
+      filesCompare.pr = Number(compare.value) || null;
+      state.fileComparePr = filesCompare.pr;
+      layout.hidden = !filesCompare.pr;
+      renderDiffs(group);
+    };
+    if (compare.options.length > 1) root.append(compare, layout);
+    setFilesPane(filesPaneActive);
+    renderFileNavigator(entry);
+    if (stateInitialized && entry && !entry.rows.length && !entry.error && entry.next !== null) loadManifestPage(entry);
   }
 
   function proposalGroup() {
@@ -3840,7 +4082,9 @@
       nums = takeWithSelected(allNums, selectedGroupPr, 8);
       if (selectedGroupPr) {
         allNums = [selectedGroupPr];
-        if (opts && groupSet.has(opts.comparePr) && opts.comparePr !== selectedGroupPr) allNums.push(opts.comparePr);
+        const comparison = opts && Object.prototype.hasOwnProperty.call(opts, "comparePr")
+          ? opts.comparePr : state.fileComparePr;
+        if (groupSet.has(comparison) && comparison !== selectedGroupPr) allNums.push(comparison);
         nums = allNums;
       }
     } else {
@@ -4189,7 +4433,7 @@
     return { ok: true, context: currentViewContext() };
   }
 
-  function openTarget(target, ifContext) {
+  async function openTarget(target, ifContext) {
     if (!stateInitialized) return actionError("not_ready", "the current repository snapshot is still loading.", true);
     const input = actionInput(target, ifContext, "target");
     const guard = checkViewContext(input.context);
@@ -4242,7 +4486,36 @@
             const member = prByNumber(number);
             return member && (member.paths || []).includes(path);
           });
-      if (!pathBelongs) return actionError("invalid_request", "path does not belong to the selected PR.", false);
+      if (!pathBelongs) {
+        // Agent targets must be verified before changing the decision target.
+        // A capped summary is not permission to accept an arbitrary path.
+        const candidates = (pr ? [pr] : (group.pr_numbers || []).map(prByNumber))
+          .filter((member) => member && (member.paths_truncated || Number(member.path_count) > (member.paths || []).length));
+        let found = false;
+        const revision = state.viewRevision;
+        const scope = manifestScope();
+        try {
+          for (const member of candidates) {
+            let page = 1;
+            while (page) {
+              const response = await readTool("get_pr", { repo: state.repo, pr: member.number,
+                file_page: page, file_page_size: 80, expected_store_version: state.storeVersion,
+                expected_snapshot_version: state.snapshotVersion });
+              if (revision !== state.viewRevision || scope !== manifestScope()) {
+                return actionError("stale_context", "View changed while checking this path.", true);
+              }
+              if (!response.ok) return actionError("not_found", "Could not verify this path.", true);
+              found = (response.data.files || []).some((file) => file.path === path || file.previous_path === path);
+              if (found) break;
+              page = response.data.next_file_page;
+            }
+            if (found) break;
+          }
+        } catch (error) {
+          return actionError("not_found", error.message || "Could not verify this path.", true);
+        }
+        if (!found) return actionError("invalid_request", "path does not belong to the selected PR.", false);
+      }
     }
     const changed = changeView(() => {
       state.selectedGroupId = groupId;
@@ -4313,12 +4586,8 @@
       if (proposalIdInput) proposalIdInput.value = id;
       const block = $("proposalBlock");
       if (block) block.open = true;
-      $("detail").classList.add("context-open");
+      setContextSidebar(true);
       setMobilePane("context");
-      if ($("contextToggle")) {
-        $("contextToggle").setAttribute("aria-expanded", "true");
-        $("contextToggle").textContent = "Close context";
-      }
       return { ok: true, proposal: data.proposal, context: currentViewContext() };
     } catch (error) {
       if (gen !== proposalGen || !workspaceCurrent(workspaceRepo, workspaceToken)) return staleViewError();
@@ -4888,12 +5157,34 @@
 
   const workspaceDialog = $("workspaceDialog");
   function setMobilePane(pane) {
+    if (pane === "list" && window.matchMedia("(max-width: 700px)").matches) setFilesPane(false);
     document.body.dataset.mobilePane = pane;
     document.querySelectorAll(".mobile-navigation [data-mobile-pane]").forEach((button) => {
       button.setAttribute("aria-pressed", String(button.dataset.mobilePane === pane));
     });
   }
   setMobilePane("list");
+  if ($("navigatorWorklistBtn")) $("navigatorWorklistBtn").onclick = () => setFilesPane(false);
+  if ($("navigatorFilesBtn")) $("navigatorFilesBtn").onclick = openFilesNavigator;
+  if ($("fileNavigatorClose")) $("fileNavigatorClose").onclick = () => $("fileNavigatorDialog").close();
+  if ($("fileNavigatorDialog")) $("fileNavigatorDialog").addEventListener("keydown", (event) => {
+    if (event.key !== "Escape") return;
+    // Search inputs otherwise consume Escape to clear the query before the
+    // native dialog can close. Keep the user's query and use normal teardown.
+    event.preventDefault();
+    event.stopPropagation();
+    $("fileNavigatorDialog").close();
+  }, true);
+  if ($("fileNavigatorDialog")) $("fileNavigatorDialog").addEventListener("close", () => {
+    document.querySelector(".pane.left").appendChild($("fileNavigator"));
+    setFilesPane(filesPaneActive);
+    if (filesDialogFocus && filesDialogFocus.isConnected) filesDialogFocus.focus({ preventScroll: true });
+    else if ($("reviewFiles")) {
+      const open = $("reviewFiles").querySelector(".file-nav-open");
+      if (open) open.focus({ preventScroll: true });
+    }
+    filesDialogFocus = null;
+  });
   document.querySelectorAll(".mobile-navigation [data-mobile-pane]").forEach((button) => {
     button.addEventListener("click", () => setMobilePane(button.dataset.mobilePane));
   });
@@ -4904,11 +5195,59 @@
     mobileWorkspaceToggle.setAttribute("aria-expanded", String(open));
   });
   const contextToggle = $("contextToggle");
+  let contextDrawerTrigger = null;
+  function closeContextDrawer(restoreFocus = false) {
+    $("detail").classList.remove("context-drawer-open");
+    const trigger = contextDrawerTrigger;
+    contextDrawerTrigger = null;
+    document.querySelectorAll("[data-context-section]").forEach((button) => button.setAttribute("aria-expanded", "false"));
+    if (restoreFocus && trigger?.isConnected) trigger.focus({ preventScroll: true });
+  }
+  function setContextSidebar(open, persist = false) {
+    closeContextDrawer();
+    document.documentElement.dataset.contextSidebar = open ? "shown" : "hidden";
+    if (contextToggle) {
+      contextToggle.setAttribute("aria-expanded", String(open));
+      contextToggle.textContent = open ? "Hide sidebar" : "Show sidebar";
+    }
+    if (persist) {
+      try { window.localStorage.setItem("triage.context-sidebar.v1", open ? "shown" : "hidden"); }
+      catch (_) { /* The toggle still works for this session. */ }
+    }
+  }
+  setContextSidebar(document.documentElement.dataset.contextSidebar === "shown");
   if (contextToggle) contextToggle.addEventListener("click", () => {
-    const open = $("detail").classList.toggle("context-open");
-    contextToggle.setAttribute("aria-expanded", String(open));
-    contextToggle.textContent = open ? "Close context" : "Context";
+    setContextSidebar(document.documentElement.dataset.contextSidebar !== "shown", true);
   });
+  document.querySelectorAll("[data-context-section]").forEach((button) => {
+    button.setAttribute("aria-controls", "reviewContext");
+    button.addEventListener("click", () => {
+      const section = $(button.dataset.contextSection);
+      if (!section) return;
+      if (contextDrawerTrigger === button) { closeContextDrawer(true); return; }
+      closeContextDrawer();
+      contextDrawerTrigger = button;
+      $("detail").classList.add("context-drawer-open");
+      button.setAttribute("aria-expanded", "true");
+      $("contextDrawerTitle").textContent = button.getAttribute("aria-label") || "Context";
+      if (section.tagName === "DETAILS") section.open = true;
+      const panel = $("reviewContext");
+      panel.scrollTop += section.getBoundingClientRect().top - panel.getBoundingClientRect().top - 60;
+      const target = section.querySelector("summary, button, a") || section;
+      if (target === section) section.tabIndex = -1;
+      target.focus({ preventScroll: true });
+    });
+  });
+  $("contextDrawerClose").addEventListener("click", () => closeContextDrawer(true));
+  document.addEventListener("pointerdown", (event) => {
+    if (contextDrawerTrigger && !event.target.closest("#reviewContext, .context-rail")) closeContextDrawer();
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape" || !contextDrawerTrigger || document.querySelector("dialog[open]")) return;
+    event.preventDefault();
+    event.stopPropagation();
+    closeContextDrawer(true);
+  }, true);
   const newWorkspaceButton = $("newWorkspaceBtn");
   const settingsWorkspaceButton = $("settingsWorkspaceBtn");
   const workspaceCancelButton = $("workspaceCancelBtn");

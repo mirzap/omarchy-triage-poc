@@ -171,7 +171,10 @@
     if (missing.length) throw new Error("tool metadata unavailable");
     return READ_TOOL_NAMES.map((name) => ({
       name,
-      description: READ_DESCRIPTIONS[name],
+      description: READ_DESCRIPTIONS[name] + " Responses are losslessly paginated: use retrieval.continuations " +
+        "for exact follow-up arguments, including snapshot preconditions. Never infer patch equivalence " +
+        "from paths. If the host clips a response, reduce page_size/member_page_size/file_page_size " +
+        "or patch_limit as supported; do not retry the same oversized call.",
       inputSchema: copySchema(byName.get(name).inputSchema),
       annotations: READ_ANNOTATIONS,
     }));

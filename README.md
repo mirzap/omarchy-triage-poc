@@ -211,7 +211,41 @@ which helps comparison but is not a risk or urgency ranking. The UI remembers a
 valid review position and supports saving a chosen group decision and moving to
 the next pending group.
 
+The **Files** navigator shares the left pane with the work list. Selecting a
+group automatically opens Files on desktop.
+You can switch back to **Work list** to choose another group. Search loaded
+file paths, browse directory groups, and use **Load more files** for large PRs;
+the displayed counts distinguish loaded files from the full manifest. On mobile,
+Files opens a full-screen picker and selecting a file returns to its diff.
+Comparison stays in the diff header. Opening a file does not record a decision,
+and loading manifest pages does not recover patches missing from the cached source.
+
+After choosing **Compare with**, choose **Auto layout**, **Side by side**, or
+**Stacked**. Auto uses two columns when the diff area (not the entire window) is
+at least 740 CSS pixels wide. The layout choice is remembered in this browser;
+Side by side forces two columns even in a narrower window.
+
+The right sidebar can collapse to an icon menu; each icon opens its section in an overlay drawer without resizing the diff or changing the saved collapsed state. Close the drawer with its Close button, Escape, or a click outside it.
+Its visibility is remembered in this browser and applied before first paint.
+The PR description sits below the title and starts collapsed for each selected PR.
+
 ## MCP and WebMCP
+
+Agent reads return complete JSON, not silently shortened text. Large manifests
+and patches are paginated: `retrieval.continuations` provides ready-to-call tool
+arguments with the required store/snapshot versions. Follow the continuations
+needed for the review; for a known file, call `read_patch` directly instead of
+enumerating the whole group file list. Source evidence completeness is separate
+from whether all pages/chunks have been read. PR descriptions are returned in full.
+
+`get_group` defaults to 10 members and 20 shared files per page; its disposition
+records contain decisions, not duplicated file manifests. Use `get_pr` for a PR's
+complete paged file manifest (20 files by default, up to 80). `files_remaining`
+counts manifest rows still to retrieve; `missing_patch_count` and
+`source_incomplete_reasons` describe cached source gaps that pagination cannot
+repair. A large PR is not inherently incomplete. External agent hosts may impose their own output or
+tool-round limits; this app has no six-round agent loop. If a host clips a result,
+request a smaller supported page/chunk instead of repeating the same call.
 
 Install the optional MCP extra in the same environment:
 

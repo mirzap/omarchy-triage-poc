@@ -337,6 +337,40 @@ vm.runInNewContext(
 );
 
 (async () => {
+  // Manifest paging is independent of the capped UI path summary. A response
+  // from an old snapshot must not populate or repaint the replacement view.
+  const manifestState = { repo: "acme/widgets", storeVersion: 7, snapshotVersion: 9,
+    selectedPr: 12, selectedGroupId: "G001" };
+  const manifestRequests = [];
+  let manifestPaints = 0;
+  const manifestContext = { state: manifestState, $() { return null; },
+    validRepoPath(path) { return typeof path === "string"; },
+    renderFileNavigator() { manifestPaints++; },
+    readTool(tool, args) { return new Promise(resolve => manifestRequests.push({ tool, args, resolve })); } };
+  vm.runInNewContext(section("  const fileManifests =", "\n  function manifestCount(") +
+    "\nglobalThis.currentManifest = currentManifest; globalThis.loadManifestPage = loadManifestPage; " +
+    "globalThis.prMayContainPath = prMayContainPath;", manifestContext);
+  const manifest = manifestContext.currentManifest();
+  const firstPage = manifestContext.loadManifestPage(manifest);
+  assert.strictEqual(manifestRequests[0].args.expected_store_version, 7);
+  assert.strictEqual(manifestRequests[0].args.expected_snapshot_version, 9);
+  manifestRequests[0].resolve({ ok: true, context: { repo: "acme/widgets", store_version: 7, snapshot_version: 9 },
+    data: { files: [{ path: "src/beyond-500.ts" }], file_count: 610, next_file_page: 2 } });
+  await firstPage;
+  assert.strictEqual(manifestContext.prMayContainPath({ number: 12, paths: [] }, "src/beyond-500.ts"), true);
+  const nextPage = manifestContext.loadManifestPage(manifest);
+  assert.strictEqual(manifestRequests[1].args.file_page, 2);
+  manifestState.snapshotVersion = 10;
+  const replacement = manifestContext.currentManifest();
+  const paintsBeforeStale = manifestPaints;
+  manifestRequests[1].resolve({ ok: true, context: { repo: "acme/widgets", store_version: 7, snapshot_version: 9 },
+    data: { files: [{ path: "src/stale.ts" }], file_count: 610, next_file_page: null } });
+  await nextPage;
+  assert.strictEqual(replacement.rows.length, 0);
+  assert.strictEqual(manifestPaints, paintsBeforeStale);
+  replacement.next = null;
+  assert.strictEqual(manifestContext.prMayContainPath({ number: 12, paths: [], paths_truncated: true }, "src/absent.ts"), false);
+
   const group = { group_id: "G001", pr_numbers: Array.from({ length: 12 }, (_, i) => i + 1) };
   await context.renderDiffs(group);
   // The workbench requests the selected revision directly, including members

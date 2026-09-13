@@ -163,7 +163,9 @@ TOOL_DEFINITIONS: tuple[dict[str, Any], ...] = (
         "filters": _FILTER_SCHEMA}, ["repo"]),
     _tool("get_group", {"group_id": {"type": "string", "pattern": GROUP_ID.pattern[:-2]},
         "member_page": {"type": "integer", "minimum": 1},
-        "member_page_size": {"type": "integer", "minimum": 1, "maximum": MAX_PAGE}}, ["repo", "group_id"]),
+        "member_page_size": {"type": "integer", "minimum": 1, "maximum": MAX_PAGE},
+        "shared_file_page": {"type": "integer", "minimum": 1},
+        "shared_file_page_size": {"type": "integer", "minimum": 1, "maximum": MAX_PAGE}}, ["repo", "group_id"]),
     _tool("get_pr", {"pr": {"type": "integer", "minimum": 1},
         "file_page": {"type": "integer", "minimum": 1},
         "file_page_size": {"type": "integer", "minimum": 1, "maximum": MAX_PAGE}}, ["repo", "pr"]),
@@ -358,6 +360,38 @@ def _evidence_status(complete: bool, reasons: list[str]) -> dict[str, Any]:
     for reason in reasons:
         if reason and reason not in unique and len(unique) < MAX_REASON_CODES: unique.append(reason)
     return {"complete": bool(complete and not unique), "reasons": unique}
+
+
+def _retrieval_plan(result: Envelope, operation: str, args: Mapping[str, Any]) -> Envelope:
+    """Make lossless continuation actionable, separate from source completeness."""
+    ctx = result["context"]
+    pinned = {**args, "repo": ctx["repo"],
+              "expected_store_version": ctx["store_version"],
+              "expected_snapshot_version": ctx["snapshot_version"]}
+    calls: list[dict[str, Any]] = []
+    data = result["data"]
+    next_page = result.get("page", {}).get("next_page")
+    if next_page is not None:
+        calls.append({"tool": operation, "args": {**pinned, "page": next_page}})
+    fields = {"get_group": (("next_member_page", "member_page"), ("next_shared_file_page", "shared_file_page")),
+              "get_pr": (("next_file_page", "file_page"),),
+              "read_patch": (("next_patch_offset", "patch_offset"),)}
+    for output, parameter in fields.get(operation, ()):
+        if data.get(output) is not None:
+            calls.append({"tool": operation, "args": {**pinned, parameter: data[output]}})
+    if operation == "compare_prs":
+        for item in data.get("items", []):
+            if item.get("next_patch_offset") is not None:
+                calls.append({"tool": "read_patch", "args": {
+                    "repo": ctx["repo"], "pr": item["number"], "path": data["path"],
+                    "patch_offset": item["next_patch_offset"],
+                    "patch_limit": args.get("patch_limit", MAX_PATCH_CHUNK),
+                    "expected_store_version": ctx["store_version"],
+                    "expected_snapshot_version": ctx["snapshot_version"]}})
+    result["retrieval"] = {"complete": not calls, "continuations": calls,
+        "instruction": "Follow continuations for all requested evidence; do not repeat identical calls. "
+                       "Source evidence completeness does not mean every page or patch chunk was read."}
+    return result
 
 
 def _snapshot_id(data: Mapping[str, Any], source: str) -> str:
@@ -573,10 +607,10 @@ def _bundle(ctx: _Context, number: int) -> EvidenceBundle:
         reasons.append("missing_revision")
     if not files: reasons.append("patch_unavailable")
     if any(not str(item.get("patch") or "") for item in files): reasons.append("patch_unavailable")
-    if any(item.get("patch_complete") is not True for item in files): reasons.append("malformed_patch")
+    if any(item.get("patch") and not _file_complete(item) for item in files): reasons.append("malformed_patch")
     if bool(evidence_meta.get("files_cap_reached")): reasons.append("provider_file_cap")
     if source == "github" and not expected_digest: reasons.append("revision_conflict")
-    if not revision.evidence_complete: reasons.append("missing_revision")
+    if not revision.evidence_complete and not reasons: reasons.append("source_evidence_incomplete")
     unique_reasons = tuple(dict.fromkeys(reasons))
     return EvidenceBundle(number, display_meta, tuple(files), revision, snapshot,
                           revision.evidence_complete and not legacy and not unique_reasons,
@@ -641,23 +675,26 @@ def _patch_limit(value: Any = None) -> int:
 
 
 def _pr_data(bundle: EvidenceBundle, stored: Mapping[str, Any], *, file_page: int = 1,
-             file_page_size: int = MAX_PAGE) -> dict[str, Any]:
+             file_page_size: int = 20) -> dict[str, Any]:
     meta = bundle.meta
     file_rows = [_file_summary(item) for item in bundle.files]
     file_start = (file_page - 1) * file_page_size
     file_page_rows = file_rows[file_start:file_start + file_page_size]
     file_pages = _page_info(len(file_rows), file_page, file_page_size)
-    out = {"number": bundle.number, "title": str(meta.get("title") or "")[:512],
-           "body": str(meta.get("body") or "")[:24_000], "user": str(meta.get("user") or "")[:256],
-           "html_url": str(meta.get("html_url") or "")[:2048], "created_at": str(meta.get("created_at") or ""),
+    out = {"number": bundle.number, "title": str(meta.get("title") or ""),
+           "body": str(meta.get("body") or ""), "user": str(meta.get("user") or ""),
+           "html_url": str(meta.get("html_url") or ""), "created_at": str(meta.get("created_at") or ""),
            "updated_at": str(meta.get("updated_at") or ""), "head_sha": bundle.revision.head_sha,
            "base_sha": bundle.revision.base_sha, "content_digest": bundle.revision.content_digest,
            "evidence_source": bundle.revision.source, "cache_snapshot_id": bundle.snapshot_id,
            "evidence_complete": bundle.complete, "legacy_unverified": bundle.legacy_unverified,
+           "source_incomplete_reasons": list(bundle.reasons),
+           "missing_patch_count": sum(not item.get("patch") for item in bundle.files),
            "revision": bundle.revision.to_dict(), "files": file_page_rows,
            "file_count": len(file_rows), "file_page": file_page, "file_page_size": file_page_size,
            "file_pages": file_pages["pages"], "next_file_page": file_pages["next_page"],
-           "files_truncated": file_pages["truncated"]}
+           "files_truncated": file_pages["truncated"],
+           "files_returned": len(file_page_rows), "files_remaining": file_pages["truncated"]}
     if "group_id" in stored: out["group_id"] = stored.get("group_id") or ""
     if "label" in stored: out["label"] = stored.get("label") or "needs-human"
     return out
@@ -793,7 +830,7 @@ class WorkspaceService:
         common = {"repo", "expected_store_version", "expected_snapshot_version"}
         per_operation = {
             "get_workspace": set(), "list_groups": {"page", "page_size", "filters"},
-            "search_prs": {"page", "page_size", "filters"}, "get_group": {"group_id", "member_page", "member_page_size"},
+            "search_prs": {"page", "page_size", "filters"}, "get_group": {"group_id", "member_page", "member_page_size", "shared_file_page", "shared_file_page_size"},
             "get_pr": {"pr", "file_page", "file_page_size"}, "read_patch": {"pr", "path", "patch_offset", "patch_limit"},
             "compare_prs": {"path", "group_id", "prs", "page", "page_size", "patch_offset", "patch_limit"},
             "find_related": {"pr", "path", "limit"}, "get_history": {"page", "page_size", "filters"},
@@ -809,14 +846,12 @@ class WorkspaceService:
             allow_missing=operation == "get_workspace",
         )
         if operation == "get_workspace": return self._workspace(ctx)
-        if operation == "list_groups": return self._groups(ctx, args)
-        if operation == "search_prs": return self._prs(ctx, args)
-        if operation == "get_group": return self._group(ctx, args)
-        if operation == "get_pr": return self._pr(ctx, args)
-        if operation == "read_patch": return self._patch(ctx, args)
-        if operation == "compare_prs": return self._compare(ctx, args)
-        if operation == "find_related": return self._related(ctx, args)
-        return self._history(ctx, args)
+        handler = {"list_groups": self._groups, "search_prs": self._prs,
+                   "get_group": self._group, "get_pr": self._pr, "read_patch": self._patch,
+                   "compare_prs": self._compare, "find_related": self._related,
+                   "get_history": self._history}[operation]
+        result = handler(ctx, args)
+        return _retrieval_plan(result, operation, args)
 
     def read_pr_evidence(self, repo: str, pr: int) -> EvidenceBundle:
         args = {"repo": repo}
@@ -885,18 +920,21 @@ class WorkspaceService:
             raise _error(409, "revision_conflict", "group evidence does not match the active snapshot") from exc
         payload = group.to_dict()
         member_page = _page(args.get("member_page"), "member_page", 1, MAX_INT)
-        member_page_size = _page(args.get("member_page_size"), "member_page_size", 80, MAX_PAGE)
+        member_page_size = _page(args.get("member_page_size"), "member_page_size", 10, MAX_PAGE)
         _continuation_guard(args, member_page=member_page)
-        member_info = _page_info(len(revisions), member_page, member_page_size)
+        member_info = _page_info(len(group.pr_numbers), member_page, member_page_size)
         member_start = (member_page - 1) * member_page_size
-        revision_rows = revisions[member_start:member_start + member_page_size]
         payload["member_numbers"] = list(group.pr_numbers[member_start:member_start + member_page_size])
+        selected_members = set(payload["member_numbers"])
+        revision_rows = [revision for revision in revisions if revision.pr_number in selected_members]
         payload["member_count"] = len(group.pr_numbers)
         payload["member_page"] = member_page
         payload["member_page_size"] = member_page_size
         payload["next_member_page"] = member_info["next_page"]
         payload["revision_refs"] = [item.to_dict() for item in revision_rows]
         payload["member_revisions"] = payload["revision_refs"]
+        payload["member_path_signatures"] = {str(n): group.member_path_signatures[str(n)]
+            for n in payload["member_numbers"] if str(n) in group.member_path_signatures}
         payload["revision_ref_count"] = len(revisions)
         payload["revision_ref_page"] = member_page
         payload["revision_ref_page_size"] = member_page_size
@@ -905,21 +943,37 @@ class WorkspaceService:
         payload["members_truncated"] = member_info["truncated"]
         payload["snapshot_digest"] = digest
         payload["evidence_complete"] = complete
+        file_page = _page(args.get("shared_file_page"), "shared_file_page", 1, MAX_INT)
+        file_size = _page(args.get("shared_file_page_size"), "shared_file_page_size", 20, MAX_PAGE)
+        _continuation_guard(args, file_page=file_page)
+        file_info = _page_info(len(group.shared_files), file_page, file_size)
+        file_start = (file_page - 1) * file_size
+        payload["shared_files"] = group.shared_files[file_start:file_start + file_size]
+        payload["shared_file_count"] = len(group.shared_files)
+        payload["shared_file_page"] = file_page
+        payload["shared_file_page_size"] = file_size
+        payload["next_shared_file_page"] = file_info["next_page"]
+        payload["shared_files_remaining"] = file_info["truncated"]
+        payload.pop("centroid", None)
         state = _state(ctx)
+        # A disposition is a decision, not another copy of the PR's entire
+        # file manifest. Manifests remain losslessly available through get_pr.
+        decision_fields = {"number", "title", "disposition", "disposition_status",
+                           "disposition_reason", "duplicate_of", "disposition_revision"}
+        state_prs = {row.get("number"): row for row in state.get("prs") or []
+                     if row.get("group_id") == gid}
         payload["dispositions"] = {
-            str(number): next(
-                (row for row in state.get("prs") or []
-                 if row.get("number") == number and row.get("group_id") == gid),
-                {"number": number, "disposition": "pending", "disposition_status": "pending"},
-            )
-            for number in group.pr_numbers
+            str(number): {key: value for key, value in state_prs.get(number,
+                {"number": number, "disposition": "pending", "disposition_status": "pending"}).items()
+                if key in decision_fields}
+            for number in payload["member_numbers"]
         }
         reasons = [] if complete else ["missing_revision"]
         return _envelope(ctx, payload, evidence=_evidence_status(complete, reasons))
 
     def _pr(self, ctx: _Context, args: Mapping[str, Any]) -> Envelope:
         file_page = _page(args.get("file_page"), "file_page", 1, MAX_INT)
-        file_page_size = _page(args.get("file_page_size"), "file_page_size", 80, MAX_PAGE)
+        file_page_size = _page(args.get("file_page_size"), "file_page_size", 20, MAX_PAGE)
         _continuation_guard(args, file_page=file_page)
         bundle = _bundle(ctx, _positive(args.get("pr"), "pr"))
         payload = _pr_data(bundle, _stored_pr(ctx, bundle.number), file_page=file_page,

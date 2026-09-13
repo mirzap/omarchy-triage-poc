@@ -4,8 +4,9 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Triage Workspace</title>
+  <script src="/preferences.js?v=2"></script>
   <link rel="stylesheet" href="/styles.css?v=32" />
-  <link rel="stylesheet" href="/workbench.css?v=1" />
+  <link rel="stylesheet" href="/workbench.css?v=6" />
 </head>
 <body>
   <header class="topbar">
@@ -78,6 +79,11 @@
 
   <main class="layout">
     <aside class="pane left">
+      <nav id="navigatorTabs" class="navigator-tabs" aria-label="Left pane">
+        <button id="navigatorWorklistBtn" class="btn" type="button" aria-pressed="true">Work list</button>
+        <button id="navigatorFilesBtn" class="btn" type="button" aria-pressed="false">Files</button>
+      </nav>
+      <div id="worklistPane" class="worklist-pane">
       <div class="left-tabs" role="tablist">
         <button type="button" class="tab active" id="tabQueue" data-tab="queue" role="tab" aria-selected="true">Queue</button>
         <button type="button" class="tab" id="tabGroups" data-tab="groups" role="tab" aria-selected="false">Groups</button>
@@ -92,6 +98,17 @@
       <div id="queueList" class="virt-scroll" role="list"></div>
       <div id="groupList" class="virt-scroll hidden" role="list"></div>
       <div id="allPrList" class="virt-scroll hidden" role="list"></div>
+      </div>
+      <section id="fileNavigator" class="file-navigator" aria-labelledby="fileNavigatorTitle" hidden>
+        <div class="file-navigator-head">
+          <h2 id="fileNavigatorTitle">Changed files</h2>
+          <label class="sr-only" for="fileNavigatorSearch">Search changed file paths</label>
+          <input id="fileNavigatorSearch" type="search" placeholder="Find a file or directory…" autocomplete="off" spellcheck="false" />
+          <div id="fileNavigatorStatus" class="file-navigator-status" role="status" aria-live="polite"></div>
+        </div>
+        <div id="fileNavigatorList" class="file-navigator-list" aria-label="Changed files"></div>
+        <button id="fileNavigatorMore" class="btn file-navigator-more" type="button" hidden>Load more files</button>
+      </section>
     </aside>
 
     <section class="pane center">
@@ -101,9 +118,13 @@
           <div class="detail-ident">
             <div class="detail-kicker muted" id="detailKicker"></div>
             <div class="detail-title" id="detailTitle"></div>
+            <details class="block more-block pr-description" id="prBodyBlock">
+              <summary id="prBodyHead" class="queue-toggle">Description</summary>
+              <div id="prBody" class="pr-body muted">Select a PR to read its description.</div>
+            </details>
             <div class="muted" id="detailMeta"></div>
           </div>
-          <button id="contextToggle" class="btn subtle" type="button" aria-expanded="false">Context</button>
+          <button id="contextToggle" class="btn subtle" type="button" aria-controls="reviewContext" aria-expanded="false">Sidebar</button>
         </div>
 <div id="reviewFiles" class="review-files" aria-label="Changed files"></div><div class="review-scroll">        <div class="block" id="diffBlock">
           <h3>Diff</h3>
@@ -135,7 +156,17 @@
           </div>
           <div id="dispositionHint" class="muted"></div>
         </section>
-</div><aside id="reviewContext" class="review-context" aria-label="Group context">
+</div>
+<nav class="context-rail" aria-label="Sidebar sections">
+  <button class="btn" type="button" data-context-section="membersBlock" aria-label="Group members" title="Group members"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="9" cy="8" r="3"/><path d="M3 21v-3a6 6 0 0 1 12 0v3M16 5a3 3 0 0 1 0 6m2 3a5 5 0 0 1 3 5v2"/></svg></button>
+  <button class="btn" type="button" data-context-section="groupActions" aria-label="Group decisions" title="Group decisions"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L20 5M20 12v8H4V4h10"/></svg></button>
+  <button class="btn" type="button" data-context-section="proposalChooser" aria-label="Agent drafts" title="Agent drafts"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 3H4v18h16V11M10 14l1-4 8-8 3 3-8 8-4 1Z"/></svg></button>
+  <button class="btn" type="button" data-context-section="relatedBlock" aria-label="Related patches" title="Related patches"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m10 13 4-4M8 16l-2 2a4 4 0 0 1-6-6l5-5a4 4 0 0 1 6 0m2 1 2-2a4 4 0 0 1 6 6l-5 5a4 4 0 0 1-6 0"/></svg></button>
+  <button class="btn" type="button" data-context-section="overlapBlock" aria-label="File overlap" title="File overlap"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="12" height="12" rx="2"/><rect x="9" y="9" width="12" height="12" rx="2"/></svg></button>
+  <button class="btn" type="button" data-context-section="evidenceDetails" aria-label="Evidence and labels" title="Evidence and labels"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 2 8 4v6c0 5-8 10-8 10S4 17 4 12V6l8-4Z"/><path d="m8 12 3 3 5-6"/></svg></button>
+</nav>
+<aside id="reviewContext" class="review-context" aria-label="Group context">
+        <div class="context-drawer-head"><span id="contextDrawerTitle">Context</span><button id="contextDrawerClose" class="btn" type="button" aria-label="Close sidebar drawer">Close</button></div>
         <div class="block" id="membersBlock">
           <h3 id="membersHead">PRs in this shape</h3>
           <div id="detailMembersWrap" class="member-wrap">
@@ -152,10 +183,6 @@
             <button id="saveNextBtn" type="button" class="btn" disabled>Save &amp; next pending</button>
           </div>
 </details>
-        <details class="block more-block" id="prBodyBlock">
-          <summary id="prBodyHead" class="queue-toggle">Description</summary>
-          <div id="prBody" class="pr-body muted">Click a PR above.</div>
-        </details>
         <details id="proposalChooser" class="block proposal-chooser">
           <summary>Agent drafts <span id="proposalCount"></span></summary>
           <div class="panel-heading">
@@ -207,7 +234,7 @@
             <table id="overlapMatrix" class="overlap-matrix"></table>
           </div>
         </details>
-<details class="block more-block"><summary class="queue-toggle">Evidence &amp; labels</summary>            <div class="label-stack" id="detailPills"></div>
+<details class="block more-block" id="evidenceDetails"><summary class="queue-toggle">Evidence &amp; labels</summary>            <div class="label-stack" id="detailPills"></div>
             <details class="label-key">
               <summary>All labels</summary>
               <div class="label-stack" id="labelKeyAll"></div>
@@ -232,8 +259,16 @@
     </aside>
   </main>
 
+  <dialog id="fileNavigatorDialog" class="file-navigator-dialog" aria-labelledby="fileNavigatorDialogTitle">
+    <div class="file-navigator-dialog-head">
+      <h2 id="fileNavigatorDialogTitle">Changed files</h2>
+      <button id="fileNavigatorClose" class="btn" type="button">Close</button>
+    </div>
+    <div id="fileNavigatorDialogBody" class="file-navigator-dialog-body"></div>
+  </dialog>
+
   <script src="/vendor/virtual.js"></script>
-  <script src="/app.js?v=38"></script>
-  <script src="/webmcp.js?v=1"></script>
+  <script src="/app.js?v=44"></script>
+  <script src="/webmcp.js?v=2"></script>
 </body>
 </html>
