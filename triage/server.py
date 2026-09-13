@@ -21,6 +21,7 @@ from urllib.parse import parse_qs, unquote_to_bytes, urlsplit
 
 from triage import gh as gh_module
 from triage import rank as rank_module
+from triage import service as service_module
 from triage import store as store_module
 from triage.github import parse_repo
 from triage.models import ChangedFile, PullRequest
@@ -253,7 +254,12 @@ def start_fetch_async(source: str, repo: str, limit: int,
 
 
 def _repo_key(value: Any) -> str:
-    repo = str(value or "").strip().strip("/").lower()
+    if not isinstance(value, str):
+        raise RequestProblem(400, "invalid_repo", "repo must be owner/name")
+    try:
+        repo = value.encode("utf-8", "strict").decode("utf-8").strip().strip("/").lower()
+    except UnicodeError as exc:
+        raise RequestProblem(400, "invalid_repo", "repo must be owner/name") from exc
     if not repo or len(repo) > 200:
         raise RequestProblem(400, "invalid_repo", "repo must be owner/name")
     try:
@@ -266,7 +272,12 @@ def _repo_key(value: Any) -> str:
 
 
 def _safe_file_path(value: Any) -> str:
-    path = str(value or "")
+    if not isinstance(value, str):
+        raise RequestProblem(400, "invalid_path", "path is required and must be at most 1024 bytes")
+    try:
+        path = value.encode("utf-8", "strict").decode("utf-8")
+    except UnicodeError as exc:
+        raise RequestProblem(400, "invalid_path", "path is invalid") from exc
     if not path or len(path.encode()) > 1024 or "\x00" in path:
         raise RequestProblem(400, "invalid_path", "path is required and must be at most 1024 bytes")
     pure = PurePosixPath(path)
@@ -550,7 +561,14 @@ class TriageHandler(BaseHTTPRequestHandler):
             origin = self._guard(mutation=False)
             parsed = urlsplit(self.path)
             path = self._decoded_path(parsed.path)
-            if path == "/api/session":
+            if path == "/api/tools":
+                self._send_json(200, {"tools": list(service_module.TOOL_DEFINITIONS)})
+            elif path == "/api/tools/definitions":
+                self._send_json(200, {
+                    "tools": list(service_module.TOOL_DEFINITIONS),
+                    "draft_tool": service_module.DRAFT_PROPOSAL_TOOL_DEFINITION,
+                })
+            elif path == "/api/session":
                 self._send_json(200, {"csrf_token": self.csrf_token, "origin": origin,
                     "limits": {"body_bytes": MAX_BODY_BYTES, "fetch_prs": MAX_FETCH_LIMIT,
                                "enrichment_candidates": MAX_ENRICH_CANDIDATES}})
@@ -558,6 +576,16 @@ class TriageHandler(BaseHTTPRequestHandler):
                 self._send_json(200, _state_payload(self.store_path))
             elif path == "/api/progress":
                 self._send_json(200, get_fetch_progress())
+            elif path.startswith("/api/proposals/"):
+                proposal_id = path[len("/api/proposals/"):]
+                if not proposal_id or "/" in proposal_id:
+                    raise RequestProblem(400, "invalid_proposal", "proposal_id is invalid")
+                query = self._query(parsed, {"repo"})
+                repo = self._one(query, "repo") or None
+                proposal = store_module.inspect_proposal(
+                    proposal_id, path=self.store_path, repo=repo
+                )
+                self._send_json(200, {"proposal": proposal.to_dict()})
             elif path == "/api/overlap":
                 query = self._query(parsed, {"group_id", "member_page", "member_page_size",
                                              "row_page", "row_page_size"})
@@ -585,7 +613,15 @@ class TriageHandler(BaseHTTPRequestHandler):
                 if str(store.get("source") or "") == "fixtures":
                     meta = next((p for p in store.get("last_prs") or []
                                  if int(p.get("number") or 0) == number), None)
+                    evidence = {
+                        "meta": meta,
+                        "files": (meta or {}).get("files") or [],
+                        "snapshot_id": "",
+                    }
+                    stored = meta
+                    fixture_source = True
                 else:
+                    fixture_source = False
                     owner, name = parse_repo(repo)
                     stored = next((p for p in store.get("last_prs") or []
                                    if int(p.get("number") or 0) == number), None)
@@ -594,6 +630,10 @@ class TriageHandler(BaseHTTPRequestHandler):
                     evidence = gh_module.cached_pr_evidence(
                         owner, name, number, snapshot_id=stored.get("cache_snapshot_id", "")
                     ) or {}
+                    if not isinstance(evidence, dict):
+                        raise RequestProblem(
+                            409, "revision_conflict", "cached evidence is invalid"
+                        )
                     meta = evidence.get("meta")
                     legacy_unverified = self._legacy_unverified(stored, evidence)
                     unbound_preview = (
@@ -605,6 +645,12 @@ class TriageHandler(BaseHTTPRequestHandler):
                                              "cached description does not match the triage revision")
                 if not meta:
                     raise RequestProblem(404, "cache_miss", "PR is not in the active local cache")
+                self._guard_evidence_identity(
+                    stored,
+                    evidence,
+                    active_repo=repo,
+                    fixture_source=fixture_source,
+                )
                 payload = dict(meta)
                 if str(store.get("source") or "") != "fixtures" and legacy_unverified:
                     payload["legacy_unverified"] = True
@@ -648,7 +694,15 @@ class TriageHandler(BaseHTTPRequestHandler):
             if parsed.query:
                 raise RequestProblem(400, "query_forbidden", "POST endpoints do not accept query")
             body = self._read_json()
-            if path == "/api/fetch":
+            if path == "/api/tools/read":
+                self._post_tool_read(body)
+            elif path == "/api/proposals/draft":
+                self._post_proposal_draft(body)
+            elif path == "/api/dispositions":
+                self._post_dispositions(body)
+            elif path.startswith("/api/proposals/"):
+                self._post_proposal_transition(path, body)
+            elif path == "/api/fetch":
                 self._post_fetch(body)
             elif path == "/api/enrich":
                 self._post_enrich(body)
@@ -662,7 +716,11 @@ class TriageHandler(BaseHTTPRequestHandler):
         except Exception as exc:  # noqa: BLE001
             conflict = getattr(store_module, "StoreConflictError", ())
             incomplete = getattr(store_module, "IncompleteEvidenceError", ())
-            if conflict and isinstance(exc, conflict):
+            service_error = getattr(service_module, "ServiceError", ())
+            if service_error and isinstance(exc, service_error):
+                result = exc.envelope()
+                self._send_json(int(getattr(exc, "status", 500)), result)
+            elif conflict and isinstance(exc, conflict):
                 self._send_json(409, {"error": "target changed; reload before deciding",
                     "code": getattr(exc, "code", "revision_conflict"),
                     "repo": getattr(exc, "current_repo", ""),
@@ -677,6 +735,175 @@ class TriageHandler(BaseHTTPRequestHandler):
             else:
                 traceback.print_exc()
                 self._send_json(500, {"error": "internal server error", "code": "internal_error"})
+
+    def _post_tool_read(self, body: dict[str, Any]) -> None:
+        self._fields(body, required={"operation", "args"})
+        operation, args = body["operation"], body["args"]
+        if not isinstance(operation, str) or not isinstance(args, dict):
+            raise RequestProblem(400, "invalid_request", "operation and args are required")
+        result = service_module.dispatch_read(self.store_path, operation, args)
+        if result.get("ok") is not True:
+            error = result.get("error") or {}
+            status = error.get("status", 500)
+            if isinstance(status, bool) or not isinstance(status, int) or not 400 <= status <= 599:
+                status = 500
+            self._send_json(status, result)
+            return
+        self._send_json(200, result)
+
+    @staticmethod
+    def _proposal_items(value: Any) -> list[dict[str, Any]]:
+        if not isinstance(value, list) or not value or len(value) > 200:
+            raise RequestProblem(400, "invalid_items", "items must be a bounded non-empty list")
+        rows: list[dict[str, Any]] = []
+        for item in value:
+            if not isinstance(item, dict):
+                raise RequestProblem(400, "invalid_items", "each item must be an object")
+            # HTTP callers must bind proposals to the exact evidence they
+            # displayed. The store may fill refs for small direct Python uses,
+            # but the network boundary never accepts an unbound item.
+            if not isinstance(item.get("revision"), dict):
+                raise RequestProblem(400, "revision_required", "each item requires an exact revision ref")
+            if item.get("disposition", item.get("decision")) == "duplicate" and not isinstance(
+                item.get("duplicate_of_revision", item.get("canonical_revision")), dict
+            ):
+                raise RequestProblem(400, "revision_required", "duplicate requires an exact canonical revision ref")
+            rows.append(item)
+        return rows
+
+    def _proposal_versions(self, body: dict[str, Any]) -> tuple[int, int]:
+        if "expected_store_version" not in body and "expected_version" in body:
+            body["expected_store_version"] = body["expected_version"]
+        if "expected_snapshot_version" not in body:
+            raise RequestProblem(400, "missing_fields", "missing fields: expected_snapshot_version")
+        return (
+            self._json_int(body.get("expected_store_version"), "expected_store_version", 0, 9_007_199_254_740_991),
+            self._json_int(body.get("expected_snapshot_version"), "expected_snapshot_version", 0, 9_007_199_254_740_991),
+        )
+
+    def _proposal_key(self, body: dict[str, Any]) -> str:
+        value = body.get("idempotency_key")
+        if not isinstance(value, str) or not _IDEMPOTENCY_KEY.fullmatch(value):
+            raise RequestProblem(400, "invalid_idempotency_key", "idempotency_key must be 8-128 safe characters")
+        return value
+
+    def _post_proposal_draft(self, body: dict[str, Any]) -> None:
+        self._fields(body, required={"repo", "group_id", "items", "expected_store_version",
+                                      "expected_snapshot_version", "idempotency_key"},
+                     optional={"canonical_pr", "provenance", "context", "actor", "expected_version"})
+        repo = _repo_key(body["repo"])
+        group_id = body["group_id"]
+        if not isinstance(group_id, str) or not _GROUP_ID.fullmatch(group_id):
+            raise RequestProblem(400, "invalid_group", "group_id is invalid")
+        items = self._proposal_items(body["items"])
+        canonical = body.get("canonical_pr")
+        if canonical is not None:
+            canonical = self._json_int(canonical, "canonical_pr", 1, 2_147_483_647)
+        expected_version, expected_snapshot = self._proposal_versions(body)
+        key = self._proposal_key(body)
+        provenance = body.get("provenance", {})
+        context = body.get("context", {})
+        if not isinstance(provenance, dict) or not isinstance(context, dict):
+            raise RequestProblem(400, "invalid_request", "provenance and context must be objects")
+        actor = body.get("actor", "agent")
+        if not isinstance(actor, str) or not 1 <= len(actor.strip()) <= 256:
+            raise RequestProblem(400, "invalid_actor", "actor must be 1-256 characters")
+        request = service_module.ProposalRequest(
+            repo=repo, group_id=group_id, items=tuple(items), canonical_pr=canonical,
+            expected_store_version=expected_version,
+            expected_snapshot_version=expected_snapshot,
+            idempotency_key=key, provenance=provenance, context=context,
+        )
+        result = service_module.WorkspaceService(self.store_path).draft_proposal(
+            request, actor=actor
+        )
+        if result.get("ok") is not True:
+            error = result.get("error") or {}
+            status = error.get("status", 500)
+            self._send_json(status if isinstance(status, int) else 500, result)
+            return
+        # Keep the standard envelope while also exposing the proposal at the
+        # top level for small browser clients that do not need generic tool
+        # envelope plumbing.
+        response = dict(result)
+        if isinstance(result.get("data"), dict):
+            response["proposal"] = result["data"].get("proposal")
+        self._send_json(201, response)
+
+    def _post_dispositions(self, body: dict[str, Any]) -> None:
+        self._fields(
+            body,
+            required={"repo", "group_id", "items", "expected_store_version",
+                      "expected_snapshot_version", "idempotency_key", "actor"},
+        )
+        repo = _repo_key(body["repo"])
+        group_id = body["group_id"]
+        if not isinstance(group_id, str) or not _GROUP_ID.fullmatch(group_id):
+            raise RequestProblem(400, "invalid_group", "group_id is invalid")
+        items = self._proposal_items(body["items"])
+        expected_version, expected_snapshot = self._proposal_versions(body)
+        key = self._proposal_key(body)
+        actor = body["actor"]
+        if not isinstance(actor, str) or not 1 <= len(actor.strip()) <= 256:
+            raise RequestProblem(400, "invalid_actor", "actor must be 1-256 characters")
+        rows = store_module.save_dispositions(
+            items, path=self.store_path, repo=repo, group_id=group_id,
+            expected_version=expected_version,
+            expected_snapshot_version=expected_snapshot,
+            idempotency_key=key, actor=actor.strip(), source="human",
+        )
+        self._send_json(200, {
+            "dispositions": [row.to_dict() for row in rows],
+            "state": _state_payload(self.store_path),
+        })
+
+    def _post_proposal_transition(self, path: str, body: dict[str, Any]) -> None:
+        prefix = "/api/proposals/"
+        remainder = path[len(prefix):]
+        proposal_id, separator, action = remainder.partition("/")
+        if not proposal_id or not separator or action not in {"accept", "edit", "reject"}:
+            raise RequestProblem(404, "not_found", "proposal route not found")
+        allowed = {"repo", "expected_store_version", "expected_snapshot_version",
+                   "expected_version", "idempotency_key", "actor"}
+        if action in {"accept", "edit"}:
+            allowed |= {"items", "canonical_pr"}
+        if action == "reject":
+            allowed.add("reason")
+        required = {"repo", "idempotency_key", "actor", "expected_snapshot_version"}
+        if "expected_store_version" not in body and "expected_version" not in body:
+            required.add("expected_store_version")
+        self._fields(body, required=required, optional=allowed - required)
+        repo = _repo_key(body["repo"])
+        expected_version, expected_snapshot = self._proposal_versions(body)
+        key = self._proposal_key(body)
+        actor = body["actor"]
+        if not isinstance(actor, str) or not 1 <= len(actor.strip()) <= 256:
+            raise RequestProblem(400, "invalid_actor", "actor must be 1-256 characters")
+        canonical = body.get("canonical_pr")
+        if canonical is not None:
+            canonical = self._json_int(canonical, "canonical_pr", 1, 2_147_483_647)
+        if action == "edit" and "items" not in body:
+            raise RequestProblem(400, "missing_fields", "missing fields: items")
+        items = self._proposal_items(body["items"]) if action == "edit" or "items" in body else None
+        kwargs: dict[str, Any] = {
+            "path": self.store_path, "repo": repo,
+            "expected_version": expected_version,
+            "expected_snapshot_version": expected_snapshot,
+            "idempotency_key": key, "actor": actor,
+        }
+        if action == "accept":
+            proposal = store_module.accept_proposal(
+                proposal_id, items=items, canonical_pr=canonical, **kwargs
+            )
+        elif action == "edit":
+            proposal = store_module.edit_proposal(
+                proposal_id, items=items or [], canonical_pr=canonical, **kwargs
+            )
+        else:
+            proposal = store_module.reject_proposal(
+                proposal_id, reason=body.get("reason", "rejected by maintainer"), **kwargs
+            )
+        self._send_json(200, {"proposal": proposal.to_dict(), "state": _state_payload(self.store_path)})
 
     def _post_fetch(self, body: dict[str, Any]) -> None:
         self._fields(body, required={"source", "repo", "limit", "refresh"})
@@ -811,7 +1038,15 @@ class TriageHandler(BaseHTTPRequestHandler):
                             owner, name, number,
                             snapshot_id=stored.get("cache_snapshot_id", ""),
                         ) or {}))
+            if not isinstance(evidence, dict):
+                raise RequestProblem(409, "revision_conflict", "cached evidence is invalid")
             meta, files = evidence.get("meta"), evidence.get("files") or []
+            self._guard_evidence_identity(
+                stored,
+                evidence,
+                active_repo=active,
+                fixture_source=fixture_source,
+            )
             legacy_unverified = (
                 not fixture_source and self._legacy_unverified(stored, evidence)
             )
@@ -876,6 +1111,76 @@ class TriageHandler(BaseHTTPRequestHandler):
                                "same_complete_patch": equality, "scope": "page"}}
 
     @staticmethod
+    def _guard_evidence_identity(
+        stored: dict[str, Any],
+        evidence: dict[str, Any],
+        *,
+        active_repo: str,
+        fixture_source: bool,
+    ) -> None:
+        """Require returned evidence to stay bound to the requested PR/snapshot."""
+        meta = evidence.get("meta")
+        if meta is None:
+            return
+        if not isinstance(meta, dict):
+            raise RequestProblem(
+                409,
+                "revision_conflict",
+                "cached evidence metadata is invalid",
+            )
+        expected_number = stored.get("number")
+        current_number = meta.get("number")
+        if (
+            type(expected_number) is not int
+            or type(current_number) is not int
+            or current_number != expected_number
+        ):
+            raise RequestProblem(
+                409,
+                "membership_conflict",
+                "cached evidence PR number does not match the requested PR",
+            )
+        meta_repo = str(meta.get("repository") or "").strip().strip("/").lower()
+        if meta_repo and meta_repo != active_repo:
+            raise RequestProblem(
+                409,
+                "revision_conflict",
+                "cached evidence repository does not match the active repository",
+            )
+
+        expected_snapshot = str(stored.get("cache_snapshot_id") or "")
+        actual_snapshot = str(evidence.get("snapshot_id") or "")
+        legacy_unverified = evidence.get("legacy_unverified") is True
+        if fixture_source:
+            if expected_snapshot or actual_snapshot:
+                raise RequestProblem(
+                    409,
+                    "snapshot_conflict",
+                    "fixture evidence must not carry a GitHub cache snapshot",
+                )
+            return
+        if expected_snapshot:
+            if actual_snapshot != expected_snapshot or legacy_unverified:
+                raise RequestProblem(
+                    409,
+                    "snapshot_conflict",
+                    "cached evidence snapshot does not match the triage snapshot",
+                )
+            if meta_repo != active_repo:
+                raise RequestProblem(
+                    409,
+                    "revision_conflict",
+                    "cached evidence has no exact repository identity",
+                )
+            return
+        if actual_snapshot or not legacy_unverified:
+            raise RequestProblem(
+                409,
+                "snapshot_conflict",
+                "cached evidence has no exact snapshot identity",
+            )
+
+    @staticmethod
     def _legacy_unverified(stored: dict[str, Any], evidence: dict[str, Any]) -> bool:
         """Accept only an explicitly isolated pre-snapshot cache as a preview."""
         return (
@@ -906,6 +1211,11 @@ class TriageHandler(BaseHTTPRequestHandler):
             elif expected or current:
                 return False
         expected_digest = str(stored.get("content_digest") or "")
+        # A record with a known revision but no content identity is not safe
+        # to present as verified evidence.  Explicitly unbound legacy rows are
+        # handled by the caller as previews before reaching this check.
+        if not expected_digest and compared:
+            return False
         if expected_digest:
             changed_files = [ChangedFile.from_dict(item) for item in files]
             candidate = PullRequest(

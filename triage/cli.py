@@ -320,6 +320,18 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_mcp(args: argparse.Namespace) -> int:
+    """Run the read-only stdio MCP bridge for one local backend."""
+    from triage.mcp_server import BridgeError, MCPDependencyError, run_stdio
+
+    try:
+        run_stdio(args.url)
+    except (BridgeError, MCPDependencyError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def cmd_backup(args: argparse.Namespace) -> int:
     store = Path(args.store).expanduser()
     destination = Path(args.output).expanduser() if args.output else None
@@ -456,6 +468,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--no-open", action="store_true", help="Do not open browser")
     p_serve.add_argument("--store", default=str(DEFAULT_STORE_PATH))
     p_serve.set_defaults(func=cmd_serve)
+
+    p_mcp = sub.add_parser(
+        "mcp",
+        help="Expose local read-only triage tools over MCP stdio",
+    )
+    p_mcp.add_argument(
+        "--url",
+        required=True,
+        help="Loopback HTTP backend URL, for example http://127.0.0.1:8741",
+    )
+    p_mcp.set_defaults(func=cmd_mcp)
 
     p_backup = sub.add_parser("backup", help="Create a validated store backup")
     p_backup.add_argument("--store", default=str(DEFAULT_STORE_PATH))

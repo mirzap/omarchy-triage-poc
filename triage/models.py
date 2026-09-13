@@ -76,6 +76,10 @@ class RevisionEvidence:
     content_digest: str = ""
     evidence_complete: bool = False
     source: str = ""
+    # GitHub evidence is valid only inside the immutable cache snapshot that
+    # supplied it.  Fixtures leave this empty because their complete evidence
+    # is persisted in the local store itself.
+    cache_snapshot_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -98,6 +102,7 @@ class RevisionEvidence:
             )
             and counts_valid,
             source=str(data.get("source", "") or ""),
+            cache_snapshot_id=str(data.get("cache_snapshot_id", "") or ""),
         )
 
 
@@ -305,6 +310,7 @@ class PullRequest:
             content_digest=digest,
             evidence_complete=complete,
             source=source,
+            cache_snapshot_id=self.cache_snapshot_id,
         )
 
 
@@ -446,8 +452,26 @@ class Group:
 
 
 def revision_snapshot_digest(revisions: list[RevisionEvidence]) -> str:
-    """Digest membership and every revision field, including incompleteness."""
-    payload = [item.to_dict() for item in sorted(revisions, key=lambda r: r.pr_number)]
+    """Digest the canonical revision binding, excluding cache provenance.
+
+    ``cache_snapshot_id`` pins the evidence read used at a write boundary, but
+    it is not part of the PR revision identity.  Keeping it out of this
+    payload preserves the digest format used by existing fixture/GitHub store
+    bindings and lets an unchanged PR survive a cache refetch.
+    """
+    payload = [
+        {
+            "pr_number": item.pr_number,
+            "head_sha": item.head_sha,
+            "base_sha": item.base_sha,
+            "additions": item.additions,
+            "deletions": item.deletions,
+            "content_digest": item.content_digest,
+            "evidence_complete": item.evidence_complete,
+            "source": item.source,
+        }
+        for item in sorted(revisions, key=lambda r: r.pr_number)
+    ]
     encoded = json.dumps(
         payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
@@ -493,6 +517,150 @@ class DecisionEvent:
             evidence_complete=_bool_value(
                 data.get("evidence_complete"), default=False
             ),
+        )
+
+
+# Local, per-PR review is deliberately separate from the historical
+# group-level TrustedRule/DecisionEvent pair above.  A disposition is scoped to
+# one exact revision and therefore remains meaningful when clustering changes.
+DISPOSITIONS = ("keep", "duplicate", "reject", "needs_hardware", "upgrade", "pending")
+
+
+@dataclass(frozen=True)
+class Disposition:
+    repo: str
+    pr: int
+    revision: RevisionEvidence
+    disposition: str
+    reason: str
+    duplicate_of: int | None = None
+    duplicate_of_revision: RevisionEvidence | None = None
+    actor: str = ""
+    decided_at: str = ""
+    event_id: str = ""
+    source: str = "human"
+
+    # ``pr_number`` is a convenient alias for callers that work with the
+    # existing RevisionEvidence vocabulary.
+    @property
+    def pr_number(self) -> int:
+        return self.pr
+
+    @property
+    def canonical_revision(self) -> RevisionEvidence | None:
+        return self.duplicate_of_revision
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "repo": self.repo,
+            "pr": self.pr,
+            "revision": self.revision.to_dict(),
+            "disposition": self.disposition,
+            "reason": self.reason,
+            "duplicate_of": self.duplicate_of,
+            "duplicate_of_revision": (
+                self.duplicate_of_revision.to_dict()
+                if self.duplicate_of_revision is not None else None
+            ),
+            "actor": self.actor,
+            "decided_at": self.decided_at,
+            "event_id": self.event_id,
+            "source": self.source,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "Disposition":
+        raw_revision = data.get("revision")
+        # A short-lived compatibility form is useful for hand-authored
+        # fixtures, while persisted new records always use ``revision``.
+        if not isinstance(raw_revision, dict):
+            raw_revision = dict(data)
+        duplicate = data.get("duplicate_of")
+        if duplicate is not None:
+            try:
+                duplicate = int(duplicate)
+            except (TypeError, ValueError):
+                duplicate = None
+        raw_duplicate_revision = data.get(
+            "duplicate_of_revision", data.get("canonical_revision")
+        )
+        return cls(
+            repo=str(data.get("repo", "") or ""),
+            pr=int(data.get("pr", data.get("pr_number", 0)) or 0),
+            revision=RevisionEvidence.from_dict(raw_revision),
+            disposition=str(data.get("disposition", data.get("decision", "")) or ""),
+            reason=str(data.get("reason", "") or ""),
+            duplicate_of=duplicate,
+            duplicate_of_revision=(
+                RevisionEvidence.from_dict(raw_duplicate_revision)
+                if isinstance(raw_duplicate_revision, dict) else None
+            ),
+            actor=str(data.get("actor", "") or ""),
+            decided_at=str(data.get("decided_at", "") or ""),
+            event_id=str(data.get("event_id", "") or ""),
+            source=str(data.get("source", "human") or "human"),
+        )
+
+
+# Alternate spelling retained for integrations that call these records
+# ``PRDisposition``.
+PRDisposition = Disposition
+LocalDisposition = Disposition
+
+
+@dataclass(frozen=True)
+class Proposal:
+    proposal_id: str
+    status: str
+    repo: str
+    group_id: str
+    canonical_pr: int | None
+    items: tuple[Disposition, ...]
+    context: dict[str, Any]
+    provenance: dict[str, Any]
+    created_at: str = ""
+    updated_at: str = ""
+    decision_event_id: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "proposal_id": self.proposal_id,
+            "status": self.status,
+            "repo": self.repo,
+            "group_id": self.group_id,
+            "canonical_pr": self.canonical_pr,
+            "items": [item.to_dict() for item in self.items],
+            "context": dict(self.context),
+            "provenance": dict(self.provenance),
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "decision_event_id": self.decision_event_id,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "Proposal":
+        canonical = data.get("canonical_pr")
+        if canonical is not None:
+            try:
+                canonical = int(canonical)
+            except (TypeError, ValueError):
+                canonical = None
+        return cls(
+            proposal_id=str(data.get("proposal_id", "") or ""),
+            status=str(data.get("status", "") or ""),
+            repo=str(data.get("repo", "") or ""),
+            group_id=str(data.get("group_id", "") or ""),
+            canonical_pr=canonical,
+            items=tuple(
+                Disposition.from_dict(raw)
+                for raw in data.get("items", [])
+                if isinstance(raw, dict)
+            ),
+            context=dict(data.get("context") or {}),
+            provenance=dict(data.get("provenance") or {}),
+            created_at=str(data.get("created_at", "") or ""),
+            updated_at=str(data.get("updated_at", "") or ""),
+            decision_event_id=str(data.get("decision_event_id", "") or ""),
         )
 
 

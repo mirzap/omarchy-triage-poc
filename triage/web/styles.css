@@ -106,6 +106,7 @@ a:hover { text-decoration: underline; }
   text-overflow: ellipsis;
 }
 .sync-meta { color: var(--muted); font-size: 10px; margin-top: 3px; }
+.agent-tools-status { color: var(--muted); font-size: 10px; margin-top: 2px; }
 
 .layout {
   display: grid;
@@ -283,7 +284,9 @@ a:hover { text-decoration: underline; }
   margin-bottom: 14px;
 }
 .detail-head .mono { font-size: 18px; }
-.actions { display: flex; gap: 8px; }
+.actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: end; }
+.save-next-choice { display: flex; flex-direction: column; gap: 3px; color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: .04em; }
+.save-next-choice select { background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 6px 8px; color: var(--text); text-transform: none; letter-spacing: normal; }
 .decision-warning {
   border: 1px solid var(--border);
   border-left: 3px solid var(--accent);
@@ -295,6 +298,29 @@ a:hover { text-decoration: underline; }
 }
 .decision-warning.complete { border-left-color: var(--ok); }
 .decision-warning.incomplete { border-left-color: var(--danger); color: #fecaca; }
+.panel-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.panel-heading h3 { margin: 0 0 8px; }
+.disposition-form { display: flex; flex-wrap: wrap; gap: 8px; align-items: end; }
+.disposition-form label, .proposal-canonical, .proposal-reject { display: flex; flex-direction: column; gap: 3px; color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: .04em; }
+.disposition-form select, .disposition-form textarea, .proposal-canonical select, .proposal-reject textarea, .proposal-item select, .proposal-item textarea { background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 6px 8px; color: var(--text); text-transform: none; letter-spacing: normal; }
+.disposition-form textarea, .proposal-reject textarea { min-width: 300px; resize: vertical; }
+.disposition-form .wide { flex: 1 1 320px; }
+.disposition-panel { border-left: 3px solid var(--needs); background: #111827; padding: 8px 10px; }
+.proposal-chooser { border-left: 3px solid var(--accent); background: #1c1917; padding: 8px 10px; }
+.proposal-chooser-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.proposal-chooser-row select, .proposal-chooser-row input { background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 6px 8px; color: var(--text); min-width: 220px; }
+.proposal-chooser-row input { flex: 1 1 220px; }
+.proposal-chooser #proposalChooserHint { margin-top: 6px; font-size: 11px; }
+.disposition-panel #dispositionHint, #proposalHint { margin-top: 7px; font-size: 11px; }
+.proposal-items { display: flex; flex-direction: column; gap: 8px; margin: 8px 0; }
+.proposal-item { border: 1px solid var(--border); border-radius: 4px; padding: 7px; display: grid; grid-template-columns: 68px 150px minmax(160px, 1fr); gap: 7px; align-items: end; }
+.proposal-item > .revision-id { grid-column: 1 / -1; }
+.proposal-item .proposal-reason { grid-column: 1 / -1; }
+.proposal-item label { display: flex; flex-direction: column; gap: 3px; color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: .04em; }
+.proposal-item textarea { width: 100%; resize: vertical; }
+.proposal-canonical { margin: 8px 0; max-width: 220px; }
+.proposal-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+.proposal-meta { margin-top: 3px; }
 .revision-id { font-family: var(--mono); color: var(--muted); font-size: 10px; }
 .external-enrichment { border-top: 1px solid var(--border); margin-top: 8px; padding-top: 8px; }
 .external-enrichment p { margin: 0 0 8px; max-width: 720px; }

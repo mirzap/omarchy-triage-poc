@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Omarchy triage</title>
-  <link rel="stylesheet" href="/styles.css?v=23" />
+  <link rel="stylesheet" href="/styles.css?v=28" />
 </head>
 <body>
   <header class="topbar">
@@ -28,7 +28,7 @@
       <input id="refresh" type="checkbox" checked /> refresh
     </label>
     <button id="fetchBtn" type="button" class="btn primary">Sync</button>
-    <div class="status-wrap"><div id="status" class="status">idle</div><div id="syncMeta" class="sync-meta"></div></div>
+    <div class="status-wrap"><div id="status" class="status">idle</div><div id="syncMeta" class="sync-meta"></div><div id="agentToolsStatus" class="agent-tools-status">Browser seam ready · WebMCP adapter not loaded</div></div>
   </header>
 
   <main class="layout">
@@ -68,9 +68,56 @@
             <button id="hardwareBtn" type="button" class="btn">Needs hardware</button>
             <button id="upgradeBtn" type="button" class="btn warn">Can break upgrade</button>
             <button id="rejectBtn" type="button" class="btn danger">Reject</button>
+            <label class="save-next-choice"><span>save &amp; next decision</span><select id="saveNextDecision"><option value="">choose…</option><option value="approve">approve</option><option value="hardware">needs hardware</option><option value="upgrade">can break upgrade</option><option value="reject">reject</option></select></label>
+            <button id="saveNextBtn" type="button" class="btn" disabled>Save &amp; next pending</button>
           </div>
         </div>
         <div id="decisionWarning" class="decision-warning" role="status"></div>
+        <section id="proposalChooser" class="block proposal-chooser">
+          <div class="panel-heading">
+            <h3>Recent proposals</h3>
+            <span id="proposalChooserScope" class="muted"></span>
+          </div>
+          <div class="proposal-chooser-row">
+            <select id="proposalPicker"><option value="">choose a proposal…</option></select>
+            <input id="proposalIdInput" type="text" maxlength="256" spellcheck="false" placeholder="or paste proposal ID" />
+            <button id="proposalOpenBtn" type="button" class="btn">Open proposal</button>
+          </div>
+          <div id="proposalChooserHint" class="muted"></div>
+        </section>
+        <section id="prDispositionPanel" class="block disposition-panel" hidden>
+          <div class="panel-heading">
+            <h3>Per-PR disposition</h3>
+            <span id="dispositionPrLabel" class="muted"></span>
+          </div>
+          <div class="disposition-form">
+            <label><span>disposition</span><select id="dispositionSelect">
+              <option value="pending">pending</option>
+              <option value="keep">keep</option>
+              <option value="duplicate">duplicate</option>
+              <option value="reject">reject</option>
+              <option value="needs_hardware">needs hardware</option>
+              <option value="upgrade">can break upgrade</option>
+            </select></label>
+            <label id="canonicalWrap"><span>canonical PR</span><select id="dispositionCanonical"><option value="">choose…</option></select></label>
+            <label class="wide"><span>reason (required)</span><textarea id="dispositionReason" rows="2" maxlength="1000" placeholder="Why this PR has this disposition"></textarea></label>
+            <button id="dispositionSaveBtn" type="button" class="btn accent">Save per-PR disposition</button>
+          </div>
+          <div id="dispositionHint" class="muted"></div>
+        </section>
+        <details id="proposalBlock" class="block more-block" hidden>
+          <summary id="proposalSummary" class="queue-toggle">Agent proposal</summary>
+          <div id="proposalMeta" class="muted"></div>
+          <div id="proposalItems" class="proposal-items"></div>
+          <label class="proposal-canonical"><span>proposal canonical PR</span><select id="proposalCanonical"><option value="">none</option></select></label>
+          <label class="wide proposal-reject"><span>reject reason</span><textarea id="proposalRejectReason" rows="2" maxlength="1000" placeholder="Why this proposal is not actionable"></textarea></label>
+          <div class="proposal-actions">
+            <button id="proposalAcceptBtn" type="button" class="btn accent">Accept proposal</button>
+            <button id="proposalEditBtn" type="button" class="btn">Save edits</button>
+            <button id="proposalRejectBtn" type="button" class="btn danger">Reject proposal</button>
+          </div>
+          <div id="proposalHint" class="muted"></div>
+        </details>
         <div class="block" id="membersBlock">
           <h3 id="membersHead">PRs in this shape</h3>
           <div id="detailMembersWrap" class="member-wrap">
@@ -132,6 +179,7 @@
   </main>
 
   <script src="/vendor/virtual.js"></script>
-  <script src="/app.js?v=29"></script>
+  <script src="/app.js?v=33"></script>
+  <script src="/webmcp.js?v=1"></script>
 </body>
 </html>

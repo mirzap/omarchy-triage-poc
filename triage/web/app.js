@@ -13,6 +13,7 @@
   const state = {
     groups: [],
     prs: [],
+    proposals: [],
     rules: [],
     overlap: {},
     source: "",
@@ -36,6 +37,22 @@
     filterLabel: "",
     queuePile: "needs_you",
     examinedMembers: new Set(),
+    // Agent navigation is useful context but is never a human examination
+    // attestation.  Keep it separate so the review warning stays truthful.
+    agentOpenedMembers: new Set(),
+    proposal: null,
+    proposalKey: "",
+    proposalLoading: false,
+    proposalError: "",
+    proposalAction: "",
+    proposalEdits: null,
+    dispositionDraft: null,
+    dispositionBusy: false,
+    // Client-only identity for the browser action seam.  It is deliberately
+    // separate from store/snapshot versions: a view can become stale even
+    // when the repository snapshot has not changed.
+    viewRevision: 0,
+    nextDecision: "",
   };
 
   const QUEUE_PILES = [
@@ -60,6 +77,7 @@
   let relatedGen = 0;
   let bodyGen = 0;
   let overlapGen = 0;
+  let proposalGen = 0;
   let diffGen = 0;
   let diffScrollSerial = 0;
   let pendingDiffScroll = null;
@@ -71,9 +89,13 @@
   const indexes = { groups: new Map(), prs: new Map(), rules: new Map() };
   const selectorCache = new Map();
   const decisionRetries = new Map();
+  const dispositionRetries = new Map();
+  const proposalRetries = new Map();
   let csrfToken = "";
   let sessionPromise = null;
   let enrichmentRequest = null;
+  let stateInitialized = false;
+  let seamExposed = false;
 
   const $ = (id) => document.getElementById(id);
 
@@ -85,24 +107,207 @@
     selectedUser: null, filterQuery: "", filterLabel: "", queuePile: "needs_you",
   };
 
+  const RESUME_FIELDS = [
+    "leftTab", "selectedGroupId", "selectedPr", "selectedFile", "selectedUser",
+    "filterQuery", "filterLabel", "queuePile",
+  ];
+  const READ_TOOL_NAMES = [
+    "get_workspace", "list_groups", "search_prs", "get_group", "get_pr",
+    "read_patch", "compare_prs", "find_related", "get_history",
+  ];
+  let resumeRepo = "";
+  let urlViewFields = new Set();
+
+  function storageKey(repo) {
+    return "omarchy.triage.resume:" + encodeURIComponent(String(repo || ""));
+  }
+
+  function readResume(repo) {
+    if (!repo) return null;
+    try {
+      const raw = window.localStorage.getItem(storageKey(repo));
+      if (!raw) return null;
+      const value = JSON.parse(raw);
+      return value && typeof value === "object" ? value : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function applyResume(value, onlyIfMissing) {
+    if (!value || typeof value !== "object") return;
+    RESUME_FIELDS.forEach((field) => {
+      if (onlyIfMissing && urlViewFields.has(field)) return;
+      if (!Object.prototype.hasOwnProperty.call(value, field)) return;
+      const candidate = value[field];
+      if (field === "leftTab" && !["queue", "groups", "allprs"].includes(candidate)) return;
+      if (field === "queuePile" && !QUEUE_PILES.some((pile) => pile.id === candidate)) return;
+      if (["selectedGroupId", "selectedFile", "selectedUser", "filterQuery", "filterLabel"].includes(field) &&
+          candidate !== null && typeof candidate !== "string") return;
+      if (field === "selectedPr" && candidate !== null &&
+          (!Number.isSafeInteger(candidate) || candidate <= 0)) return;
+      if (field === "filterQuery" && candidate && Array.from(candidate).length > 256) return;
+      if (field === "selectedGroupId" && candidate && candidate.length > 256) return;
+      if (field === "selectedFile" && candidate &&
+          (candidate.length > 1024 || candidate.startsWith("/") || candidate.includes("\\") ||
+           candidate.split("/").some((part) => part === ".."))) return;
+      if (field === "selectedUser" && candidate && candidate.length > 256) return;
+      if (field === "filterLabel" && candidate && !FILTER_CHIPS.includes(candidate)) return;
+      state[field] = candidate;
+    });
+  }
+
+  function persistResume() {
+    const repo = state.repo || ($("repo") && $("repo").value.trim()) || "";
+    if (!repo) return;
+    const value = {};
+    RESUME_FIELDS.forEach((field) => { value[field] = state[field]; });
+    try {
+      window.localStorage.setItem(storageKey(repo), JSON.stringify(value));
+      resumeRepo = repo;
+    } catch (_) {
+      // Private browsing and storage-disabled contexts should not break triage.
+    }
+  }
+
+  function viewStateKey() {
+    return RESUME_FIELDS.map((field) => JSON.stringify(state[field])).join("|");
+  }
+
+  function markViewChanged(before) {
+    if (before === viewStateKey()) return false;
+    state.viewRevision = Number.isSafeInteger(state.viewRevision)
+      ? state.viewRevision + 1
+      : 1;
+    persistResume();
+    return true;
+  }
+
+  function changeView(mutator) {
+    const before = viewStateKey();
+    mutator();
+    const changed = markViewChanged(before);
+    if (changed) {
+      state.nextDecision = "";
+      const select = $("saveNextDecision");
+      if (select) select.value = "";
+    }
+    return changed;
+  }
+
+  function currentViewContext() {
+    const group = state.selectedGroupId ? groupById(state.selectedGroupId) : null;
+    const pr = state.selectedPr ? prByNumber(state.selectedPr) : null;
+    const filters = {
+      tab: state.leftTab,
+      q: state.filterQuery || "",
+      label: state.filterLabel || "",
+      pile: state.queuePile || "needs_you",
+    };
+    return {
+      repo: state.repo || ($("repo") && $("repo").value.trim()) || "",
+      source: state.source || ($("source") && $("source").value) || "",
+      store_version: Number(state.storeVersion || 0),
+      snapshot_version: Number(state.snapshotVersion || 0),
+      view_revision: Number(state.viewRevision || 0),
+      selected: {
+        group_id: state.selectedGroupId || null,
+        pr: state.selectedPr || null,
+        path: state.selectedFile || null,
+        user: state.selectedUser || null,
+      },
+      // Keep these flat fields for small WebMCP clients that do not want to
+      // understand the nested display object.
+      selected_group_id: state.selectedGroupId || null,
+      selected_pr: state.selectedPr || null,
+      selected_path: state.selectedFile || null,
+      filters,
+      group_snapshot_digest: group && group.snapshot_digest || null,
+      pr_content_digest: pr && pr.content_digest || null,
+    };
+  }
+
+  function staleViewError() {
+    return {
+      ok: false,
+      error: {
+        code: "stale_view",
+        message: "The browser view changed; retrieve get_view_context and retry.",
+        retryable: true,
+        context: currentViewContext(),
+      },
+    };
+  }
+
+  function checkViewContext(ifContext) {
+    if (!ifContext || typeof ifContext !== "object" || Array.isArray(ifContext)) {
+      return {
+        ok: false,
+        error: {
+          code: "invalid_request",
+          message: "if_context is required for this browser action.",
+          retryable: false,
+          context: currentViewContext(),
+        },
+      };
+    }
+    const current = currentViewContext();
+    if (typeof ifContext.repo !== "string" || !ifContext.repo || ifContext.repo.length > 256 ||
+        !Number.isSafeInteger(ifContext.store_version) || ifContext.store_version < 0 ||
+        !Number.isSafeInteger(ifContext.snapshot_version) || ifContext.snapshot_version < 0 ||
+        !Number.isSafeInteger(ifContext.view_revision) || ifContext.view_revision < 0) {
+      return {
+        ok: false,
+        error: {
+          code: "invalid_request",
+          message: "if_context must include repo and integer store/snapshot/view revisions.",
+          retryable: false,
+          context: current,
+        },
+      };
+    }
+    if (ifContext.repo !== current.repo ||
+        ifContext.store_version !== current.store_version ||
+        ifContext.snapshot_version !== current.snapshot_version ||
+        ifContext.view_revision !== current.view_revision) {
+      return staleViewError();
+    }
+    for (const key of ["group_snapshot_digest", "pr_content_digest"]) {
+      if (Object.prototype.hasOwnProperty.call(ifContext, key) &&
+          (ifContext[key] !== null && typeof ifContext[key] !== "string" ||
+           ifContext[key] !== current[key])) {
+        return staleViewError();
+      }
+    }
+    return { ok: true, context: current };
+  }
+
   function readUrl() {
     Object.assign(state, URL_DEFAULTS);
+    urlViewFields = new Set();
     const q = new URLSearchParams(location.search);
+    const repoHint = q.get("repo") || ($("repo") && $("repo").value.trim()) || "omacom/omarchy";
+    resumeRepo = repoHint;
+    applyResume(readResume(repoHint), false);
+    const has = (key, field) => q.has(key) && (urlViewFields.add(field || key), true);
     const tab = q.get("tab");
-    if (tab === "queue" || tab === "groups" || tab === "allprs") state.leftTab = tab;
-    const gid = q.get("group");
-    state.selectedGroupId = gid || null;
-    const pr = q.get("pr");
-    if (pr && /^\d+$/.test(pr)) state.selectedPr = parseInt(pr, 10);
-    else state.selectedPr = null;
-    const file = q.get("file");
-    state.selectedFile = file || null;
-    const user = q.get("user");
-    state.selectedUser = user || null;
-    state.filterQuery = q.get("q") || "";
-    state.filterLabel = q.get("label") || "";
-    const pile = q.get("pile");
-    if (pile && QUEUE_PILES.some((p) => p.id === pile)) state.queuePile = pile;
+    if (has("tab", "leftTab")) state.leftTab = tab === "groups" || tab === "allprs" ? tab : "queue";
+    if (has("group", "selectedGroupId")) state.selectedGroupId = q.get("group") || null;
+    if (has("pr", "selectedPr")) {
+      const pr = q.get("pr");
+      state.selectedPr = pr && /^\d+$/.test(pr) ? parseInt(pr, 10) : null;
+    }
+    if (has("file", "selectedFile")) state.selectedFile = q.get("file") || null;
+    if (has("user", "selectedUser")) state.selectedUser = q.get("user") || null;
+    if (has("q", "filterQuery")) state.filterQuery = Array.from(q.get("q") || "").slice(0, 256).join("");
+    if (has("label", "filterLabel")) {
+      const label = q.get("label") || "";
+      state.filterLabel = FILTER_CHIPS.includes(label) ? label : "";
+    }
+    if (has("pile", "queuePile")) {
+      const pile = q.get("pile");
+      state.queuePile = QUEUE_PILES.some((p) => p.id === pile) ? pile : "needs_you";
+    }
   }
 
   function writeUrl(push) {
@@ -228,6 +433,15 @@
     state.related = null;
     state.relatedKey = "";
     state.examinedMembers = new Set();
+    state.agentOpenedMembers = new Set();
+    state.proposal = null;
+    state.proposalKey = "";
+    state.proposalLoading = false;
+    state.proposalError = "";
+    state.proposalAction = "";
+    state.proposalEdits = null;
+    state.dispositionDraft = null;
+    state.dispositionBusy = false;
     lastBodyPr = null;
     Object.keys(bodyCache).forEach((key) => delete bodyCache[key]);
     for (const entry of resourceRequests.values()) entry.controller.abort();
@@ -238,9 +452,11 @@
   }
 
   function applyState(data) {
+    const viewBefore = viewStateKey();
     invalidateSnapshotCaches();
     state.groups = data.groups || [];
     state.prs = data.prs || [];
+    state.proposals = Array.isArray(data.proposals) ? data.proposals.slice(0, 200) : [];
     state.rules = data.rules || [];
     state.overlap = data.overlap || {};
     state.source = data.source || "";
@@ -250,6 +466,12 @@
     state.storeVersion = Number(data.store_version || 0);
     state.snapshotVersion = Number(data.snapshot_version || 0);
     state.sync = data.sync || null;
+    // A browser can be pointed at a different repository after a reload.
+    // Rehydrate only the fields that were not explicit in the URL.
+    if (state.repo && state.repo !== resumeRepo) {
+      resumeRepo = state.repo;
+      applyResume(readResume(state.repo), true);
+    }
     rebuildIndexes();
     queueRowsCache = null;
     if (data.source) {
@@ -298,6 +520,11 @@
     }
     renderUserDrawer();
     renderSyncMeta();
+    // Keep a corrupt or no-longer-valid saved target from recurring after the
+    // next reload.  IDs are normalized above before this write.
+    if (stateInitialized) markViewChanged(viewBefore);
+    stateInitialized = true;
+    persistResume();
   }
 
   function ruleFor(groupId) {
@@ -326,6 +553,38 @@
 
   function prByNumber(n) {
     return indexes.prs.get(n) || null;
+  }
+
+  function markHumanExamined(number) {
+    if (!Number.isSafeInteger(number) || number <= 0) return;
+    state.examinedMembers.add(number);
+    state.agentOpenedMembers.delete(number);
+  }
+
+  function markAgentOpened(number) {
+    if (!Number.isSafeInteger(number) || number <= 0) return;
+    if (!state.examinedMembers.has(number)) state.agentOpenedMembers.add(number);
+  }
+
+  function revisionRefFromPr(pr, evidence) {
+    const source = evidence || pr || {};
+    return {
+      pr_number: Number(pr && pr.number || source.number || 0),
+      head_sha: source.head_sha || (pr && pr.head_sha) || "",
+      base_sha: source.base_sha || (pr && pr.base_sha) || "",
+      additions: source.additions == null ? (pr && pr.additions != null ? pr.additions : null) : source.additions,
+      deletions: source.deletions == null ? (pr && pr.deletions != null ? pr.deletions : null) : source.deletions,
+      content_digest: source.content_digest || (pr && pr.content_digest) || "",
+      evidence_complete: source.evidence_complete === true || (pr && pr.evidence_complete === true),
+      source: source.evidence_source || source.source || (pr && pr.evidence_source) || state.source || "",
+      cache_snapshot_id: source.cache_snapshot_id || (pr && pr.cache_snapshot_id) || "",
+    };
+  }
+
+  function makeIdempotencyKey(prefix) {
+    const uuid = window.crypto && typeof window.crypto.randomUUID === "function"
+      ? window.crypto.randomUUID() : Date.now() + "-" + Math.random().toString(16).slice(2);
+    return String(prefix || "triage") + "-" + uuid;
   }
 
   function makeVirtualizer(scrollEl, count, estimateSize, overscan, onChange) {
@@ -560,9 +819,12 @@
       firstTitle
     )}</div>`;
     card.addEventListener("click", () => {
-      state.selectedGroupId = g.group_id;
-      state.selectedPr = null;
-      state.selectedFile = null;
+      changeView(() => {
+        state.selectedGroupId = g.group_id;
+        state.selectedPr = null;
+        state.selectedFile = null;
+        state.selectedUser = null;
+      });
       render();
     });
     return card;
@@ -670,9 +932,13 @@
       escapeHtml(label) +
       "</span>";
     row.addEventListener("click", () => {
-      state.selectedGroupId = pr.group_id || state.selectedGroupId;
-      state.selectedPr = pr.number;
-      state.selectedFile = null;
+      changeView(() => {
+        state.selectedGroupId = pr.group_id || state.selectedGroupId;
+        state.selectedPr = pr.number;
+        state.selectedFile = null;
+        state.selectedUser = null;
+      });
+      markHumanExamined(pr.number);
       // Keep All PRs tab visible but refresh detail
       render();
     });
@@ -680,7 +946,13 @@
   }
 
   function setLeftTab(tab, fromUrl) {
+    if (tab !== "queue" && tab !== "groups" && tab !== "allprs") tab = "queue";
     if (tab !== state.leftTab) alignSidebar = true;
+    if (!fromUrl && tab !== state.leftTab) {
+      const before = viewStateKey();
+      state.leftTab = tab;
+      markViewChanged(before);
+    }
     state.leftTab = tab;
     if (tab !== "queue") disposeVirtualizer("queue");
     if (tab !== "groups") disposeVirtualizer("group");
@@ -723,13 +995,36 @@
     if (state.selectedPr && !pr) {
       state.selectedPr = null;
       changed = true;
-    } else if (!group && pr && !state.selectedFile && pr.group_id && groupById(pr.group_id)) {
+    } else if (!group && pr && pr.group_id && groupById(pr.group_id)) {
       state.selectedGroupId = pr.group_id;
       group = groupById(pr.group_id);
       changed = true;
     }
     if (group && state.selectedPr && !(group.pr_numbers || []).includes(state.selectedPr)) {
       state.selectedPr = null;
+      changed = true;
+    }
+    if (state.selectedFile && !validRepoPath(state.selectedFile)) {
+      state.selectedFile = null;
+      changed = true;
+    } else if (state.selectedFile && group) {
+      const pathBelongs = pr
+        ? (pr.paths || []).includes(state.selectedFile)
+        : (group.pr_numbers || []).some((number) => {
+            const member = prByNumber(number);
+            return member && (member.paths || []).includes(state.selectedFile);
+          });
+      if (!pathBelongs) {
+        state.selectedFile = null;
+        changed = true;
+      }
+    } else if (state.selectedFile && !state.prs.some((item) =>
+      (item.paths || []).includes(state.selectedFile))) {
+      state.selectedFile = null;
+      changed = true;
+    }
+    if (state.selectedUser && !state.prs.some((item) => item.user === state.selectedUser)) {
+      state.selectedUser = null;
       changed = true;
     }
     return changed;
@@ -862,7 +1157,9 @@
         const el = makePill(name);
         el.dataset.label = name;
         el.addEventListener("click", () => {
-          state.filterLabel = state.filterLabel === name ? "" : name;
+          changeView(() => {
+            state.filterLabel = state.filterLabel === name ? "" : name;
+          });
           applyListFilter();
         });
         root.appendChild(el);
@@ -926,7 +1223,7 @@
           '</span><span class="pile-n">0</span>';
         btn.addEventListener("click", () => {
           if (state.queuePile === p.id) return;
-          state.queuePile = p.id;
+          changeView(() => { state.queuePile = p.id; });
           queueRowsCache = null;
           alignSidebar = true;
           renderQueue();
@@ -1274,8 +1571,13 @@
       row.appendChild(rowEvidence);
       row.addEventListener("click", (ev) => {
         if (ev.target.tagName === "A") return;
-        if (it.group_id) state.selectedGroupId = it.group_id;
-        state.selectedPr = it.number;
+        changeView(() => {
+          if (it.group_id) state.selectedGroupId = it.group_id;
+          state.selectedPr = it.number;
+          state.selectedFile = null;
+          state.selectedUser = null;
+        });
+        markHumanExamined(it.number);
         render();
       });
       root.appendChild(row);
@@ -1288,14 +1590,15 @@
 
   function openHotspot(path, opts) {
     const fromUrl = !!(opts && opts.fromUrl);
-    state.selectedGroupId = null;
-    state.selectedPr = null;
-    state.selectedFile = path;
+    changeView(() => {
+      state.selectedGroupId = null;
+      state.selectedPr = null;
+      state.selectedFile = path;
+      state.selectedUser = null;
+      if (state.queuePile !== "hotspots") state.queuePile = "hotspots";
+    });
     state.fileQueue = { path: path, prs: [], loading: true, same_patch: [] };
-    if (state.queuePile !== "hotspots") {
-      state.queuePile = "hotspots";
-      queueRowsCache = null;
-    }
+    queueRowsCache = null;
     if (!fromUrl) writeUrl(true);
     render();
     openFileQueue(path, { fromUrl: true, fileView: true });
@@ -1421,8 +1724,12 @@
         "</span>";
       row.addEventListener("click", (ev) => {
         if (ev.target.tagName === "A") return;
-        if (pr.group_id) state.selectedGroupId = pr.group_id;
-        state.selectedPr = pr.number;
+        changeView(() => {
+          if (pr.group_id) state.selectedGroupId = pr.group_id;
+          state.selectedPr = pr.number;
+          state.selectedUser = null;
+        });
+        markHumanExamined(pr.number);
         render();
       });
       root.appendChild(row);
@@ -1464,14 +1771,14 @@
 
   function openUserDrawer(name) {
     if (!name || name === "?") return;
-    state.selectedUser = name;
+    changeView(() => { state.selectedUser = name; });
     renderUserDrawer();
     writeUrl(true);
   }
 
   function closeUserDrawer() {
     if (!state.selectedUser) return;
-    state.selectedUser = null;
+    changeView(() => { state.selectedUser = null; });
     renderUserDrawer();
     writeUrl(true);
   }
@@ -1532,9 +1839,13 @@
         (dec ? " · " + dec : "") +
         (needs.has(gid) ? " · queue" : "");
       head.addEventListener("click", () => {
-        if (gid && gid !== "?") state.selectedGroupId = gid;
-        state.selectedPr = members[0].number;
-        state.selectedFile = null;
+        changeView(() => {
+          if (gid && gid !== "?") state.selectedGroupId = gid;
+          state.selectedPr = members[0].number;
+          state.selectedFile = null;
+          state.selectedUser = null;
+        });
+        markHumanExamined(members[0].number);
         render();
       });
       list.appendChild(head);
@@ -1550,8 +1861,13 @@
           escapeHtml(pr.title || "") +
           "</span>";
         row.addEventListener("click", () => {
-          if (pr.group_id) state.selectedGroupId = pr.group_id;
-          state.selectedPr = pr.number;
+          changeView(() => {
+            if (pr.group_id) state.selectedGroupId = pr.group_id;
+            state.selectedPr = pr.number;
+            state.selectedFile = null;
+            state.selectedUser = null;
+          });
+          markHumanExamined(pr.number);
           render();
         });
         list.appendChild(row);
@@ -1688,8 +2004,12 @@
         (cls ? " · " + cls : "");
       head.title = "Open this shape";
       head.addEventListener("click", () => {
-        if (gid && gid !== "?") state.selectedGroupId = gid;
-        state.selectedPr = prs[0].number;
+        changeView(() => {
+          if (gid && gid !== "?") state.selectedGroupId = gid;
+          state.selectedPr = prs[0].number;
+          state.selectedUser = null;
+        });
+        markHumanExamined(prs[0].number);
         render();
       });
       members.appendChild(head);
@@ -1701,11 +2021,16 @@
   function renderFileDetail(diffOpts) {
     const empty = $("detailEmpty");
     const detail = $("detail");
+    renderProposalChooser(null);
+    renderDispositionPanel(null, null);
+    renderProposalPanel();
     empty.classList.add("hidden");
     detail.classList.remove("hidden");
     detail.classList.add("file-view");
     const path = state.selectedFile;
     const fq = state.fileQueue;
+    const saveNext = $("saveNextBtn");
+    if (saveNext) saveNext.disabled = true;
     const count = (fq && (fq.pr_count || (fq.prs || []).length)) || 0;
     const same = (fq && fq.same_patch) || [];
     const sameN = same.reduce((n, c) => n + (c.count || 0), 0);
@@ -1739,14 +2064,22 @@
     const detail = $("detail");
     const g = state.groups.find((x) => x.group_id === state.selectedGroupId);
     if (!g && state.selectedFile) {
+      renderProposalChooser(null);
+      renderDispositionPanel(null, null);
+      renderProposalPanel();
       renderFileDetail();
       return;
     }
     if (!g) {
+      renderProposalChooser(null);
+      renderDispositionPanel(null, null);
+      renderProposalPanel();
       loadRelatedIfOpen(null, null);
       renderDiffs(null);
       empty.classList.remove("hidden");
       detail.classList.add("hidden");
+      const saveNext = $("saveNextBtn");
+      if (saveNext) saveNext.disabled = true;
       return;
     }
     empty.classList.add("hidden");
@@ -1760,6 +2093,9 @@
     const cls = g.card_class || "needs-look";
     const decision = g.suggested_decision || "unique";
     renderDecisionWarning(g);
+    renderProposalChooser(g);
+    renderDispositionPanel(g, pr);
+    renderProposalPanel();
 
     if (pr) {
       $("detailKicker").textContent = g.group_id + " · " + n + " PRs in this shape";
@@ -1965,10 +2301,13 @@
       <span class="${labelClass}">${escapeHtml(pr.label || "")}</span>
       <span class="revision-id" title="${escapeHtml(identity)}">${escapeHtml(identity)}</span>`;
     bindUserLink(li.querySelector(".user"), pr.user);
-    li.addEventListener("click", (ev) => {
-      if (ev.target.tagName === "A") return;
-      state.selectedPr = num;
-      state.examinedMembers.add(num);
+      li.addEventListener("click", (ev) => {
+        if (ev.target.tagName === "A") return;
+        changeView(() => {
+          state.selectedPr = num;
+          state.selectedUser = null;
+        });
+      markHumanExamined(num);
       render();
     });
     return li;
@@ -1984,17 +2323,500 @@
       return !pr || pr.evidence_complete !== true || !revisionKnown || !pr.content_digest;
     });
     const unexamined = numbers.filter((number) => !state.examinedMembers.has(number));
+    const agentOpened = numbers.filter((number) =>
+      state.agentOpenedMembers.has(number) && !state.examinedMembers.has(number)
+    );
     const complete = group.evidence_complete === true && incomplete.length === 0;
     root.className = "decision-warning " + (complete ? "complete" : "incomplete");
     root.textContent = numbers.length + " exact member revision" + (numbers.length === 1 ? "" : "s") +
       " · snapshot " + (group.snapshot_digest || "identity missing") +
       (unexamined.length ? " · " + unexamined.length + " not individually opened" : " · all opened") +
+      (agentOpened.length ? " · " + agentOpened.length + " opened by agent (not attested)" : "") +
       (incomplete.length ? " · " + incomplete.length + " incomplete" : " · complete evidence");
     const approve = $("blessBtn");
     approve.disabled = !complete;
     approve.title = complete
       ? "Approve only these repository-bound revisions"
       : "Approval requires complete head, base, and content evidence for every member";
+    const saveNext = $("saveNextBtn");
+    if (saveNext) {
+      saveNext.disabled = !group;
+      saveNext.title = group
+        ? "Save the explicitly chosen decision, then move within this filtered pending scope"
+        : "Select a group first";
+    }
+  }
+
+  function renderProposalChooser(group) {
+    const root = $("proposalChooser");
+    if (!root) return;
+    if (!group) {
+      root.hidden = true;
+      return;
+    }
+    root.hidden = false;
+    const gid = group.group_id;
+    const picker = $("proposalPicker");
+    const input = $("proposalIdInput");
+    const open = $("proposalOpenBtn");
+    const scope = $("proposalChooserScope");
+    const hint = $("proposalChooserHint");
+    const rows = (Array.isArray(state.proposals) ? state.proposals : [])
+      .filter((proposal) => proposal && proposal.group_id === gid &&
+        typeof proposal.proposal_id === "string" && proposal.proposal_id)
+      .sort((left, right) => String(right.updated_at || right.created_at || "")
+        .localeCompare(String(left.updated_at || left.created_at || "")));
+    if (scope) scope.textContent = gid + " · latest 200 workspace proposals max";
+    if (picker) {
+      const prior = picker.value;
+      picker.innerHTML = "";
+      const blank = document.createElement("option");
+      blank.value = "";
+      blank.textContent = "choose a proposal…";
+      picker.appendChild(blank);
+      rows.forEach((proposal) => {
+        const option = document.createElement("option");
+        option.value = proposal.proposal_id;
+        option.textContent = proposal.proposal_id + " · " + (proposal.status || "draft");
+        picker.appendChild(option);
+      });
+      if (rows.some((proposal) => proposal.proposal_id === prior)) picker.value = prior;
+      picker.onchange = () => {
+        if (input) input.value = picker.value || "";
+      };
+    }
+    if (root.dataset.group !== gid) {
+      root.dataset.group = gid;
+      if (input) input.value = "";
+    }
+    if (hint) hint.textContent = rows.length
+      ? "Select a recent draft or paste an ID; opening never accepts or applies it."
+      : "No recent proposal is listed for this group; paste an ID from the agent or proposal log.";
+    if (open) {
+      open.disabled = false;
+      open.onclick = async () => {
+        const id = String((input && input.value || picker && picker.value || "")).trim();
+        if (!id) {
+          setStatus("choose a recent proposal or paste its ID first");
+          return;
+        }
+        const result = await showProposal(id, currentViewContext());
+        if (!result || result.ok !== true) {
+          const message = result && result.error && result.error.message;
+          setStatus("proposal could not be opened" + (message ? ": " + message : ""));
+        }
+      };
+    }
+  }
+
+  const DISPOSITION_VALUES = ["pending", "keep", "duplicate", "reject", "needs_hardware", "upgrade"];
+
+  function exactPrEvidence(number) {
+    const cached = bodyCache[snapshotKey() + "|" + number];
+    return cached && typeof cached.then !== "function" ? cached : null;
+  }
+
+  function ensureDispositionDraft(pr) {
+    if (!pr) return null;
+    if (!state.dispositionDraft || state.dispositionDraft.pr !== pr.number) {
+      state.dispositionDraft = {
+        pr: pr.number,
+        disposition: DISPOSITION_VALUES.includes(pr.disposition) ? pr.disposition : "pending",
+        reason: pr.disposition_reason || "",
+        duplicate_of: pr.duplicate_of || null,
+      };
+    }
+    return state.dispositionDraft;
+  }
+
+  function renderDispositionPanel(group, pr) {
+    const root = $("prDispositionPanel");
+    if (!root) return;
+    if (!group || !pr || !(group.pr_numbers || []).includes(pr.number)) {
+      root.hidden = true;
+      return;
+    }
+    root.hidden = false;
+    const draft = ensureDispositionDraft(pr);
+    const label = $("dispositionPrLabel");
+    if (label) label.textContent = "#" + pr.number + (pr.disposition && pr.disposition !== "pending"
+      ? " · current " + pr.disposition : " · not yet decided");
+    const select = $("dispositionSelect");
+    if (select) {
+      select.value = DISPOSITION_VALUES.includes(draft.disposition) ? draft.disposition : "pending";
+      select.onchange = () => {
+        draft.disposition = select.value;
+        renderDispositionPanel(group, pr);
+      };
+    }
+    const canonical = $("dispositionCanonical");
+    if (canonical) {
+      canonical.innerHTML = "";
+      const none = document.createElement("option");
+      none.value = "";
+      none.textContent = "choose…";
+      canonical.appendChild(none);
+      (group.pr_numbers || []).forEach((number) => {
+        if (number === pr.number) return;
+        const option = document.createElement("option");
+        option.value = String(number);
+        option.textContent = "#" + number;
+        canonical.appendChild(option);
+      });
+      canonical.value = draft.duplicate_of ? String(draft.duplicate_of) : "";
+      canonical.disabled = draft.disposition !== "duplicate";
+      canonical.onchange = () => { draft.duplicate_of = canonical.value ? Number(canonical.value) : null; };
+    }
+    const canonicalWrap = $("canonicalWrap");
+    if (canonicalWrap) canonicalWrap.hidden = draft.disposition !== "duplicate";
+    const reason = $("dispositionReason");
+    if (reason) {
+      reason.value = draft.reason || "";
+      reason.oninput = () => { draft.reason = reason.value; };
+    }
+    const save = $("dispositionSaveBtn");
+    if (save) {
+      save.disabled = !!state.dispositionBusy;
+      save.textContent = state.dispositionBusy ? "Saving…" : "Save per-PR disposition";
+      save.onclick = saveSelectedDisposition;
+    }
+    const hint = $("dispositionHint");
+    if (hint) hint.textContent = pr.disposition_revision
+      ? "Bound to the currently displayed exact revision. A changed revision must be reviewed again."
+      : "This decision applies only to this PR revision; it does not decide its siblings.";
+  }
+
+  function proposalGroup() {
+    const proposal = state.proposal;
+    return proposal && proposal.group_id ? groupById(proposal.group_id) : null;
+  }
+
+  function proposalEditRows(proposal) {
+    if (!proposal || !Array.isArray(proposal.items)) return [];
+    if (!state.proposalEdits || state.proposalEdits.proposal_id !== proposal.proposal_id) {
+      state.proposalEdits = {
+        proposal_id: proposal.proposal_id,
+        canonical_pr: proposal.canonical_pr || null,
+        items: proposal.items.map((item) => ({
+          pr: item.pr,
+          disposition: DISPOSITION_VALUES.includes(item.disposition) ? item.disposition : "pending",
+          reason: item.reason || "",
+          duplicate_of: item.duplicate_of || null,
+          revision: item.revision,
+          duplicate_of_revision: item.duplicate_of_revision || null,
+        })),
+      };
+    }
+    return state.proposalEdits.items;
+  }
+
+  function renderProposalPanel() {
+    const root = $("proposalBlock");
+    if (!root) return;
+    const proposal = state.proposal;
+    const group = proposalGroup();
+    if (!proposal || !group || state.selectedGroupId !== proposal.group_id) {
+      root.hidden = true;
+      return;
+    }
+    root.hidden = false;
+    const summary = $("proposalSummary");
+    if (summary) summary.textContent = (state.proposalLoading ? "Loading agent proposal… · " : "Agent proposal · " +
+      (proposal.status || "draft") + " · ") + proposal.proposal_id;
+    const meta = $("proposalMeta");
+    if (meta) {
+      const provenance = proposal.provenance || {};
+      const context = proposal.context || {};
+      meta.textContent = "Proposal is advisory; a human must inspect and confirm it" +
+        (provenance.actor ? " · actor " + provenance.actor : "") +
+        (context.group_snapshot_digest ? " · snapshot-bound" : " · snapshot binding unavailable");
+    }
+    const rows = proposalEditRows(proposal);
+    const itemsRoot = $("proposalItems");
+    if (itemsRoot) {
+      itemsRoot.innerHTML = "";
+      const locked = state.proposalLoading || !["draft", "edited"].includes(proposal.status);
+      rows.forEach((item) => {
+        const row = document.createElement("div");
+        row.className = "proposal-item";
+        const number = document.createElement("strong");
+        number.className = "mono";
+        number.textContent = "#" + item.pr;
+        row.appendChild(number);
+        const revision = document.createElement("div");
+        revision.className = "revision-id";
+        const exact = item.revision || {};
+        revision.textContent = "head " + (exact.head_sha || "missing") +
+          " · base " + (exact.base_sha || "missing") +
+          " · content " + (exact.content_digest || "missing") +
+          (exact.evidence_complete === true ? " · complete" : " · incomplete");
+        row.appendChild(revision);
+        const dispositionLabel = document.createElement("label");
+        dispositionLabel.textContent = "disposition";
+        const disposition = document.createElement("select");
+        DISPOSITION_VALUES.forEach((value) => {
+          const option = document.createElement("option");
+          option.value = value;
+          option.textContent = value === "needs_hardware" ? "needs hardware" :
+            value === "upgrade" ? "can break upgrade" : value;
+          dispositionLabel.appendChild(option);
+        });
+        disposition.value = item.disposition;
+        disposition.disabled = locked;
+        disposition.addEventListener("change", () => {
+          item.disposition = disposition.value;
+          if (item.disposition !== "duplicate") {
+            item.duplicate_of = null;
+            item.duplicate_of_revision = null;
+          }
+          renderProposalPanel();
+        });
+        row.appendChild(dispositionLabel);
+        const canonicalLabel = document.createElement("label");
+        canonicalLabel.textContent = "canonical PR";
+        const canonical = document.createElement("select");
+        const none = document.createElement("option");
+        none.value = "";
+        none.textContent = "choose…";
+        canonical.appendChild(none);
+        (group.pr_numbers || []).forEach((numberValue) => {
+          if (numberValue === item.pr) return;
+          const option = document.createElement("option");
+          option.value = String(numberValue);
+          option.textContent = "#" + numberValue;
+          canonical.appendChild(option);
+        });
+        canonical.value = item.duplicate_of ? String(item.duplicate_of) : "";
+        canonical.disabled = locked || item.disposition !== "duplicate";
+        canonical.addEventListener("change", () => {
+          item.duplicate_of = canonical.value ? Number(canonical.value) : null;
+          item.duplicate_of_revision = null;
+        });
+        canonicalLabel.appendChild(canonical);
+        row.appendChild(canonicalLabel);
+        const reasonLabel = document.createElement("label");
+        reasonLabel.className = "proposal-reason";
+        reasonLabel.textContent = "reason";
+        const reason = document.createElement("textarea");
+        reason.rows = 2;
+        reason.maxLength = 1000;
+        reason.value = item.reason || "";
+        reason.disabled = locked;
+        reason.addEventListener("input", () => { item.reason = reason.value; });
+        reasonLabel.appendChild(reason);
+        row.appendChild(reasonLabel);
+        itemsRoot.appendChild(row);
+      });
+    }
+    const canonical = $("proposalCanonical");
+    if (canonical) {
+      canonical.innerHTML = "";
+      const none = document.createElement("option");
+      none.value = "";
+      none.textContent = "none";
+      canonical.appendChild(none);
+      (group.pr_numbers || []).forEach((number) => {
+        const option = document.createElement("option");
+        option.value = String(number);
+        option.textContent = "#" + number;
+        canonical.appendChild(option);
+      });
+      canonical.value = state.proposalEdits.canonical_pr ? String(state.proposalEdits.canonical_pr) : "";
+      canonical.disabled = !["draft", "edited"].includes(proposal.status);
+      canonical.onchange = () => { state.proposalEdits.canonical_pr = canonical.value ? Number(canonical.value) : null; };
+    }
+    const rejectReason = $("proposalRejectReason");
+    const accept = $("proposalAcceptBtn");
+    const edit = $("proposalEditBtn");
+    const reject = $("proposalRejectBtn");
+    const locked = state.proposalLoading || !["draft", "edited"].includes(proposal.status) || !!state.proposalAction;
+    if (rejectReason) rejectReason.disabled = locked;
+    if (accept) { accept.disabled = locked; accept.textContent = state.proposalAction === "accept" ? "Accepting…" : "Accept proposal"; accept.onclick = () => transitionProposal("accept"); }
+    if (edit) { edit.disabled = locked; edit.textContent = state.proposalAction === "edit" ? "Saving…" : "Save edits"; edit.onclick = () => transitionProposal("edit"); }
+    if (reject) { reject.disabled = locked; reject.textContent = state.proposalAction === "reject" ? "Rejecting…" : "Reject proposal"; reject.onclick = () => transitionProposal("reject"); }
+    const hint = $("proposalHint");
+    if (hint) hint.textContent = state.proposalLoading ? "Loading proposal…" : state.proposalError ||
+      (proposal.status === "accepted" ? "Accepted; recorded exact human dispositions." :
+        proposal.status === "rejected" ? "Rejected; no dispositions were applied." :
+          "Edit the bounded items if needed, then explicitly accept or reject.");
+  }
+
+  async function proposalItemsForWrite(action) {
+    const proposal = state.proposal;
+    const edits = state.proposalEdits;
+    const group = proposalGroup();
+    if (!proposal || !edits || !group) throw new Error("proposal is not open in the selected group");
+    if (action === "reject") return null;
+    const items = [];
+    for (const edit of edits.items) {
+      const reason = String(edit.reason || "").trim();
+      if (!reason || reason.length > 1000) throw new Error("each proposal item needs a reason of 1-1000 characters");
+      const pr = prByNumber(edit.pr);
+      if (!pr || !(group.pr_numbers || []).includes(edit.pr)) throw new Error("proposal PR is not in the selected group");
+      const revision = edit.revision || revisionRefFromPr(pr, await loadPrBody(edit.pr));
+      const item = { pr: edit.pr, revision, disposition: edit.disposition, reason };
+      if (edit.disposition === "duplicate") {
+        if (!edit.duplicate_of || edit.duplicate_of === edit.pr || !(group.pr_numbers || []).includes(edit.duplicate_of)) {
+          throw new Error("duplicate items need another canonical PR in this group");
+        }
+        const target = prByNumber(edit.duplicate_of);
+        if (!target) throw new Error("canonical PR is not in the current snapshot");
+        item.duplicate_of = edit.duplicate_of;
+        item.duplicate_of_revision = edit.duplicate_of_revision ||
+          revisionRefFromPr(target, await loadPrBody(edit.duplicate_of));
+      }
+      items.push(item);
+    }
+    return items;
+  }
+
+  async function transitionProposal(action) {
+    const proposal = state.proposal;
+    if (!proposal || !["accept", "edit", "reject"].includes(action) || state.proposalAction) return false;
+    const expected = currentViewContext();
+    const identity = [snapshotKey(), proposal.proposal_id, action,
+      JSON.stringify(state.proposalEdits || {}), $("proposalRejectReason") && $("proposalRejectReason").value || ""].join("|");
+    let idempotencyKey = proposalRetries.get(identity);
+    if (!idempotencyKey) {
+      idempotencyKey = makeIdempotencyKey("proposal");
+      proposalRetries.set(identity, idempotencyKey);
+    }
+    state.proposalAction = action;
+    renderProposalPanel();
+    try {
+      const items = await proposalItemsForWrite(action);
+      if (currentViewContext().view_revision !== expected.view_revision ||
+          currentViewContext().store_version !== expected.store_version ||
+          state.proposalKey !== proposal.proposal_id) {
+        state.proposalAction = "";
+        renderProposalPanel();
+        return false;
+      }
+      const body = {
+        repo: state.repo,
+        actor: "human",
+        expected_store_version: expected.store_version,
+        expected_snapshot_version: expected.snapshot_version,
+        idempotency_key: idempotencyKey,
+      };
+      if (action === "reject") {
+        const reason = String($("proposalRejectReason") && $("proposalRejectReason").value || "").trim();
+        if (!reason || reason.length > 1000) throw new Error("a rejection reason of 1-1000 characters is required");
+        body.reason = reason;
+        if (state.proposalEdits && state.proposalEdits.canonical_pr) body.canonical_pr = state.proposalEdits.canonical_pr;
+      } else {
+        body.items = items;
+        if (state.proposalEdits && state.proposalEdits.canonical_pr) body.canonical_pr = state.proposalEdits.canonical_pr;
+      }
+      const data = await api("/api/proposals/" + encodeURIComponent(proposal.proposal_id) + "/" + action, {
+        method: "POST", body: JSON.stringify(body),
+      });
+      if (currentViewContext().store_version !== expected.store_version && action !== "reject") {
+        // The transition response is still authoritative; apply its returned
+        // state below rather than letting another render overwrite it.
+      }
+      proposalRetries.delete(identity);
+      state.proposalAction = "";
+      if (data.state) applyState(data.state);
+      state.proposal = data.proposal || proposal;
+      state.proposalKey = state.proposal.proposal_id;
+      render();
+      const hint = action === "accept" ? "proposal accepted" : action === "edit" ? "proposal edits saved" : "proposal rejected";
+      setStatus(hint + " · human confirmation recorded");
+      return { ok: true, proposal: state.proposal, context: currentViewContext() };
+    } catch (error) {
+      state.proposalAction = "";
+      let failureMessage;
+      if (error.status === 409) {
+        state.proposalError = "proposal is stale; reload the current snapshot before retrying";
+        setStatus("proposal not saved: " + error.message);
+        failureMessage = state.proposalError;
+        await loadState();
+      } else {
+        state.proposalError = error.message || "proposal action failed";
+        setStatus("proposal error: " + state.proposalError);
+        failureMessage = state.proposalError;
+      }
+      renderProposalPanel();
+      return { ok: false, error: { code: error.status === 409 ? "stale_snapshot" : "invalid_request", message: failureMessage, retryable: error.status === 409 } };
+    }
+  }
+
+  async function saveSelectedDisposition() {
+    const group = groupById(state.selectedGroupId);
+    const pr = state.selectedPr ? prByNumber(state.selectedPr) : null;
+    const draft = ensureDispositionDraft(pr);
+    if (!group || !pr || !draft || !(group.pr_numbers || []).includes(pr.number) || state.dispositionBusy) return false;
+    const reason = String(draft.reason || "").trim();
+    if (!reason || reason.length > 1000) {
+      setStatus("per-PR disposition needs a reason of 1-1000 characters");
+      return false;
+    }
+    const expected = currentViewContext();
+    const selectedPr = pr.number;
+    const identity = [snapshotKey(), group.group_id, selectedPr, draft.disposition,
+      draft.duplicate_of || "", reason].join("|");
+    let idempotencyKey = dispositionRetries.get(identity);
+    if (!idempotencyKey) {
+      idempotencyKey = makeIdempotencyKey("disposition");
+      dispositionRetries.set(identity, idempotencyKey);
+    }
+    state.dispositionBusy = true;
+    renderDispositionPanel(group, pr);
+    try {
+      const evidence = await loadPrBody(selectedPr);
+      if (currentViewContext().view_revision !== expected.view_revision || state.selectedPr !== selectedPr) {
+        state.dispositionBusy = false;
+        renderDispositionPanel(groupById(state.selectedGroupId), prByNumber(state.selectedPr));
+        return false;
+      }
+      const item = {
+        pr: selectedPr,
+        revision: revisionRefFromPr(pr, evidence),
+        disposition: draft.disposition,
+        reason,
+        duplicate_of: null,
+      };
+      if (draft.disposition === "duplicate") {
+        const canonical = Number(draft.duplicate_of);
+        if (!canonical || canonical === selectedPr || !(group.pr_numbers || []).includes(canonical)) throw new Error("duplicate needs another canonical PR in this group");
+        const canonicalPr = prByNumber(canonical);
+        if (!canonicalPr) throw new Error("canonical PR is not in the current snapshot");
+        item.duplicate_of = canonical;
+        item.duplicate_of_revision = revisionRefFromPr(canonicalPr, await loadPrBody(canonical));
+      }
+      if (currentViewContext().view_revision !== expected.view_revision || state.selectedPr !== selectedPr) {
+        state.dispositionBusy = false;
+        renderDetail();
+        return false;
+      }
+      const data = await api("/api/dispositions", {
+        method: "POST",
+        body: JSON.stringify({
+          repo: state.repo,
+          group_id: group.group_id,
+          items: [item],
+          expected_store_version: expected.store_version,
+          expected_snapshot_version: expected.snapshot_version,
+          idempotency_key: idempotencyKey,
+          actor: "human",
+        }),
+      });
+      dispositionRetries.delete(identity);
+      state.dispositionBusy = false;
+      if (data.state) applyState(data.state);
+      render();
+      setStatus("saved per-PR disposition for #" + selectedPr);
+      return { ok: true, dispositions: data.dispositions || [], context: currentViewContext() };
+    } catch (error) {
+      state.dispositionBusy = false;
+      renderDispositionPanel(groupById(state.selectedGroupId), prByNumber(state.selectedPr));
+      if (error.status === 409) {
+        setStatus("per-PR disposition not saved: revision or snapshot changed");
+        await loadState();
+      } else setStatus("per-PR disposition error: " + error.message);
+      return false;
+    }
   }
 
   async function renderOverlap(g, options) {
@@ -2080,6 +2902,7 @@
         tr.appendChild(td);
       });
       tr.addEventListener("click", () => {
+        changeView(() => { state.selectedFile = row.path; });
         openFileQueue(row.path);
       });
       tbody.appendChild(tr);
@@ -2527,13 +3350,265 @@
 
   function render() {
     normalizeSelection();
-    if (state.selectedPr) state.examinedMembers.add(state.selectedPr);
     if (state.leftTab === "allprs") renderAllPrList();
     else if (state.leftTab === "queue") renderQueue();
     else renderGroupList();
     renderDetail();
     writeUrl(true);
     if (state.selectedUser) renderUserDrawer();
+  }
+
+  function actionError(code, message, retryable) {
+    return {
+      ok: false,
+      error: {
+        code,
+        message,
+        retryable: !!retryable,
+        context: currentViewContext(),
+      },
+    };
+  }
+
+  function validRepoPath(path) {
+    return typeof path === "string" && path.length > 0 && path.length <= 1024 &&
+      !path.startsWith("/") && !path.includes("\\") &&
+      !path.split("/").some((part) => !part || part === "." || part === "..");
+  }
+
+  function actionInput(value, context, key) {
+    if (value && typeof value === "object" &&
+        Object.prototype.hasOwnProperty.call(value, key)) {
+      return { value: value[key], context: value.if_context };
+    }
+    return {
+      value,
+      context: context && context.if_context && !context.repo ? context.if_context : context,
+    };
+  }
+
+  function setFilters(filters, ifContext) {
+    if (!stateInitialized) return actionError("not_ready", "the current repository snapshot is still loading.", true);
+    const input = actionInput(filters, ifContext, "filters");
+    const guard = checkViewContext(input.context);
+    // Guard first: a stale request must not touch state, DOM, URL, or storage.
+    if (!guard.ok) return guard;
+    const value = input.value;
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      return actionError("invalid_request", "filters must be an object.", false);
+    }
+    const allowed = new Set(["tab", "q", "label", "pile"]);
+    for (const key of Object.keys(value)) {
+      if (!allowed.has(key)) return actionError("invalid_request", "unknown filter: " + key, false);
+    }
+    if (Object.prototype.hasOwnProperty.call(value, "tab") &&
+        !["queue", "groups", "allprs"].includes(value.tab)) {
+      return actionError("invalid_request", "tab must be queue, groups, or allprs.", false);
+    }
+    if (Object.prototype.hasOwnProperty.call(value, "q") &&
+        (typeof value.q !== "string" || Array.from(value.q).length > 256)) {
+      return actionError("invalid_request", "q must be at most 256 characters.", false);
+    }
+    if (Object.prototype.hasOwnProperty.call(value, "label") &&
+        (typeof value.label !== "string" || (value.label && !FILTER_CHIPS.includes(value.label)))) {
+      return actionError("invalid_request", "label is not a supported triage filter.", false);
+    }
+    if (Object.prototype.hasOwnProperty.call(value, "pile") &&
+        !QUEUE_PILES.some((pile) => pile.id === value.pile)) {
+      return actionError("invalid_request", "pile is not a supported queue pile.", false);
+    }
+    const changed = changeView(() => {
+      if (Object.prototype.hasOwnProperty.call(value, "tab")) state.leftTab = value.tab;
+      if (Object.prototype.hasOwnProperty.call(value, "q")) state.filterQuery = value.q;
+      if (Object.prototype.hasOwnProperty.call(value, "label")) state.filterLabel = value.label;
+      if (Object.prototype.hasOwnProperty.call(value, "pile")) state.queuePile = value.pile;
+    });
+    if (changed) {
+      queueRowsCache = null;
+      selectorCache.clear();
+    }
+    if (Object.prototype.hasOwnProperty.call(value, "tab")) setLeftTab(state.leftTab, true);
+    applyListFilter();
+    return { ok: true, context: currentViewContext() };
+  }
+
+  function openTarget(target, ifContext) {
+    if (!stateInitialized) return actionError("not_ready", "the current repository snapshot is still loading.", true);
+    const input = actionInput(target, ifContext, "target");
+    const guard = checkViewContext(input.context);
+    // Validate the complete target before mutating selection or starting any
+    // asynchronous file request.
+    if (!guard.ok) return guard;
+    const value = input.value;
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      return actionError("invalid_request", "target must be an object.", false);
+    }
+    for (const key of Object.keys(value)) {
+      if (!["group_id", "pr", "path"].includes(key)) {
+        return actionError("invalid_request", "unknown target field: " + key, false);
+      }
+    }
+    const hasGroup = Object.prototype.hasOwnProperty.call(value, "group_id");
+    const hasPr = Object.prototype.hasOwnProperty.call(value, "pr");
+    const hasPath = Object.prototype.hasOwnProperty.call(value, "path");
+    if (!hasGroup && !hasPr && !hasPath) {
+      return actionError("invalid_request", "target needs group_id, pr, or path.", false);
+    }
+    if (hasGroup && value.group_id !== null && typeof value.group_id !== "string") {
+      return actionError("invalid_request", "group_id must be a string.", false);
+    }
+    if (hasPr && value.pr !== null && (!Number.isSafeInteger(value.pr) || value.pr <= 0)) {
+      return actionError("invalid_request", "pr must be a positive integer.", false);
+    }
+    if (hasPath && value.path !== null && !validRepoPath(value.path)) {
+      return actionError("invalid_request", "path must be repository-relative.", false);
+    }
+    let groupId = hasGroup ? value.group_id : (hasPr ? null : state.selectedGroupId);
+    let prNumber = hasPr ? value.pr : (hasGroup ? null : state.selectedPr);
+    let path = hasPath ? value.path : null;
+    let group = groupId ? groupById(groupId) : null;
+    let pr = prNumber ? prByNumber(prNumber) : null;
+    if (groupId && !group) return actionError("not_found", "group is not in the current snapshot.", false);
+    if (prNumber && !pr) return actionError("not_found", "PR is not in the current snapshot.", false);
+    if (pr && !group) {
+      groupId = pr.group_id || null;
+      group = groupId ? groupById(groupId) : null;
+    }
+    if (pr && (!group || !(group.pr_numbers || []).includes(pr.number))) {
+      return actionError("invalid_request", "selected PR does not belong to the selected group.", false);
+    }
+    if (!group) return actionError("invalid_request", "a group is required for this target.", false);
+    if (path) {
+      const pathBelongs = pr
+        ? (pr.paths || []).includes(path)
+        : (group.pr_numbers || []).some((number) => {
+            const member = prByNumber(number);
+            return member && (member.paths || []).includes(path);
+          });
+      if (!pathBelongs) return actionError("invalid_request", "path does not belong to the selected PR.", false);
+    }
+    const changed = changeView(() => {
+      state.selectedGroupId = groupId;
+      state.selectedPr = pr ? pr.number : null;
+      state.selectedFile = path;
+      state.selectedUser = null;
+    });
+    if (path) state.fileQueue = { path, prs: [], loading: true, same_patch: [] };
+    if (pr) markAgentOpened(pr.number);
+    render();
+    if (path) openFileQueue(path, { fromUrl: true, fileView: false });
+    return { ok: true, changed, context: currentViewContext() };
+  }
+
+  async function showProposal(proposalId, ifContext) {
+    if (!stateInitialized) return actionError("not_ready", "the current repository snapshot is still loading.", true);
+    const input = actionInput(proposalId, ifContext, "proposal_id");
+    const guard = checkViewContext(input.context);
+    if (!guard.ok) return guard;
+    if (typeof input.value !== "string" || !input.value || input.value.length > 256 ||
+        input.value.includes("/") || input.value.includes("\\") ||
+        Array.from(input.value).some((char) => char.charCodeAt(0) < 32)) {
+      return actionError("invalid_request", "proposal_id must be a bounded string.", false);
+    }
+    const id = input.value;
+    const gen = ++proposalGen;
+    state.proposalLoading = true;
+    state.proposalError = "";
+    // This is a display-only side effect after the initial fresh-context
+    // guard. The fetched proposal itself is applied only if the view remains
+    // the same when the request completes.
+    renderProposalPanel();
+    try {
+      const data = await requestOnce("proposal", state.repo + "|" + id,
+        "/api/proposals/" + encodeURIComponent(id) + "?repo=" + encodeURIComponent(state.repo));
+      const current = checkViewContext(input.context);
+      if (!current.ok || gen !== proposalGen) return current.ok ? staleViewError() : current;
+      if (!data || !data.proposal || typeof data.proposal !== "object") {
+        return actionError("not_found", "proposal response was empty.", false);
+      }
+      const proposalGroupId = data.proposal.group_id;
+      if (typeof proposalGroupId !== "string" || !groupById(proposalGroupId)) {
+        return actionError("not_found", "proposal group is not in the current snapshot.", false);
+      }
+      state.proposal = data.proposal;
+      state.proposalKey = id;
+      state.proposalLoading = false;
+      state.proposalError = "";
+      state.proposalEdits = null;
+      const rejectReason = $("proposalRejectReason");
+      if (rejectReason) rejectReason.value = "";
+      changeView(() => {
+        state.selectedGroupId = proposalGroupId;
+        state.selectedPr = null;
+        state.selectedFile = null;
+        state.selectedUser = null;
+      });
+      renderDetail();
+      const proposalPicker = $("proposalPicker");
+      const proposalIdInput = $("proposalIdInput");
+      if (proposalPicker) proposalPicker.value = id;
+      if (proposalIdInput) proposalIdInput.value = id;
+      const block = $("proposalBlock");
+      if (block) block.open = true;
+      return { ok: true, proposal: data.proposal, context: currentViewContext() };
+    } catch (error) {
+      if (gen !== proposalGen) return staleViewError();
+      state.proposalLoading = false;
+      state.proposalError = error.message || "proposal could not be loaded";
+      renderProposalPanel();
+      if (error.status === 404) return actionError("not_found", state.proposalError, false);
+      return actionError("proposal_unavailable", state.proposalError, true);
+    }
+  }
+
+  async function readTool(operation, args) {
+    if (!stateInitialized) {
+      const error = new Error("the current repository snapshot is still loading");
+      error.code = "not_ready";
+      throw error;
+    }
+    const allowed = [
+      "get_workspace", "list_groups", "search_prs", "get_group", "get_pr",
+      "read_patch", "compare_prs", "find_related", "get_history",
+    ];
+    if (!allowed.includes(operation)) {
+      const error = new Error("unsupported read operation");
+      error.code = "invalid_request";
+      throw error;
+    }
+    if (args === undefined) args = {};
+    if (!args || typeof args !== "object" || Array.isArray(args)) {
+      const error = new Error("args must be an object");
+      error.code = "invalid_request";
+      throw error;
+    }
+    return api("/api/tools/read", {
+      method: "POST",
+      body: JSON.stringify({ operation, args }),
+    });
+  }
+
+  function exposeTriageApp() {
+    if (seamExposed) return;
+    seamExposed = true;
+    // Stable, intentionally narrow browser seam. Do not add api/session or
+    // mutation helpers here: WebMCP may only read through readTool and may
+    // change the current display through the guarded view actions.
+    window.TriageApp = Object.freeze({
+      getViewContext: () => currentViewContext(),
+      setFilters,
+      openTarget,
+      showProposal,
+      readTool,
+    });
+    if (typeof window.dispatchEvent === "function" && typeof window.CustomEvent === "function") {
+      window.dispatchEvent(new window.CustomEvent("triage:ready", {
+        detail: {
+          capabilities: ["read_tool", "get_view_context", "set_filters", "open_target", "show_proposal"],
+          read_operations: READ_TOOL_NAMES.slice(),
+        },
+      }));
+    }
   }
 
   async function loadState() {
@@ -2543,6 +3618,7 @@
       const data = await api("/api/state");
       if (gen !== stateLoadGen) return;
       applyState(data);
+      exposeTriageApp();
       const c = (state.queue && state.queue.counts) || {};
       setStatus(
         `${state.prs.length} PRs · ${state.groups.length} groups · ${c.needs_you || 0} need you`
@@ -2658,8 +3734,19 @@
     }
   }
 
-  async function doDecide(decision) {
-    if (!state.selectedGroupId) return;
+  function pendingScopeGroups() {
+    if (state.leftTab === "queue" && state.queuePile === "hotspots") return [];
+    const source = state.leftTab === "queue"
+      ? pileItems(state.queuePile || "needs_you")
+      : visibleGroups();
+    return source.filter((group) =>
+      pileHas("needs_you", group.group_id) || !ruleFor(group.group_id)
+    );
+  }
+
+  async function doDecide(decision, options) {
+    const advance = !!(options && options.advance);
+    if (!state.selectedGroupId) return false;
     const group = groupById(state.selectedGroupId);
     const membersComplete = group && (group.pr_numbers || []).every((number) => {
       const pr = prByNumber(number);
@@ -2669,8 +3756,10 @@
     if (decision === "approve" &&
         (!group || group.evidence_complete !== true || !membersComplete)) {
       setStatus("approval blocked: complete evidence is required for every revision");
-      return;
+      return false;
     }
+    const pendingBefore = advance ? pendingScopeGroups().map((item) => item.group_id) : [];
+    const currentIndex = pendingBefore.indexOf(state.selectedGroupId);
     const gen = ++stateLoadGen;
     const retryIdentity = [snapshotKey(), state.selectedGroupId, decision].join("|");
     let idempotencyKey = decisionRetries.get(retryIdentity);
@@ -2696,7 +3785,28 @@
       if (gen !== stateLoadGen) return;
       decisionRetries.delete(retryIdentity);
       applyState(data.state);
-      setStatus(`decision saved: ${decision} ${group.group_id}`);
+      let nextGroupId = null;
+      if (advance) {
+        const ordered = currentIndex >= 0
+          ? pendingBefore.slice(currentIndex + 1).concat(pendingBefore.slice(0, currentIndex))
+          : pendingBefore;
+        nextGroupId = ordered.find((groupId) => {
+          const candidate = groupById(groupId);
+          return candidate && (pileHas("needs_you", groupId) || !ruleFor(groupId));
+        }) || null;
+        if (nextGroupId) {
+          changeView(() => {
+            state.selectedGroupId = nextGroupId;
+            state.selectedPr = null;
+            state.selectedFile = null;
+            state.selectedUser = null;
+          });
+        }
+      }
+      render();
+      setStatus(`decision saved: ${decision} ${group.group_id}` +
+        (advance ? (nextGroupId ? " · next pending group" : " · no more pending groups in this filter") : ""));
+      return true;
     } catch (err) {
       if (gen !== stateLoadGen) return;
       if (err.status === 409) {
@@ -2705,6 +3815,21 @@
       } else {
         setStatus("decide error: " + err.message + " · retry keeps the same request key");
       }
+      return false;
+    }
+  }
+
+  async function doSaveAndNext() {
+    const select = $("saveNextDecision");
+    const decision = select && select.value;
+    if (!["approve", "hardware", "upgrade", "reject"].includes(decision)) {
+      setStatus("choose a decision before saving and moving to the next pending group");
+      return;
+    }
+    const saved = await doDecide(decision, { advance: true });
+    if (saved) {
+      state.nextDecision = "";
+      if (select) select.value = "";
     }
   }
 
@@ -2766,6 +3891,12 @@
   $("hardwareBtn").addEventListener("click", () => doDecide("hardware"));
   $("upgradeBtn").addEventListener("click", () => doDecide("upgrade"));
   $("rejectBtn").addEventListener("click", () => doDecide("reject"));
+  const saveNextButton = $("saveNextBtn");
+  if (saveNextButton) saveNextButton.addEventListener("click", doSaveAndNext);
+  const saveNextDecision = $("saveNextDecision");
+  if (saveNextDecision) saveNextDecision.addEventListener("change", (event) => {
+    state.nextDecision = event.target.value || "";
+  });
   $("enrichBtn").addEventListener("click", doEnrich);
   $("tabQueue").addEventListener("click", () => setLeftTab("queue"));
   $("tabGroups").addEventListener("click", () => setLeftTab("groups"));
@@ -2798,12 +3929,14 @@
   window.addEventListener("popstate", () => {
     if (writingUrl) return;
     alignSidebar = true;
+    const before = viewStateKey();
     readUrl();
     if ($("listFilter")) $("listFilter").value = state.filterQuery;
     selectorCache.clear();
     queueRowsCache = null;
     paintLabelFilters();
     normalizeSelection();
+    markViewChanged(before);
     setLeftTab(state.leftTab, true);
     renderDetail();
     writeUrl(false);
@@ -2817,7 +3950,15 @@
     resourceRequests.clear();
   });
   window.addEventListener("pageshow", (event) => {
-    if (event.persisted) render();
+    if (event.persisted) {
+      // A restored page may retain a stale server snapshot and a stale set of
+      // WebMCP registrations. Force a fresh context before accepting actions.
+      stateInitialized = false;
+      state.viewRevision = Number.isSafeInteger(state.viewRevision)
+        ? state.viewRevision + 1 : 1;
+      persistResume();
+      bootstrapSession(true).then(loadState).catch((error) => setStatus("session error: " + error.message));
+    }
   });
 
   readUrl();
@@ -2825,7 +3966,7 @@
   if (filterInp) {
     filterInp.value = state.filterQuery || "";
     filterInp.addEventListener("input", () => {
-      state.filterQuery = filterInp.value;
+      changeView(() => { state.filterQuery = filterInp.value; });
       applyListFilter();
     });
   }

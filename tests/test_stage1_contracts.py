@@ -263,6 +263,7 @@ def test_save_groups_inherits_active_repo_and_decision_becomes_known(tmp_path: P
         [first_group],
         [1],
         last_prs=[_slim(first, "G001")],
+        source="fixtures",
         repo="a/r",
         path=path,
     )
@@ -390,6 +391,7 @@ def test_concurrent_decisions_and_upserts_are_full_read_modify_write(tmp_path: P
         groups,
         [1, 2],
         last_prs=[_slim(p1, "G001"), _slim(p2, "G002")],
+        source="fixtures",
         repo="acme/widgets",
         path=path,
     )
@@ -442,6 +444,7 @@ def test_rule_mutations_hold_outer_lock_across_read_modify_write(
         groups,
         [1, 2],
         last_prs=[_slim(p1, "G001"), _slim(p2, "G002")],
+        source="fixtures",
         repo="acme/widgets",
         path=path,
     )

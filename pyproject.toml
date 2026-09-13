@@ -20,6 +20,7 @@ classifiers = [
 
 [project.optional-dependencies]
 dev = ["build>=1.2", "pytest>=7.0"]
+mcp = ["mcp==2.2.0"]
 
 [project.scripts]
 triage = "triage.cli:main"
