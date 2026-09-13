@@ -1232,6 +1232,7 @@
     else if (slot === "all") allPrVirtualizer = null;
     else if (slot === "queue") queueVirtualizer = null;
     else if (slot === "member") memberVirtualizer = null;
+    else if (slot === "file") fileNavigatorVirtualizer = null;
   }
 
   function scrollSidebarToSelection() {
@@ -3314,6 +3315,7 @@
     mark.type = "button";
     mark.className = "btn";
     const reviewed = !!(file && file.human && file.human.reviewed);
+    syncReviewedDiff(reviewed);
     const canMark = !!file && file.can_mark_reviewed === true;
     mark.textContent = reviewed ? "Reviewed — undo" : "Mark file reviewed";
     mark.setAttribute("aria-pressed", String(reviewed));
@@ -3601,6 +3603,23 @@
     renderFileReviewBar();
     renderFileFindings();
     renderAgentFileDrafts();
+  }
+
+  // Reset only when the target revision or its human-reviewed status changes.
+  // Re-rendering findings must not close a diff the reviewer explicitly opened.
+  let reviewedDiffTarget = "";
+  function syncReviewedDiff(reviewed) {
+    const block = $("diffBlock");
+    if (!block) return;
+    const pr = prByNumber(state.selectedPr) || {};
+    const key = JSON.stringify([state.repo, state.selectedPr, state.selectedFile,
+      pr.head_sha, pr.base_sha, pr.content_digest, !!reviewed]);
+    if (key !== reviewedDiffTarget) {
+      reviewedDiffTarget = key;
+      block.open = !reviewed;
+    }
+    const summary = $("diffSummary");
+    if (summary) summary.textContent = reviewed ? "Diff · reviewed" : "Diff";
   }
 
   // Per-path review status for the file navigator.  Pages are loaded on
@@ -4447,6 +4466,9 @@
   let filesPaneActive = false;
   let filesDialogFocus = null;
   let filesCompare = { key: "", pr: null };
+  let fileNavigatorVirtualizer = null;
+  let fileNavigatorResize = null;
+  let fileNavigatorOwner = "";
 
   function manifestScope() {
     return JSON.stringify([state.repo, state.snapshotVersion, state.storeVersion]);
@@ -4583,16 +4605,23 @@
       if (!groups.has(directory)) groups.set(directory, []);
       groups.get(directory).push(file);
     }
-    const fragment = document.createDocumentFragment();
+    const flat = [];
     for (const [directory, files] of groups) {
+      flat.push({ directory, count: files.length });
+      for (const file of files) flat.push({ file });
+    }
+    const buildRow = (row) => {
+      if (!row.file) {
       const heading = document.createElement("div");
       heading.className = "file-nav-directory";
-      heading.textContent = directory + " · " + files.length;
-      fragment.appendChild(heading);
-      for (const file of files) {
+      heading.textContent = row.directory + " · " + row.count;
+      return heading;
+      }
+        const file = row.file;
         const button = document.createElement("button");
         button.type = "button";
         button.className = "file-nav-row" + (file.path === state.selectedFile ? " active" : "");
+        button.setAttribute("aria-label", file.path);
         button.setAttribute("aria-pressed", String(file.path === state.selectedFile));
         const add = (className, text) => {
           const span = document.createElement("span"); span.className = className;
@@ -4638,25 +4667,104 @@
           if ($("fileQueueBlock").open) openFileQueue(file.path, { scroll: false });
           writeUrl(true);
         };
-        fragment.appendChild(button);
-      }
+        return button;
+    };
+    // Reuse measured heights and mounted rows across scroll events. Only a
+    // data/filter change rebuilds this renderer; scrolling paints its window.
+    const owner = JSON.stringify([entry.scope, entry.pr, entry.query]);
+    if (owner !== fileNavigatorOwner) {
+      disposeVirtualizer("file");
+      fileNavigatorOwner = owner;
     }
+    if (fileNavigatorResize) fileNavigatorResize.disconnect();
+    const inner = document.createElement("div");
+    inner.className = "file-nav-window";
+    const mounted = new Map();
+    let painting = false;
+    let paintFrame = 0;
+    const requestPaint = () => {
+      if (paintFrame) return;
+      paintFrame = requestAnimationFrame(() => { paintFrame = 0; paint(); });
+    };
+    const prefetch = () => {
+      if (currentManifest() !== entry || list.clientHeight === 0) return;
+      const nearEnd = list.scrollHeight - list.scrollTop - list.clientHeight < 600;
+      if (nearEnd && !entry.error && !entry.loading && entry.next !== null) {
+        void loadManifestPage(entry);
+      }
+      if (!reviewIndex.loading && !reviewIndex.error && reviewIndex.next &&
+          reviewIndex.loaded < entry.rows.length) void ensureReviewIndex(entry.pr);
+    };
+    const paint = () => {
+      if (painting || !fileNavigatorVirtualizer || list.firstChild !== inner) return;
+      painting = true;
+      const virtual = fileNavigatorVirtualizer;
+      const items = virtual.getVirtualItems();
+      inner.style.height = virtual.getTotalSize() + "px";
+      const keep = new Set(items.map((item) => item.index));
+      for (const [index, node] of mounted) {
+        if (!keep.has(index)) { node.remove(); mounted.delete(index); }
+      }
+      for (const item of items) {
+        let node = mounted.get(item.index);
+        if (!node) {
+          node = document.createElement("div");
+          node.className = "file-nav-window-row";
+          node.dataset.index = String(item.index);
+          node.appendChild(buildRow(flat[item.index]));
+          mounted.set(item.index, node);
+          const following = [...inner.children].find((child) => Number(child.dataset.index) > item.index);
+          inner.insertBefore(node, following || null);
+        }
+        node.style.transform = "translateY(" + item.start + "px)";
+        virtual.measureElement(node);
+      }
+      painting = false;
+      requestAnimationFrame(prefetch);
+    };
+    list.replaceChildren(inner);
     if (!rows.length) {
       const empty = document.createElement("p");
       empty.className = "muted";
       empty.textContent = entry.loading ? "Loading files…" : query ? "No matching loaded files." : "No file metadata available.";
-      fragment.appendChild(empty);
+      inner.appendChild(empty);
+    } else if (Virtualizer) {
+      if (!fileNavigatorVirtualizer) {
+        fileNavigatorVirtualizer = mountVirtualizer("file", makeVirtualizer(
+          list, flat.length, (index) => flat[index].file ? 125 : 38, 5,
+          requestPaint
+        ));
+      }
+      fileNavigatorVirtualizer.setOptions({
+        ...fileNavigatorVirtualizer.options,
+        count: flat.length,
+        estimateSize: (index) => flat[index].file ? 125 : 38,
+        onChange: requestPaint,
+        initialOffset: entry.scroll,
+        getItemKey: (index) => flat[index].file ? flat[index].file.path : "dir:" + flat[index].directory,
+      });
+      fileNavigatorVirtualizer.measureElement();
+      fileNavigatorVirtualizer._willUpdate();
+      paint();
+    } else {
+      // Bounded fallback if the bundled virtualizer failed to load.
+      inner.textContent = "File navigator unavailable. Reload to retry.";
     }
-    list.replaceChildren(fragment);
     list.scrollTop = entry.scroll;
+    fileNavigatorResize = new ResizeObserver(() => {
+      if (fileNavigatorVirtualizer) fileNavigatorVirtualizer._willUpdate();
+      paint();
+      prefetch();
+    });
+    fileNavigatorResize.observe(list);
     const more = $("fileNavigatorMore");
-    more.hidden = entry.next === null;
+    more.hidden = !entry.error || entry.next === null;
     more.disabled = entry.loading;
-    more.textContent = entry.loading ? "Loading…" : entry.error ? "Retry loading files" : "Load more files";
+    more.textContent = "Retry loading files";
     more.onclick = () => loadManifestPage(entry);
     const reviewMore = $("fileNavigatorReviewMore");
     if (reviewMore) {
-      reviewMore.hidden = !reviewIndex.next || reviewIndex.key !== snapshotKey() + "|" + entry.pr;
+      reviewMore.hidden = !reviewIndex.error || !reviewIndex.next || reviewIndex.key !== snapshotKey() + "|" + entry.pr;
       reviewMore.disabled = reviewIndex.loading;
       reviewMore.textContent = reviewIndex.loading
         ? "Loading review status…"
@@ -4665,7 +4773,24 @@
           : "Load review status for more files";
       reviewMore.onclick = () => ensureReviewIndex(entry.pr);
     }
-    list.onscroll = () => { entry.scroll = list.scrollTop; };
+    list.onscroll = () => { entry.scroll = list.scrollTop; prefetch(); };
+    list.onkeydown = (event) => {
+      if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key) || !fileNavigatorVirtualizer) return;
+      const row = event.target.closest(".file-nav-window-row");
+      if (!row) return;
+      event.preventDefault();
+      const step = event.key === "ArrowUp" || event.key === "End" ? -1 : 1;
+      let index = event.key === "Home" ? 0 : event.key === "End" ? flat.length - 1 : Number(row.dataset.index) + step;
+      while (index >= 0 && index < flat.length && !flat[index].file) index += step;
+      if (index < 0 || index >= flat.length) return;
+      fileNavigatorVirtualizer.scrollToIndex(index, { align: "auto" });
+      requestAnimationFrame(() => {
+        paint();
+        const node = mounted.get(index);
+        if (node && node.firstChild) node.firstChild.focus({ preventScroll: true });
+      });
+    };
+    requestAnimationFrame(prefetch);
     $("fileNavigatorSearch").oninput = (event) => {
       entry.query = event.target.value;
       entry.scroll = 0;

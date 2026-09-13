@@ -46,6 +46,10 @@ button, input, select, textarea { font: inherit; }
 .file-nav-directory { position: sticky; top: -6px; z-index: 1; margin: 8px 0 4px; padding: 7px 5px; background: #11141a; border-bottom: 1px solid var(--border); font: 11px var(--mono); color: var(--muted); overflow-wrap: anywhere; }
 .file-nav-row { display: block; width: 100%; box-sizing: border-box; border: 1px solid transparent; border-radius: 6px; padding: 9px; margin: 0 0 3px; background: transparent; color: var(--text); text-align: left; cursor: pointer; }
 .file-nav-row:hover { background: var(--bg-hover); }
+.file-nav-window { position: relative; width: 100%; }
+.file-nav-window-row { position: absolute; top: 0; left: 0; width: 100%; display: flow-root; }
+.file-nav-window-row .file-nav-directory { position: static; }
+#diffSummary { cursor: pointer; }
 .file-nav-row.active, .file-nav-row[aria-current=true] { background: #202839; border-color: var(--accent-dim); }
 .file-nav-name { display: block; font-size: 13px; font-weight: 600; line-height: 1.45; overflow-wrap: anywhere; }
 .file-nav-parent { display: block; margin-top: 3px; font: 11px/1.5 var(--mono); color: var(--muted); overflow-wrap: anywhere; word-break: normal; }

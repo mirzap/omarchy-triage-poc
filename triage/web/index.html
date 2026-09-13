@@ -6,7 +6,7 @@
   <title>Triage Workspace</title>
   <script src="/preferences.js?v=3"></script>
   <link rel="stylesheet" href="/styles.css?v=32" />
-  <link rel="stylesheet" href="/workbench.css?v=8" />
+  <link rel="stylesheet" href="/workbench.css?v=9" />
 </head>
 <body>
   <header class="topbar">
@@ -107,7 +107,7 @@
           <div id="fileNavigatorStatus" class="file-navigator-status" role="status" aria-live="polite"></div>
         </div>
         <div id="fileNavigatorList" class="file-navigator-list" aria-label="Changed files"></div>
-        <button id="fileNavigatorMore" class="btn file-navigator-more" type="button" hidden>Load more files</button>
+        <button id="fileNavigatorMore" class="btn file-navigator-more" type="button" hidden>Retry loading files</button>
         <button id="fileNavigatorReviewMore" class="btn file-navigator-more" type="button" hidden>Load review status for more files</button>
       </section>
     </aside>
@@ -141,13 +141,13 @@
           <div id="fileFindingsList" class="file-findings-list"></div>
           <button id="fileFindingsMore" class="btn" type="button" hidden>Load more findings</button>
         </details>
-        <div class="block" id="diffBlock">
-          <h3>Diff</h3>
+        <details class="block" id="diffBlock" open>
+          <summary id="diffSummary" class="queue-toggle">Diff</summary>
           <div id="diffMeta" class="muted diff-hint"></div>
           <div id="diffPanels" class="diff-panels">
             <div class="muted diff-hint">Pick a file above to compare hunks.</div>
           </div>
-        </div>
+        </details>
 </div><div id="decisionWarning" class="decision-warning" role="status"></div>
 </div>
 <nav class="context-rail" aria-label="Sidebar sections">
@@ -380,7 +380,7 @@
   </dialog>
 
   <script src="/vendor/virtual.js"></script>
-  <script src="/app.js?v=45"></script>
+  <script src="/app.js?v=46"></script>
   <script src="/webmcp.js?v=3"></script>
 </body>
 </html>
