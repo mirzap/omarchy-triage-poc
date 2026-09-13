@@ -20,8 +20,8 @@ browser and starts an explicit, refreshing Sync; authenticate GitHub first
 with `gh auth login` if needed. No separate `triage run` command is required.
 
 The server uses a separate workspace for each repository by default. Starting
-it does not fetch anything. Existing workspaces appear in the selector: click
-**Open**, use **Settings** → **Save** to update that repository's source or cap,
+it does not fetch anything. Selecting an existing workspace loads it immediately;
+use **Settings** → **Save** to update that repository's source or cap,
 then click **Sync** when ready. **Refresh** is checked by default; uncheck it to
 load existing cached evidence without network access. Merely opening an
 unknown repository never creates a server store.
@@ -138,7 +138,8 @@ triage history --store /path/to/store.json
 CLI and HTTP decisions use the current store version and an idempotency key. Stale submissions conflict instead of overwriting newer work. Decision events retain actor, time, repository, reviewed revisions, membership snapshot, and evidence completeness.
 
 The CLI examples above decide entire groups. In the dashboard, select a PR to
-record an individual decision (called a **disposition** in the current UI):
+record an individual decision in the **Decision for** tray (called a
+**disposition** in the API):
 
 | Decision | Meaning |
 |---|---|
@@ -147,11 +148,18 @@ record an individual decision (called a **disposition** in the current UI):
 | Duplicate | Link to another PR in the group as the preferred candidate |
 | Reject | Do not pursue this change |
 | Needs hardware | Requires validation on relevant hardware |
-| Can break upgrade | Requires upgrade-compatibility review |
+| Upgrade risk | Requires upgrade-compatibility review |
 
-Enter a reason and save explicitly. **Canonical PR** means the preferred PR
+Enter a reason and save explicitly. **Preferred PR** is the canonical candidate
 and is selectable only for a duplicate decision. Keep and duplicate decisions
 require complete evidence. Saving one PR does not decide its siblings.
+
+The workbench opens the selected PR's diff first. Choose a file, then use
+**Compare with…** to add another group member. **Save & next pending** saves
+the individual decision and advances within the current filtered group scope.
+Group-wide actions, agent drafts, descriptions, and evidence details live in
+the context column. On small screens, switch between **Work list**, **Review**,
+and **Context**; workspace controls are under **Workspaces**.
 
 ## Dashboard
 
@@ -180,7 +188,7 @@ If no valid legacy store exists, the stable default is `omacom/omarchy`.
 The dashboard keeps browser-local profile drafts separate from the displayed
 state. **New workspace** asks for source, owner/repo, and file cap, then
 **Create & sync** saves that profile and starts the first refreshing Sync.
-Existing workspaces use the selector and **Open**; **Settings** → **Save** only
+Selecting an existing workspace loads it immediately; **Settings** → **Save** only
 updates that repository's browser-local profile, while **Sync** remains a
 separate explicit action. Switching repositories does not carry over
 decisions, proposals, progress, or cached evidence from the previous
@@ -224,8 +232,8 @@ Results include repository/snapshot context, pagination, and evidence limits.
 
 The tenth tool, `propose_triage`, creates a revision-bound draft with proposed
 per-PR decisions, reasons, and optional canonical references. In the dashboard,
-**Recent proposals** lists recent proposals for the selected group. It stays
-empty until a proposal is created; simply opening a group does not run AI.
+**Agent drafts** expands to list recent proposals for the selected group.
+It has no drafts until a proposal is created; opening a group does not run AI.
 A human can inspect, edit, accept, or reject a draft. Standalone MCP does not
 expose proposal acceptance or a dedicated proposal-list/inspection tool.
 

@@ -4,30 +4,31 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Triage Workspace</title>
-  <link rel="stylesheet" href="/styles.css?v=31" />
+  <link rel="stylesheet" href="/styles.css?v=32" />
+  <link rel="stylesheet" href="/workbench.css?v=1" />
 </head>
 <body>
   <header class="topbar">
     <div class="topbar-main">
       <div class="brand">Triage Workspace</div>
+      <button id="mobileWorkspaceToggle" class="btn mobile-only" type="button" aria-expanded="false" aria-controls="workspaceActions">Workspaces</button>
       <div class="topbar-status" aria-live="polite">
         <div id="activeWorkspace" class="workspace-active">No workspace selected</div>
         <div id="status" class="status" role="status">Create a workspace to begin.</div>
       </div>
-      <div class="topbar-controls" aria-label="Workspace actions">
+      <div id="workspaceActions" class="topbar-controls" aria-label="Workspace actions">
         <div id="savedWorkspaceControls" class="saved-workspace-controls workspace-action" hidden>
           <label class="field workspace-choice">
             <span>workspace</span>
             <select id="workspaceChoices" aria-label="Saved workspaces"><option value="">choose saved workspace…</option></select>
           </label>
-          <button id="openWorkspaceBtn" type="button" class="btn">Open</button>
           <label class="refresh-toggle" title="Revalidate the open-PR list and changed revisions">
             <input id="refresh" type="checkbox" checked /> refresh
           </label>
           <button id="fetchBtn" type="button" class="btn primary">Sync</button>
           <button id="settingsWorkspaceBtn" type="button" class="btn subtle">Settings</button>
         </div>
-        <button id="newWorkspaceBtn" type="button" class="btn primary workspace-action">New workspace</button>
+        <button id="newWorkspaceBtn" type="button" class="btn workspace-action">New workspace</button>
       </div>
     </div>
     <details id="workspaceMetaDetails" class="workspace-meta-details">
@@ -37,11 +38,11 @@
         <div id="agentToolsStatus" class="agent-tools-status">Browser seam ready · WebMCP adapter not loaded</div>
       </div>
     </details>
-    <div id="workspaceSetupHint" class="workspace-setup-hint">Create a browser-local workspace profile to choose a source and file cap. The first Sync starts after Create &amp; sync.</div>
+    <div id="workspaceSetupHint" class="workspace-setup-hint">Add a repository to start reviewing pull requests.</div>
     <dialog id="workspaceDialog" aria-labelledby="workspaceDialogTitle" aria-describedby="workspaceDialogIntro">
       <form id="workspaceForm" method="dialog" novalidate>
         <h2 id="workspaceDialogTitle">New workspace</h2>
-        <p id="workspaceDialogIntro" class="dialog-intro">Choose where this workspace reads from. Create &amp; sync saves the profile in this browser, then starts the first explicit Sync.</p>
+        <p id="workspaceDialogIntro" class="dialog-intro">Choose a repository. We’ll save it in this browser and start syncing.</p>
         <label class="dialog-field" for="source">
           <span>source</span>
           <select id="source">
@@ -69,6 +70,12 @@
     </dialog>
   </header>
 
+  <nav class="mobile-navigation" aria-label="Workbench panes">
+    <button class="btn" type="button" data-mobile-pane="list" aria-pressed="true">Work list</button>
+    <button class="btn" type="button" data-mobile-pane="review" aria-pressed="false">Review</button>
+    <button class="btn" type="button" data-mobile-pane="context" aria-pressed="false">Context</button>
+  </nav>
+
   <main class="layout">
     <aside class="pane left">
       <div class="left-tabs" role="tablist">
@@ -78,7 +85,7 @@
       </div>
       <div class="list-filters">
         <input id="listFilter" type="search" placeholder="Filter #, author, file, title…" autocomplete="off" />
-        <div id="labelFilters" class="label-filters"></div>
+        <details class="filter-disclosure"><summary>Labels</summary><div id="labelFilters" class="label-filters"></div></details>
         <div id="pileNav" class="pile-nav"></div>
         <div id="groupListHeader" class="list-header muted"></div>
       </div>
@@ -90,18 +97,53 @@
     <section class="pane center">
       <div id="detailEmpty" class="empty-state">Select a group</div>
       <div id="detail" class="detail hidden">
-        <div class="detail-head">
+<div class="review-main">        <div class="detail-head">
           <div class="detail-ident">
             <div class="detail-kicker muted" id="detailKicker"></div>
             <div class="detail-title" id="detailTitle"></div>
             <div class="muted" id="detailMeta"></div>
-            <div class="label-stack" id="detailPills"></div>
-            <details class="label-key">
-              <summary>All labels</summary>
-              <div class="label-stack" id="labelKeyAll"></div>
-            </details>
           </div>
-          <div class="actions">
+          <button id="contextToggle" class="btn subtle" type="button" aria-expanded="false">Context</button>
+        </div>
+<div id="reviewFiles" class="review-files" aria-label="Changed files"></div><div class="review-scroll">        <div class="block" id="diffBlock">
+          <h3>Diff</h3>
+          <div id="diffMeta" class="muted diff-hint"></div>
+          <div id="diffPanels" class="diff-panels">
+            <div class="muted diff-hint">Pick a file above to compare hunks.</div>
+          </div>
+        </div>
+</div><div id="decisionWarning" class="decision-warning" role="status"></div>        <section id="prDispositionPanel" class="block disposition-panel" hidden>
+          <div class="panel-heading">
+            <h3>Decision for</h3>
+            <span id="dispositionPrLabel" class="muted"></span>
+          </div>
+          <div id="decisionChips" class="decision-chips" role="group" aria-label="Decision for selected PR"></div>
+          <div class="disposition-form" id="dispositionEditor">
+            <label class="sr-only"><span>Decision</span><select id="dispositionSelect">
+              <option value="pending">pending</option>
+              <option value="keep">keep</option>
+              <option value="duplicate">duplicate</option>
+              <option value="reject">reject</option>
+              <option value="needs_hardware">needs hardware</option>
+              <option value="upgrade">can break upgrade</option>
+            </select></label>
+            <label id="canonicalWrap"><span>Preferred PR</span><select id="dispositionCanonical"><option value="">choose…</option></select></label>
+            <label class="wide"><span>reason (required)</span><textarea id="dispositionReason" rows="2" maxlength="1000" placeholder="Why did you choose this decision?"></textarea></label>
+            <button id="dispositionSaveBtn" type="button" class="btn accent">Save decision</button>
+          <button id="dispositionNextBtn" type="button" class="btn primary">Save &amp; next pending</button>
+            <button id="dispositionCancelBtn" type="button" class="btn">Cancel</button>
+          </div>
+          <div id="dispositionHint" class="muted"></div>
+        </section>
+</div><aside id="reviewContext" class="review-context" aria-label="Group context">
+        <div class="block" id="membersBlock">
+          <h3 id="membersHead">PRs in this shape</h3>
+          <div id="detailMembersWrap" class="member-wrap">
+            <ul id="detailMembers" class="member-list"></ul>
+          </div>
+        </div>
+<p class="context-note">Shared files suggest a connection, not equivalent changes.</p>
+<details class="block more-block" id="groupActions"><summary class="queue-toggle">Group decisions</summary><p class="muted">Applies locally to every current member revision. Not a GitHub approval.</p>          <div class="actions">
             <button id="blessBtn" type="button" class="btn accent">Approve reviewed revisions</button>
             <button id="hardwareBtn" type="button" class="btn">Needs hardware</button>
             <button id="upgradeBtn" type="button" class="btn warn">Can break upgrade</button>
@@ -109,11 +151,15 @@
             <label class="save-next-choice"><span>save &amp; next decision</span><select id="saveNextDecision"><option value="">choose…</option><option value="approve">approve</option><option value="hardware">needs hardware</option><option value="upgrade">can break upgrade</option><option value="reject">reject</option></select></label>
             <button id="saveNextBtn" type="button" class="btn" disabled>Save &amp; next pending</button>
           </div>
-        </div>
-        <div id="decisionWarning" class="decision-warning" role="status"></div>
-        <section id="proposalChooser" class="block proposal-chooser">
+</details>
+        <details class="block more-block" id="prBodyBlock">
+          <summary id="prBodyHead" class="queue-toggle">Description</summary>
+          <div id="prBody" class="pr-body muted">Click a PR above.</div>
+        </details>
+        <details id="proposalChooser" class="block proposal-chooser">
+          <summary>Agent drafts <span id="proposalCount"></span></summary>
           <div class="panel-heading">
-            <h3>Recent proposals</h3>
+            <h3 class="sr-only">Recent proposals</h3>
             <span id="proposalChooserScope" class="muted"></span>
           </div>
           <div class="proposal-chooser-row">
@@ -122,27 +168,7 @@
             <button id="proposalOpenBtn" type="button" class="btn">Open proposal</button>
           </div>
           <div id="proposalChooserHint" class="muted"></div>
-        </section>
-        <section id="prDispositionPanel" class="block disposition-panel" hidden>
-          <div class="panel-heading">
-            <h3>Per-PR disposition</h3>
-            <span id="dispositionPrLabel" class="muted"></span>
-          </div>
-          <div class="disposition-form">
-            <label><span>disposition</span><select id="dispositionSelect">
-              <option value="pending">pending</option>
-              <option value="keep">keep</option>
-              <option value="duplicate">duplicate</option>
-              <option value="reject">reject</option>
-              <option value="needs_hardware">needs hardware</option>
-              <option value="upgrade">can break upgrade</option>
-            </select></label>
-            <label id="canonicalWrap"><span>canonical PR</span><select id="dispositionCanonical"><option value="">choose…</option></select></label>
-            <label class="wide"><span>reason (required)</span><textarea id="dispositionReason" rows="2" maxlength="1000" placeholder="Why this PR has this disposition"></textarea></label>
-            <button id="dispositionSaveBtn" type="button" class="btn accent">Save per-PR disposition</button>
-          </div>
-          <div id="dispositionHint" class="muted"></div>
-        </section>
+        </details>
         <details id="proposalBlock" class="block more-block" hidden>
           <summary id="proposalSummary" class="queue-toggle">Agent proposal</summary>
           <div id="proposalMeta" class="muted"></div>
@@ -156,36 +182,6 @@
           </div>
           <div id="proposalHint" class="muted"></div>
         </details>
-        <div class="block" id="membersBlock">
-          <h3 id="membersHead">PRs in this shape</h3>
-          <div id="detailMembersWrap" class="member-wrap">
-            <ul id="detailMembers" class="member-list"></ul>
-          </div>
-        </div>
-        <details class="block more-block" id="prBodyBlock">
-          <summary id="prBodyHead" class="queue-toggle">Description</summary>
-          <div id="prBody" class="pr-body muted">Click a PR above.</div>
-        </details>
-        <div class="block" id="overlapBlock">
-          <h3>Files in this shape</h3>
-          <div id="overlapSummary" class="overlap-summary muted"></div>
-          <div class="overlap-legend">
-            <span class="item"><span class="sq shared"></span> all PRs</span>
-            <span class="item"><span class="sq partial"></span> some PRs</span>
-            <span class="item"><span class="sq unique"></span> one PR</span>
-            <span class="item"><span class="sq miss"></span> this PR skips it</span>
-          </div>
-          <div id="overlapMatrixWrap" class="overlap-matrix-wrap">
-            <table id="overlapMatrix" class="overlap-matrix"></table>
-          </div>
-        </div>
-        <div class="block" id="diffBlock">
-          <h3>Diff</h3>
-          <div id="diffMeta" class="muted diff-hint"></div>
-          <div id="diffPanels" class="diff-panels">
-            <div class="muted diff-hint">Pick a file above to compare hunks.</div>
-          </div>
-        </div>
         <details class="block more-block" id="fileQueueBlock">
           <summary id="fileQueueToggle" class="queue-toggle">Also on this file</summary>
           <div id="fileQueue" class="file-queue muted">Pick a file above.</div>
@@ -198,6 +194,26 @@
             <button id="enrichBtn" type="button" class="btn">Send up to 24 candidates for external ranking</button>
           </div>
         </details>
+        <details class="block more-block" id="overlapBlock">
+          <summary class="queue-toggle">File overlap</summary>
+          <div id="overlapSummary" class="overlap-summary muted"></div>
+          <div class="overlap-legend">
+            <span class="item"><span class="sq shared"></span> all PRs</span>
+            <span class="item"><span class="sq partial"></span> some PRs</span>
+            <span class="item"><span class="sq unique"></span> one PR</span>
+            <span class="item"><span class="sq miss"></span> this PR skips it</span>
+          </div>
+          <div id="overlapMatrixWrap" class="overlap-matrix-wrap">
+            <table id="overlapMatrix" class="overlap-matrix"></table>
+          </div>
+        </details>
+<details class="block more-block"><summary class="queue-toggle">Evidence &amp; labels</summary>            <div class="label-stack" id="detailPills"></div>
+            <details class="label-key">
+              <summary>All labels</summary>
+              <div class="label-stack" id="labelKeyAll"></div>
+            </details>
+<div id="revisionDetails" class="revision-id"></div></details>
+</aside>
       </div>
     </section>
 
@@ -217,7 +233,7 @@
   </main>
 
   <script src="/vendor/virtual.js"></script>
-  <script src="/app.js?v=36"></script>
+  <script src="/app.js?v=38"></script>
   <script src="/webmcp.js?v=1"></script>
 </body>
 </html>

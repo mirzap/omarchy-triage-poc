@@ -339,8 +339,12 @@ vm.runInNewContext(
 (async () => {
   const group = { group_id: "G001", pr_numbers: Array.from({ length: 12 }, (_, i) => i + 1) };
   await context.renderDiffs(group);
-  assert.match(requestedUrl, /group_id=G001/);
-  assert.match(requestedUrl, /page=2/);
+  // The workbench requests the selected revision directly, including members
+  // beyond the old eight-member page, and compares only on explicit request.
+  assert.match(requestedUrl, /prs=12&/);
+  assert.match(requestedUrl, /page=1&/);
+  await context.renderDiffs(group, { comparePr: 3 });
+  assert.match(requestedUrl, /prs=12,3&/);
   const panel = diffRoot.children.find((child) => child.className === "diff-panel");
   assert(panel, "nonempty patch response must append a diff panel");
   assert.match(panel.innerHTML, /\+new/);

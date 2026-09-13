@@ -538,6 +538,8 @@
   function renderWorkspaceControls() {
     const active = $("activeWorkspace");
     const saved = hasSavedWorkspace();
+    const mobileWorkspaceToggle = $("mobileWorkspaceToggle");
+    if (mobileWorkspaceToggle) mobileWorkspaceToggle.textContent = saved ? "Workspaces" : "New workspace";
     if (active) {
       active.textContent = state.workspaceSwitching
         ? "opening workspace: " + (state.repo || state.repoDraft || "?")
@@ -566,8 +568,6 @@
       picker.appendChild(option);
     });
     picker.value = all.includes(state.repo) ? state.repo : all.includes(prior) ? prior : "";
-    const open = $("openWorkspaceBtn");
-    if (open) open.disabled = !picker.value || state.workspaceSwitching;
     const sync = $("fetchBtn");
     if (sync) sync.disabled = !saved || !state.repo || state.fetching || state.workspaceSwitching;
     const settings = $("settingsWorkspaceBtn");
@@ -1411,6 +1411,8 @@
       firstTitle
     )}</div>`;
     card.addEventListener("click", () => {
+      if (hasUnsavedDecisionEdit() && !window.confirm("Discard unsaved PR decision edits?")) return;
+      setMobilePane("review");
       changeView(() => {
         state.selectedGroupId = g.group_id;
         state.selectedPr = null;
@@ -1524,6 +1526,8 @@
       escapeHtml(label) +
       "</span>";
     row.addEventListener("click", () => {
+      if (state.selectedPr !== pr.number && hasUnsavedDecisionEdit() && !window.confirm("Discard unsaved PR decision edits?")) return;
+      setMobilePane("review");
       changeView(() => {
         state.selectedGroupId = pr.group_id || state.selectedGroupId;
         state.selectedPr = pr.number;
@@ -1890,6 +1894,7 @@
       hs.pr_count +
       " PRs</span>";
     el.addEventListener("click", () => {
+      setMobilePane("review");
       openHotspot(hs.path);
     });
     return el;
@@ -2621,6 +2626,7 @@
     empty.classList.add("hidden");
     detail.classList.remove("hidden");
     detail.classList.add("file-view");
+    if ($("reviewFiles")) $("reviewFiles").replaceChildren();
     const path = state.selectedFile;
     const fq = state.fileQueue;
     const saveNext = $("saveNextBtn");
@@ -2657,6 +2663,14 @@
     const empty = $("detailEmpty");
     const detail = $("detail");
     const g = state.groups.find((x) => x.group_id === state.selectedGroupId);
+    if (g) {
+      changeView(() => {
+        if (!state.selectedPr) state.selectedPr = (g.pr_numbers || [])[0] || null;
+        const selected = prByNumber(state.selectedPr);
+        if (!state.selectedFile && selected) state.selectedFile = (selected.paths || [])[0] || null;
+      });
+      renderReviewFiles(g);
+    }
     if (!g && state.selectedFile) {
       renderProposalChooser(null);
       renderDispositionPanel(null, null);
@@ -2701,7 +2715,7 @@
     renderProposalPanel();
 
     if (pr) {
-      $("detailKicker").textContent = g.group_id + " · " + n + " PRs in this shape";
+      $("detailKicker").textContent = g.group_id + " · " + n + " PRs with shared files";
       $("detailTitle").innerHTML =
         '<a class="pr-link" href="' +
         escapeHtml(prUrl(pr)) +
@@ -2720,7 +2734,8 @@
         meta.appendChild(ub);
       }
       meta.appendChild(
-        document.createTextNode(rule ? " · marked " + rule.decision : " · unreviewed")
+        document.createTextNode(" · " + (pr.paths || []).length + " files · " +
+          (pr.disposition || "pending").replace(/_/g, " "))
       );
     } else {
       $("detailKicker").textContent = g.group_id + " · " + n + (n === 1 ? " PR" : " PRs");
@@ -2748,11 +2763,11 @@
     }
 
     const mh = $("membersHead");
-    if (mh) mh.textContent = "PRs in this shape · " + n;
+    if (mh) mh.textContent = "Group · " + n + " PRs";
 
     renderMembers(g);
     renderPrBodies(g);
-    renderOverlap(g);
+    if ($("overlapBlock").open) renderOverlap(g);
     renderDiffs(g);
     renderFileQueue();
     const qPr = state.selectedPr || (g.pr_numbers || [])[0];
@@ -2796,8 +2811,11 @@
       return;
     }
     if (head) head.textContent = "Description · #" + selected;
-    if (block && lastBodyPr !== selected) block.open = true;
     lastBodyPr = selected;
+    if (block && !block.open) {
+      root.textContent = "Open to read this PR’s description.";
+      return;
+    }
     root.className = "pr-body muted";
     root.textContent = "Loading description…";
     loadPrBody(selected)
@@ -2906,6 +2924,8 @@
     bindUserLink(li.querySelector(".user"), pr.user);
       li.addEventListener("click", (ev) => {
         if (ev.target.tagName === "A") return;
+        if (state.selectedPr !== num && hasUnsavedDecisionEdit() && !window.confirm("Discard unsaved PR decision edits?")) return;
+        setMobilePane("review");
         changeView(() => {
           state.selectedPr = num;
           state.selectedUser = null;
@@ -2931,11 +2951,19 @@
     );
     const complete = group.evidence_complete === true && incomplete.length === 0;
     root.className = "decision-warning " + (complete ? "complete" : "incomplete");
-    root.textContent = numbers.length + " exact member revision" + (numbers.length === 1 ? "" : "s") +
-      " · snapshot " + (group.snapshot_digest || "identity missing") +
-      (unexamined.length ? " · " + unexamined.length + " not individually opened" : " · all opened") +
-      (agentOpened.length ? " · " + agentOpened.length + " opened by agent (not attested)" : "") +
-      (incomplete.length ? " · " + incomplete.length + " incomplete" : " · complete evidence");
+    const selectedIncomplete = incomplete.includes(state.selectedPr);
+    root.textContent = selectedIncomplete
+      ? "Incomplete evidence for #" + state.selectedPr + ". Review the missing content before deciding."
+      : "Complete evidence for #" + state.selectedPr +
+        (incomplete.length ? " · " + incomplete.length + " group members have incomplete evidence." : " · Decisions are local; nothing is sent to GitHub.");
+    const identity = $("revisionDetails");
+    if (identity) identity.textContent = "Snapshot " + (group.snapshot_digest || "missing") +
+      " · " + unexamined.length + " members not individually opened · " + agentOpened.length +
+      " opened by agent (not human-attested). " + numbers.map((number) => {
+        const member = prByNumber(number) || {};
+        return "#" + number + " head " + (member.head_sha || "missing") +
+          " base " + (member.base_sha || "missing") + " content " + (member.content_digest || "missing");
+      }).join("; ");
     const approve = $("blessBtn");
     approve.disabled = !complete;
     approve.title = complete
@@ -2969,6 +2997,8 @@
         typeof proposal.proposal_id === "string" && proposal.proposal_id)
       .sort((left, right) => String(right.updated_at || right.created_at || "")
         .localeCompare(String(left.updated_at || left.created_at || "")));
+    const count = $("proposalCount");
+    if (count) count.textContent = rows.length ? " · " + rows.length : "";
     if (scope) scope.textContent = gid + " · latest 200 workspace proposals max";
     if (picker) {
       const prior = picker.value;
@@ -3041,6 +3071,32 @@
     }
     root.hidden = false;
     const draft = ensureDispositionDraft(pr);
+    const chips = $("decisionChips");
+    if (chips) {
+      chips.replaceChildren();
+      const names = { keep: "Keep", duplicate: "Duplicate", reject: "Reject",
+        needs_hardware: "Needs hardware", upgrade: "Upgrade risk", pending: "Pending" };
+      ["keep", "duplicate", "reject", "needs_hardware", "upgrade", "pending"].forEach((value) => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "btn decision-chip";
+        button.textContent = names[value];
+        button.setAttribute("aria-pressed", String(draft.disposition === value));
+        const complete = pr.evidence_complete === true && !!pr.content_digest &&
+          (state.source === "fixtures" || !!(pr.head_sha && pr.base_sha));
+        button.disabled = !!state.dispositionBusy || (!complete && ["keep", "duplicate"].includes(value));
+        if (!complete && ["keep", "duplicate"].includes(value)) button.title = "Requires complete evidence for this revision";
+        button.addEventListener("click", () => {
+          draft.disposition = value;
+          draft.editing = true;
+          if (value !== "duplicate") draft.duplicate_of = null;
+          renderDispositionPanel(group, pr);
+        });
+        chips.appendChild(button);
+      });
+    }
+    const editor = $("dispositionEditor");
+    if (editor) editor.hidden = !draft.editing;
     const label = $("dispositionPrLabel");
     if (label) label.textContent = "#" + pr.number + (pr.disposition && pr.disposition !== "pending"
       ? " · current " + pr.disposition : " · not yet decided");
@@ -3049,6 +3105,7 @@
       select.value = DISPOSITION_VALUES.includes(draft.disposition) ? draft.disposition : "pending";
       select.onchange = () => {
         draft.disposition = select.value;
+        draft.editing = true;
         renderDispositionPanel(group, pr);
       };
     }
@@ -3063,7 +3120,7 @@
         if (number === pr.number) return;
         const option = document.createElement("option");
         option.value = String(number);
-        option.textContent = "#" + number;
+        option.textContent = "#" + number + " — " + ((prByNumber(number) || {}).title || "");
         canonical.appendChild(option);
       });
       canonical.value = draft.duplicate_of ? String(draft.duplicate_of) : "";
@@ -3080,13 +3137,87 @@
     const save = $("dispositionSaveBtn");
     if (save) {
       save.disabled = !!state.dispositionBusy;
-      save.textContent = state.dispositionBusy ? "Saving…" : "Save per-PR disposition";
+      save.textContent = state.dispositionBusy ? "Saving…" : "Save decision";
       save.onclick = saveSelectedDisposition;
+    }
+    const next = $("dispositionNextBtn");
+    if (next) {
+      next.disabled = !!state.dispositionBusy;
+      next.onclick = saveDispositionAndNext;
+    }
+    const cancel = $("dispositionCancelBtn");
+    if (cancel) {
+      cancel.disabled = !!state.dispositionBusy;
+      cancel.onclick = () => { state.dispositionDraft = null; renderDispositionPanel(group, pr); };
     }
     const hint = $("dispositionHint");
     if (hint) hint.textContent = pr.disposition_revision
       ? "Bound to the currently displayed exact revision. A changed revision must be reviewed again."
-      : "This decision applies only to this PR revision; it does not decide its siblings.";
+      : "For this PR revision only. Other group members are unchanged.";
+  }
+
+  async function saveDispositionAndNext() {
+    const repo = state.repo;
+    const token = workspaceGen;
+    const selected = state.selectedPr;
+    const pending = visibleGroups().flatMap((group) => group.pr_numbers || [])
+      .filter((number) => {
+        const pr = prByNumber(number);
+        return pr && (!pr.disposition || pr.disposition === "pending");
+      });
+    const index = pending.indexOf(selected);
+    const candidates = pending.slice(index + 1).concat(pending.slice(0, Math.max(0, index)))
+      .filter((number) => number !== selected);
+    const result = await saveSelectedDisposition();
+    if (!result || !result.ok || !workspaceCurrent(repo, token) || state.selectedPr !== selected) return;
+    const next = candidates.map(prByNumber).find((pr) => pr && (!pr.disposition || pr.disposition === "pending"));
+    if (!next) { setStatus("Decision saved. No more pending PRs in this view."); return; }
+    changeView(() => {
+      state.selectedGroupId = next.group_id;
+      state.selectedPr = next.number;
+      state.selectedFile = (next.paths || [])[0] || null;
+    });
+    render();
+  }
+
+  function renderReviewFiles(group) {
+    const root = $("reviewFiles");
+    if (!root) return;
+    root.replaceChildren();
+    const pr = prByNumber(state.selectedPr);
+    const paths = pr ? pr.paths || [] : [];
+    paths.forEach((path) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "btn file-choice" + (path === state.selectedFile ? " active" : "");
+      button.textContent = path;
+      button.setAttribute("aria-pressed", String(path === state.selectedFile));
+      button.addEventListener("click", () => {
+        changeView(() => { state.selectedFile = path; });
+        renderReviewFiles(group);
+        renderDiffs(group);
+        loadRelatedIfOpen(state.selectedPr, path);
+        if ($("fileQueueBlock").open) openFileQueue(path, { scroll: false });
+        writeUrl(true);
+      });
+      root.appendChild(button);
+    });
+    if (!paths.length) root.textContent = "No file evidence available for this PR.";
+    const compare = document.createElement("select");
+    compare.className = "btn file-choice";
+    compare.setAttribute("aria-label", "Compare selected PR with");
+    const none = document.createElement("option");
+    none.value = "";
+    none.textContent = "Compare with…";
+    compare.appendChild(none);
+    (group.pr_numbers || []).filter((number) => number !== state.selectedPr).forEach((number) => {
+      const option = document.createElement("option");
+      option.value = String(number);
+      option.textContent = "#" + number;
+      compare.appendChild(option);
+    });
+    compare.onchange = () => renderDiffs(group, { comparePr: Number(compare.value) || null });
+    if (compare.options.length > 1) root.appendChild(compare);
   }
 
   function proposalGroup() {
@@ -3358,6 +3489,7 @@
     const reason = String(draft.reason || "").trim();
     if (!reason || reason.length > 1000) {
       setStatus("per-PR disposition needs a reason of 1-1000 characters");
+      if ($("dispositionReason")) $("dispositionReason").focus();
       return false;
     }
     const expected = currentViewContext();
@@ -3664,7 +3796,7 @@
       pendingDiffScrollFrame = null;
       if (!diffScrollMatches(request) || generation !== diffGen) return;
       pendingDiffScroll = null;
-      const pane = document.querySelector(".pane.center");
+      const pane = document.querySelector(".review-scroll") || document.querySelector(".pane.center");
       const block = $("diffBlock");
       if (!pane || !block) return;
       const paneRect = pane.getBoundingClientRect();
@@ -3706,6 +3838,11 @@
       const selectedGroupPr = groupSet.has(state.selectedPr) ? state.selectedPr : null;
       allNums = g.pr_numbers || [];
       nums = takeWithSelected(allNums, selectedGroupPr, 8);
+      if (selectedGroupPr) {
+        allNums = [selectedGroupPr];
+        if (opts && groupSet.has(opts.comparePr) && opts.comparePr !== selectedGroupPr) allNums.push(opts.comparePr);
+        nums = allNums;
+      }
     } else {
       const selected = prByNumber(state.selectedPr);
       const selectedFilePr =
@@ -3737,7 +3874,8 @@
     const selectedIndex = allNums.indexOf(state.selectedPr);
     const defaultPage = selectedIndex >= 0 ? Math.floor(selectedIndex / pageSize) + 1 : 1;
     const page = (opts && opts.page) || defaultPage;
-    const target = g
+    const focused = g && state.selectedPr && (g.pr_numbers || []).includes(state.selectedPr);
+    const target = g && !focused
       ? "&group_id=" + encodeURIComponent(g.group_id)
       : "&prs=" + allNums.join(",");
     const url = "/api/patches?repo=" + encodeURIComponent(repo) + target +
@@ -3747,7 +3885,7 @@
     try {
       data = typeof requestOnce === "function"
         ? await requestOnce("patch", snapshotKey() + "|" +
-            (g ? g.group_id : allNums.join(",")) + "|" + path + "|" + page, url)
+            (g && !focused ? g.group_id : allNums.join(",")) + "|" + path + "|" + page, url)
         : await api(url);
     } catch (err) {
       if (gen !== diffGen) return;
@@ -3770,12 +3908,11 @@
     }
     const comparison = data.comparison || {};
     if (meta) {
-      meta.textContent = path + " · page " + (data.page || page) + " of " +
-        (data.total_pages || 1) + " · " + (data.total_items || items.length) +
-        " target PRs · equality " +
-        (comparison.same_complete_patch == null ? "unknown/incomplete" :
-          comparison.same_complete_patch ? "same complete patch" : "different complete patches");
+      meta.textContent = "Reviewing #" + state.selectedPr + " · " + path +
+        (items.length > 1 ? " · " + (comparison.same_complete_patch == null ? "comparison incomplete" :
+          comparison.same_complete_patch ? "same complete patch" : "different patches") : "");
     }
+    items.sort((a, b) => Number(b.number === state.selectedPr) - Number(a.number === state.selectedPr));
     items.forEach((it) => {
       const pr = prByNumber(it.number) || { number: it.number, user: "" };
       const patch = it.patch || "";
@@ -3819,10 +3956,15 @@
         group: g,
       });
       if (it.content_sha256) {
+        const details = document.createElement("details");
+        details.className = "patch-identity";
+        const summary = document.createElement("summary");
+        summary.textContent = "Patch identity";
         const digest = document.createElement("div");
         digest.className = "revision-id";
         digest.textContent = "full patch sha256 " + it.content_sha256;
-        panel.appendChild(digest);
+        details.append(summary, digest);
+        panel.appendChild(details);
       } else if ((it.incomplete_reasons || []).length) {
         const reason = document.createElement("div");
         reason.className = "revision-id incomplete-evidence";
@@ -4110,6 +4252,7 @@
     });
     if (path) state.fileQueue = { path, prs: [], loading: true, same_patch: [] };
     if (pr) markAgentOpened(pr.number);
+    setMobilePane("review");
     render();
     if (path) openFileQueue(path, { fromUrl: true, fileView: false });
     return { ok: true, changed, context: currentViewContext() };
@@ -4170,6 +4313,12 @@
       if (proposalIdInput) proposalIdInput.value = id;
       const block = $("proposalBlock");
       if (block) block.open = true;
+      $("detail").classList.add("context-open");
+      setMobilePane("context");
+      if ($("contextToggle")) {
+        $("contextToggle").setAttribute("aria-expanded", "true");
+        $("contextToggle").textContent = "Close context";
+      }
       return { ok: true, proposal: data.proposal, context: currentViewContext() };
     } catch (error) {
       if (gen !== proposalGen || !workspaceCurrent(workspaceRepo, workspaceToken)) return staleViewError();
@@ -4569,17 +4718,18 @@
     }
   }
 
-  const repoInput = $("repo");
-  const openWorkspaceButton = $("openWorkspaceBtn");
   const workspaceChoices = $("workspaceChoices");
-  async function openDraftWorkspace() {
-    const target = workspaceChoices && workspaceChoices.value || repoInput && repoInput.value.trim();
-    await switchWorkspace(target);
-  }
-  if (openWorkspaceButton) openWorkspaceButton.addEventListener("click", openDraftWorkspace);
-  if (workspaceChoices) workspaceChoices.addEventListener("change", () => {
-    if (repoInput && workspaceChoices.value) repoInput.value = workspaceChoices.value;
-    if (openWorkspaceButton) openWorkspaceButton.disabled = !workspaceChoices.value || state.workspaceSwitching;
+  if (workspaceChoices) workspaceChoices.addEventListener("change", async () => {
+    const target = workspaceChoices.value;
+    try {
+      if (target) await switchWorkspace(target);
+    } catch (error) {
+      setStatus("Could not open workspace: " + error.message);
+    } finally {
+      // Restore the active selection if the user cancels unsaved-edit discard.
+      // Loading another workspace never starts a GitHub Sync.
+      renderWorkspaceControls();
+    }
   });
 
   function pendingScopeGroups() {
@@ -4737,6 +4887,28 @@
   }
 
   const workspaceDialog = $("workspaceDialog");
+  function setMobilePane(pane) {
+    document.body.dataset.mobilePane = pane;
+    document.querySelectorAll(".mobile-navigation [data-mobile-pane]").forEach((button) => {
+      button.setAttribute("aria-pressed", String(button.dataset.mobilePane === pane));
+    });
+  }
+  setMobilePane("list");
+  document.querySelectorAll(".mobile-navigation [data-mobile-pane]").forEach((button) => {
+    button.addEventListener("click", () => setMobilePane(button.dataset.mobilePane));
+  });
+  const mobileWorkspaceToggle = $("mobileWorkspaceToggle");
+  if (mobileWorkspaceToggle) mobileWorkspaceToggle.addEventListener("click", () => {
+    if (!hasSavedWorkspace()) { openWorkspaceDialog("new"); return; }
+    const open = document.body.classList.toggle("workspace-menu-open");
+    mobileWorkspaceToggle.setAttribute("aria-expanded", String(open));
+  });
+  const contextToggle = $("contextToggle");
+  if (contextToggle) contextToggle.addEventListener("click", () => {
+    const open = $("detail").classList.toggle("context-open");
+    contextToggle.setAttribute("aria-expanded", String(open));
+    contextToggle.textContent = open ? "Close context" : "Context";
+  });
   const newWorkspaceButton = $("newWorkspaceBtn");
   const settingsWorkspaceButton = $("settingsWorkspaceBtn");
   const workspaceCancelButton = $("workspaceCancelBtn");
@@ -4771,6 +4943,22 @@
   const userClose = $("userDrawerClose");
   if (userClose) userClose.addEventListener("click", closeUserDrawer);
   const relatedBlock = $("relatedBlock");
+  const overlapDisclosure = $("overlapBlock");
+  if (overlapDisclosure) overlapDisclosure.addEventListener("toggle", () => {
+    const group = groupById(state.selectedGroupId);
+    if (overlapDisclosure.open && group) renderOverlap(group);
+  });
+  const bodyDisclosure = $("prBodyBlock");
+  if (bodyDisclosure) bodyDisclosure.addEventListener("toggle", () => {
+    renderPrBodies(groupById(state.selectedGroupId) || {});
+  });
+  const fileQueueDisclosure = $("fileQueueBlock");
+  if (fileQueueDisclosure) fileQueueDisclosure.addEventListener("toggle", () => {
+    if (fileQueueDisclosure.open && state.selectedFile &&
+        (!state.fileQueue || state.fileQueue.path !== state.selectedFile)) {
+      openFileQueue(state.selectedFile, { scroll: false });
+    }
+  });
   if (relatedBlock) {
     relatedBlock.addEventListener("toggle", () => {
       if (!relatedBlock.open) {
@@ -4788,7 +4976,7 @@
     if (e.key === "Escape" && workspaceDialog && workspaceDialog.open) return;
     if (e.key === "Escape" && state.selectedUser) closeUserDrawer();
   });
-  const centerPane = document.querySelector(".pane.center");
+  const centerPane = document.querySelector(".review-scroll") || document.querySelector(".pane.center");
   if (centerPane) {
     centerPane.addEventListener("wheel", cancelDiffScrollForUserIntent, { passive: true });
     centerPane.addEventListener("touchstart", cancelDiffScrollForUserIntent, { passive: true });
