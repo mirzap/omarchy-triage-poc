@@ -1,16 +1,17 @@
 # Omarchy PR triage
 
-Omarchy PR triage is a local-first proof of concept for turning a large pull-request backlog into reviewable file-set groups. Grouping is advisory. A human decision is recorded against the exact repository, group membership, head/base revisions, and available diff content that was reviewed.
+Omarchy PR triage is a local-first proof of concept for turning a large pull-request backlog into reviewable file-set groups. Grouping is advisory. The dashboard supports patch comparison, revision-bound group and per-PR decisions, and agent-created proposals that require human acceptance. Local agents can connect through MCP; supported browsers can expose WebMCP tools.
 
 The application never writes to GitHub. It reads pull-request metadata and files, stores local JSON state, and serves a loopback-only dashboard. It does not merge, label, comment on, or approve a GitHub pull request.
 
 ## Safety model
 
 - PRs are grouped only by deterministic changed-file-set overlap. Titles, embeddings, SimHash, and coarse fingerprints do not create approval edges.
-- Every undecided or changed revision stays pending. A previous decision applies only while its reviewed revision and membership snapshot still match.
+- Every undecided or changed revision stays pending. Group decisions require the reviewed membership snapshot to match; per-PR decisions survive regrouping only while their repository, source, and exact revision identity remain valid. Duplicate decisions also require the referenced PR revision to remain valid.
 - Approval requires complete evidence for every group member. Missing, binary, malformed, truncated, renamed-without-source, or GitHub-capped evidence is shown as incomplete and fails closed.
 - Reject, hardware, and upgrade dispositions may be recorded against incomplete evidence, but the event retains that limitation.
 - Legacy rules remain visible as unverified history. They are not promoted into revision-verified approval.
+- Agent proposals are drafts, not approvals. MCP cannot directly accept a proposal, save a human decision, trigger a refresh, or write to GitHub. PR text and tool results are untrusted content, not instructions.
 - Concurrent cooperating processes use a lock, optimistic versions, and atomic JSON replacement. This is one local store, not a network database.
 
 The GitHub pull-files endpoint has a 3,000-file response ceiling, so reaching that ceiling is explicitly incomplete rather than silently complete ([GitHub REST documentation](https://docs.github.com/en/rest/pulls/pulls#list-pull-requests-files)).
@@ -19,7 +20,7 @@ The GitHub pull-files endpoint has a 3,000-file response ceiling, so reaching th
 
 - Python 3.11 or newer
 - macOS or Linux/POSIX; persistence uses Unix `flock` through Python's [`fcntl`](https://docs.python.org/3/library/fcntl.html)
-- No runtime Python dependencies outside the standard library
+- The base app uses only the Python standard library; optional MCP support installs the pinned official SDK and its dependencies
 
 ```bash
 python3.11 -m venv .venv
@@ -34,6 +35,7 @@ A wheel contains the dashboard, nested virtualizer bundle, and fixture data. The
 
 ```bash
 triage demo
+triage serve --store .triage/demo-store.json
 ```
 
 The demo uses `.triage/demo-store.json`, never `.triage/store.json`, performs no network calls, and leaves all newcomers at the human-review gate. If that demo store already exists, the command refuses to replace it.
@@ -82,7 +84,7 @@ The GitHub cache remains `.triage/cache` relative to the current working
 directory even when `--store` is custom. Run refresh, cached load, and the
 server from the same repository workspace so stored snapshot references resolve
 to the intended immutable cache. A JSON-store backup alone does not include
-GitHub patch snapshots; the operations runbook covers complete evidence backup.
+GitHub patch snapshots; see [Backup and restore](#backup-and-restore).
 
 ## Decisions and history
 
@@ -97,6 +99,22 @@ triage history --store /path/to/store.json
 
 CLI and HTTP decisions use the current store version and an idempotency key. Stale submissions conflict instead of overwriting newer work. Decision events retain actor, time, repository, reviewed revisions, membership snapshot, and evidence completeness.
 
+The CLI examples above decide entire groups. In the dashboard, select a PR to
+record an individual decision (called a **disposition** in the current UI):
+
+| Decision | Meaning |
+|---|---|
+| Pending | Undecided or waiting for more information |
+| Keep | Retain this candidate for further review; not approval to merge |
+| Duplicate | Link to another PR in the group as the preferred candidate |
+| Reject | Do not pursue this change |
+| Needs hardware | Requires validation on relevant hardware |
+| Can break upgrade | Requires upgrade-compatibility review |
+
+Enter a reason and save explicitly. **Canonical PR** means the preferred PR
+and is selectable only for a duplicate decision. Keep and duplicate decisions
+require complete evidence. Saving one PR does not decide its siblings.
+
 ## Dashboard
 
 ```bash
@@ -106,6 +124,66 @@ triage serve --host 127.0.0.1 --port 8741 --store /path/to/store.json
 The server accepts only literal loopback or `localhost` binding, validates Host/Origin/session tokens for mutations, and serves static files from the installed package. It is a local review tool, not a production or team server. Python documents `http.server` as unsuitable for production because it provides only basic security checks ([Python documentation](https://docs.python.org/3/library/http.server.html)). Do not expose this process through a LAN bind, reverse proxy, tunnel, or public hostname. Authentication, roles, TLS, and repository authorization are release gates for team use.
 
 The dashboard separates cache-only loading from explicit Refresh. It shows the complete all-open list, persistent pending queues, revision/evidence status, paged file comparisons, and advisory related-PR results. Approval is disabled when the selected group lacks complete evidence.
+
+**Queue** organizes work into actionable piles; **Groups** browses the file-set
+groups; **All PRs** lists individual contributions. Group lists sort by PR count,
+which helps comparison but is not a risk or urgency ranking. The UI remembers a
+valid review position and supports saving a chosen group decision and moving to
+the next pending group.
+
+## MCP and WebMCP
+
+Install the optional MCP extra in the same environment:
+
+```bash
+python -m pip install -e '.[mcp]'
+# Keep the dashboard backend running in a separate terminal.
+triage mcp --url http://127.0.0.1:8741
+```
+
+This command runs a stdio bridge, not an HTTP MCP endpoint. Configure your MCP
+client to launch it. The bridge talks only to the existing loopback backend;
+it does not open the store directly or start a dashboard or synchronization.
+
+Nine read tools expose the active workspace and cached evidence:
+`get_workspace`, `list_groups`, `search_prs`, `get_group`, `get_pr`,
+`read_patch`, `compare_prs`, `find_related`, and `get_history`.
+Results include repository/snapshot context, pagination, and evidence limits.
+
+The tenth tool, `propose_triage`, creates a revision-bound draft with proposed
+per-PR decisions, reasons, and optional canonical references. In the dashboard,
+**Recent proposals** lists recent proposals for the selected group. It stays
+empty until a proposal is created; simply opening a group does not run AI.
+A human can inspect, edit, accept, or reject a draft. Standalone MCP does not
+expose proposal acceptance or a dedicated proposal-list/inspection tool.
+
+### Pi and OMP
+
+Copy [`.mcp.example.json`](.mcp.example.json) to `.mcp.json` and replace the
+`command` and `cwd` paths with this checkout's absolute paths. The example uses
+`.venv/bin/python` and port **8741**. `.mcp.json` is ignored by Git so local paths
+and configuration stay private.
+
+- **OMP:** launch from this repo. In an existing session, run `/mcp reload`,
+  then `/mcp test omarchy-triage`.
+- **Pi:** install the pinned repo-local adapter with
+  `pi install npm:pi-mcp-adapter@2.33.0 --local`, restart Pi, and run `/mcp`.
+  Review and approve project-local configuration if prompted. The package is
+  recorded in `.pi/settings.json`; installed files stay in ignored `.pi/npm/`,
+  separate from the app's npm dependencies.
+
+### Browser tools
+
+On browsers with `document.modelContext` support, the app registers the nine
+read tools plus `get_view_context`, `set_filters`, `open_target`, and
+`show_proposal`. View actions reject stale context. WebMCP does not expose
+decision acceptance, Fetch, or reset. Unsupported browsers retain the normal
+dashboard without agent tools.
+
+Connecting an agent does not establish that a human examined the evidence.
+Before using a hosted model, consider that retrieved PR content may be sent to
+that model by its client; the local MCP bridge is not a privacy boundary for
+the agent's subsequent use of results.
 
 ## Optional external ranking
 
@@ -130,13 +208,23 @@ triage restore /safe/store-backup.json \
   --confirm-restore /path/to/store.json
 ```
 
-Backup validates the source JSON before writing. Restore validates the backup, requires exact target confirmation, retains the prior target as `store.json.pre-restore`, and advances the store version so stale browser tabs cannot submit decisions. See [Operations](docs/OPERATIONS.md) for the restore drill and failure handling.
+Backup validates the source JSON before writing. Restore validates the backup, requires exact target confirmation, retains the prior target as `store.json.pre-restore`, and advances the store version so stale browser tabs cannot submit decisions.
+
+The backup command copies **JSON only**. To preserve patch evidence, stop
+writers and also archive the repository's `.triage/cache/OWNER/REPO/` namespace,
+including immutable snapshots referenced by the store. Keep the same relative
+cache layout when restoring. First restore into a separate temporary workspace
+and verify groups, history, and representative patches. Missing evidence must
+remain unavailable, not be replaced with a newer snapshot. Snapshot retention
+is currently operator-managed; do not delete snapshots still needed by reviews.
 
 ## Development and validation
 
 ```bash
 pytest
 node --check triage/web/app.js
+node --check triage/web/webmcp.js
+node tests/ui_contracts.cjs triage/web/app.js
 npm ci
 npm run build
 git diff --exit-code -- triage/web/vendor/virtual.js
@@ -152,5 +240,8 @@ python -m build
 - `triage/web/` — installed dashboard assets, including `vendor/virtual.js`
 - `scripts/` — deterministic local performance/retrieval benchmarks
 - `tests/` — offline Python and JavaScript contract tests
-- `docs/OPERATIONS.md` — local backup, restore, refresh, and incident procedures
-- `docs/REVIEW_REMEDIATION.md` — R1–R14 implementation/evidence matrix
+- `.mcp.example.json` — MCP client configuration template
+- `.pi/settings.json` — pinned repo-local Pi adapter package
+
+Internal review notes and runbooks under `docs/` are local-only and ignored by
+Git. Public installation and operating instructions are kept in this README.
