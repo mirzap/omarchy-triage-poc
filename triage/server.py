@@ -166,6 +166,7 @@ _fetch_lock = threading.Lock()
 _fetch_progress: dict[str, Any] = {
     "running": False, "phase": "", "done": 0, "total": 0, "error": None,
     "ready": False, "message": "", "repo": "", "refresh": False,
+    "snapshot_available": False,
     # Internal only.  It is used to prevent a progress response for one
     # workspace from being presented as another workspace's job.
     "store_path": "",
@@ -185,6 +186,7 @@ def _progress_unlocked(*, include_internal: bool = False) -> dict[str, Any]:
         "message": _fetch_progress.get("message") or "",
         "repo": _fetch_progress.get("repo") or "",
         "refresh": bool(_fetch_progress.get("refresh")),
+        "snapshot_available": bool(_fetch_progress.get("snapshot_available")),
     }
     if include_internal:
         result["store_path"] = _fetch_progress.get("store_path") or ""
@@ -217,7 +219,7 @@ def get_fetch_progress(*, repo: str | None = None, store_path: Path | None = Non
             return {
                 "running": False, "phase": "", "done": 0, "total": 0,
                 "error": None, "ready": False, "message": "",
-                "repo": wanted_repo, "refresh": False,
+                "repo": wanted_repo, "refresh": False, "snapshot_available": False,
             }
         progress.pop("store_path", None)
         return progress
@@ -236,48 +238,123 @@ def _set_progress(**fields: Any) -> None:
         _fetch_progress.update(fields)
 
 
+def _has_usable_snapshot(store_path: Path) -> bool:
+    """Check for a persisted snapshot without treating an empty store as one."""
+    try:
+        if not store_path.is_file():
+            return False
+        data = load_store(store_path)
+    except Exception:  # noqa: BLE001 - a malformed store is not a usable snapshot
+        return False
+    repo = str(data.get("repo") or "").strip()
+    source = str(data.get("source") or "").strip()
+    version = data.get("snapshot_version")
+    return bool(repo and source and (
+        (isinstance(version, int) and version > 0)
+        or data.get("last_prs")
+        or data.get("last_groups")
+    ))
+
+
+def _sync_failure_message(snapshot_available: bool) -> str:
+    """Return an actionable error without provider, secret, or path details."""
+    if snapshot_available:
+        return "sync failed; previous snapshot preserved. Retry Sync."
+    return "sync failed; no snapshot available. Check connectivity and retry Sync."
+
+
+def _safe_progress_phase(raw: Any) -> str:
+    phase = str(raw or "").strip().lower()
+    if phase in {"reconcile", "reconciling"}:
+        return "reconciliation"
+    if phase in {"build_queue", "queue"}:
+        return "building_queue"
+    if phase in {"listing", "files", "reconciliation", "grouping",
+                 "building_queue", "saving", "loading", "rendering"}:
+        return phase
+    if phase in {"failed", "error"}:
+        return "error"
+    # The adapter may add a more detailed phase in a later revision. Keep the
+    # public progress contract bounded rather than echoing arbitrary strings.
+    return "syncing"
+
+
 def run_fetch(source: str, repo: str, limit: int,
               store_path: Path = DEFAULT_STORE_PATH,
               progress: dict[str, Any] | None = None, *, refresh: bool = False) -> dict[str, Any]:
     """Synchronously ingest and recompute; used by the worker and unit tests."""
     print(f"[serve] fetch source={source} repo={repo} limit={limit} refresh={refresh}", flush=True)
     if progress is not None:
-        progress.update(phase="ingest", done=0, total=0, message=f"ingesting ({source})")
+        progress.update(phase="listing", done=0, total=0, message=f"loading {source} pull list")
+        _set_progress(phase="listing", done=0, total=0,
+                      message=f"loading {source} pull list")
 
     def on_progress(snap: dict[str, Any]) -> None:
         if progress is None:
             return
+        phase = _safe_progress_phase(snap.get("phase", progress.get("phase", "")))
+        if phase == "syncing" and str(snap.get("phase") or "").lower() == "done":
+            phase = "reconciliation"
+        if phase == "error":
+            message = _sync_failure_message(bool(progress.get("_snapshot_available")))
+        else:
+            message = str(snap.get("message") or progress.get("message") or "syncing")
         progress.update(
-            phase=snap.get("phase", progress.get("phase", "")),
+            phase=phase,
             done=snap.get("done", progress.get("done", 0)),
             total=snap.get("total", progress.get("total", 0)),
-            message=snap.get("message", ""),
+            message=message,
         )
-        _set_progress(**{k: progress.get(k) for k in ("phase", "done", "total", "message")})
+        # The GitHub adapter may attach a provider exception to its private
+        # progress mapping. Scrub it before the worker or an embedding caller
+        # can observe the mapping.
+        progress["error"] = (
+            _sync_failure_message(bool(progress.get("_snapshot_available")))
+            if phase == "error" else None
+        )
+        _set_progress(**{k: progress.get(k) for k in ("phase", "done", "total", "message", "error")})
 
     prs = ingest(source=source, repo=repo, limit=limit, refresh=refresh,
                  progress=progress,
                  on_progress=on_progress if progress is not None else None)
     if progress is not None:
-        message = f"clustering {len(prs)} PRs"
-        progress.update(phase="pipeline", done=len(prs), total=len(prs), message=message)
-        _set_progress(phase="pipeline", done=len(prs), total=len(prs), message=message)
+        message = f"reconciled {len(prs)} pull revisions"
+        progress.update(phase="reconciliation", done=len(prs), total=len(prs), message=message)
+        _set_progress(phase="reconciliation", done=len(prs), total=len(prs), message=message)
     run_pipeline(prs, persist=True, store_path=store_path, apply_rules=True,
-                 source=source, repo=repo)
+                 source=source, repo=repo, progress=progress,
+                 on_progress=on_progress if progress is not None else None)
+    if progress is not None:
+        progress.update(phase="loading", done=0, total=0,
+                        message="loading saved triage state")
+        _set_progress(phase="loading", done=0, total=0,
+                      message="loading saved triage state")
+        if progress.get("_skip_state_payload"):
+            return {}
     return _state_payload(store_path)
 
 
 def _fetch_worker(source: str, repo: str, limit: int, refresh: bool, store_path: Path) -> None:
-    local = {"phase": "starting", "done": 0, "total": 0, "message": "starting"}
+    with _fetch_lock:
+        snapshot_available = bool(_fetch_progress.get("snapshot_available"))
+    local = {
+        "phase": "starting", "done": 0, "total": 0, "message": "starting",
+        "_snapshot_available": snapshot_available,
+        # The browser performs the authoritative state GET after the worker
+        # publishes ready. Preserve run_fetch's historical return for direct
+        # callers while avoiding an unneeded large state projection here.
+        "_skip_state_payload": True,
+    }
     try:
         run_fetch(source, repo, limit, store_path=store_path, progress=local, refresh=refresh)
-        _finish_fetch(running=False, phase="done", error=None, ready=True,
-                      message=local.get("message") or "ready", done=local.get("done", 0),
-                      total=local.get("total", 0))
+        _finish_fetch(running=False, phase="loading", error=None, ready=True,
+                      snapshot_available=True,
+                      message="snapshot saved; loading triage state",
+                      done=local.get("done", 0), total=local.get("total", 0))
     except Exception:  # noqa: BLE001
-        traceback.print_exc()
-        message = "refresh failed; the last usable snapshot was preserved"
-        _finish_fetch(running=False, phase="error", error=message, ready=False, message=message)
+        message = _sync_failure_message(snapshot_available)
+        _finish_fetch(running=False, phase="error", error=message, ready=False,
+                      snapshot_available=snapshot_available, message=message)
 
 
 class FetchBusyError(RuntimeError):
@@ -294,7 +371,8 @@ def start_fetch_async(source: str, repo: str, limit: int,
             raise FetchBusyError(_progress_unlocked())
         _fetch_progress.update(running=True, phase="starting", done=0, total=0,
                                error=None, ready=False, message="starting", repo=repo,
-                               refresh=refresh, store_path=str(Path(store_path)))
+                               refresh=refresh, store_path=str(Path(store_path)),
+                               snapshot_available=_has_usable_snapshot(Path(store_path)))
         _fetch_thread = threading.Thread(
             target=_fetch_worker, args=(source, repo, limit, refresh, store_path),
             daemon=True, name="triage-fetch",

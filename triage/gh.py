@@ -31,6 +31,10 @@ ACTIVE_SNAPSHOT_FILE = "active.json"
 SNAPSHOTS_DIR = "snapshots"
 MAX_PULL_FILES = 3000
 MAX_ATTEMPTS = 3
+# A files response is fetched through a mutable PR-number endpoint.  Keep the
+# retry budget deliberately small: repeated movement is represented as an
+# incomplete pending PR, never as an excuse to publish an older diff.
+MAX_RECONCILIATION_ROUNDS = 2
 
 ProgressCallback = Callable[[dict[str, Any]], None]
 
@@ -575,6 +579,54 @@ def _pull_revision(item: dict[str, Any] | None) -> tuple[str, str, str] | None:
     return updated_at, head_sha, base_sha
 
 
+def _evidence_revision(
+    item: dict[str, Any] | None,
+) -> tuple[str, str] | None:
+    """Return the SHA identity used to bind file evidence to a PR."""
+    revision = _pull_revision(item)
+    if revision is None:
+        return None
+    return revision[1], revision[2]
+
+
+def _same_evidence_revision(
+    left: tuple[str, str, str] | None,
+    right: tuple[str, str, str] | None,
+) -> bool:
+    """Compare file evidence by head/base, not mutable listing metadata."""
+    return (
+        left is not None
+        and right is not None
+        and left[1:] == right[1:]
+    )
+
+
+def _validate_pulls_listing(raw: Any, *, source: str = "GitHub") -> list[dict[str, Any]]:
+    """Validate a complete open-PR list before any number-based staging.
+
+    GitHub normally returns integer PR numbers.  Refusing coercion is
+    intentional: coercing malformed values (or accepting duplicate numbers)
+    can bind a mutable PR-number files response to the wrong metadata.
+    """
+    if not isinstance(raw, list):
+        raise GhError(f"Unexpected response for {source} pulls list")
+    validated: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise GhError(f"Invalid {source} pulls list item at index {index}")
+        number = item.get("number")
+        if type(number) is not int or number <= 0:
+            raise GhError(
+                f"Invalid PR number in {source} pulls list at index {index}"
+            )
+        if number in seen:
+            raise GhError(f"Duplicate PR number in {source} pulls list: #{number}")
+        seen.add(number)
+        validated.append(item)
+    return validated
+
+
 def _file_metadata_revision(metadata: Any, number: int) -> tuple[str, str, str] | None:
     if not isinstance(metadata, dict):
         return None
@@ -638,13 +690,12 @@ def _sync_lock(root: Path, timeout: float = 10.0):
 
 
 def _listing_signature(items: list[Any]) -> str:
+    items = _validate_pulls_listing(items)
     relevant: list[dict[str, Any]] = []
-    for item in items:
-        if not isinstance(item, dict) or "number" not in item:
-            raise GhError("Unexpected item in pulls list")
+    for item in sorted(items, key=lambda value: value["number"]):
         relevant.append(
             {
-                "number": int(item["number"]),
+                "number": item["number"],
                 "title": item.get("title") or "",
                 "body": item.get("body") or "",
                 "user": item.get("user"),
@@ -662,7 +713,9 @@ def _raw_files_for(root: Path, number: int, revision: tuple[str, str, str] | Non
     if revision is None:
         return None
     metadata = _load_json(root / FETCH_METADATA_FILE)
-    if _file_metadata_revision(metadata, number) != revision:
+    if not _same_evidence_revision(
+        _file_metadata_revision(metadata, number), revision
+    ):
         return None
     raw = _load_json(root / "files" / f"{number}.json")
     return raw if isinstance(raw, list) else None
@@ -731,12 +784,39 @@ def fetch_pulls_with_transport(
             )
             raise
 
+    def request_listing() -> list[dict[str, Any]]:
+        try:
+            return _validate_pulls_listing(
+                request(endpoint, paginate=True, timeout=PULLS_TIMEOUT)
+            )
+        except GhError as exc:
+            # A syntactically successful HTTP response can still be an unsafe
+            # listing.  Keep the failure path identical to transport errors so
+            # callers know the previous active snapshot remains authoritative.
+            _emit_progress(
+                progress,
+                on_progress,
+                phase="failed",
+                error=str(exc),
+                cache_status="preserved",
+                message="sync failed; previous snapshot preserved",
+            )
+            raise
+
     with _sync_lock(root):
         read_root = _cache_read_root(owner, repo, cache_dir)
         old_pulls = _load_json(read_root / "pulls.json")
-        if old_pulls is not None and not isinstance(old_pulls, list):
-            raise GhError("Cached pulls.json is not a list")
         listing_fetched = refresh_requested
+        if old_pulls is not None:
+            try:
+                old_pulls = _validate_pulls_listing(old_pulls, source="cached")
+            except GhError:
+                # A refresh can replace a pre-snapshot/legacy preview whose
+                # list has no canonical PR-number identity.  Cache-only reads
+                # remain fail-closed and reject the malformed list.
+                if not listing_fetched:
+                    raise
+                old_pulls = None
         raw_pulls = old_pulls
         if raw_pulls is None and not refresh_requested:
             raise GhError(
@@ -747,9 +827,7 @@ def fetch_pulls_with_transport(
         _emit_progress(progress, on_progress, phase="listing", done=0, total=0,
                        message="listing open pulls" if listing_fetched else "using cached open-pull list")
         if listing_fetched:
-            raw_pulls = request(endpoint, paginate=True, timeout=PULLS_TIMEOUT)
-            if not isinstance(raw_pulls, list):
-                raise GhError("Unexpected response for pulls list")
+            raw_pulls = request_listing()
             listed_at = _utc_timestamp()
             cache_status = "refreshed" if old_pulls is not None else "fresh"
         else:
@@ -813,96 +891,253 @@ def fetch_pulls_with_transport(
             f"{uuid.uuid4().hex[:12]}"
         )
         stage_root = root / SNAPSHOTS_DIR / snapshot_id
-        _atomic_save_json(stage_root / "pulls.json", raw_pulls)
-        files_metadata: dict[str, Any] = {}
         progress_lock = threading.Lock()
         counts = {"done": 0, "cached": 0, "fetched": 0, "refreshed": 0}
 
-        def stage_one(item: dict[str, Any]) -> tuple[PullRequest, Any]:
-            number = int(item["number"])
+        # The limit is a cap on file scopes for this refresh.  Keep the scope
+        # stable while reconciling so a reordered list cannot turn one refresh
+        # into an unbounded series of downloads.  Unlimited refreshes include
+        # newly observed PRs in each bounded round.
+        scope_numbers = (
+            None
+            if limit == 0
+            else {item["number"] for item in selected}
+        )
+        # number -> (listing revision metadata, raw files).  The revision is
+        # retained with the staged bytes so a later confirmation can never
+        # publish those bytes under a different head/base pair.
+        staged: dict[int, tuple[tuple[str, str, str], list[Any]]] = {}
+        staged_fetched_at: dict[int, str] = {}
+
+        def file_status(
+            item: dict[str, Any], raw_files: list[Any], *, outside_limit: bool = False,
+        ) -> dict[str, Any]:
             revision = _pull_revision(item)
-            raw_files = _raw_files_for(read_root, number, revision)
-            reused = raw_files is not None
-            if raw_files is None:
-                files_endpoint = f"repos/{owner}/{repo}/pulls/{number}/files?per_page=100"
-                raw_files = request(files_endpoint, paginate=True, timeout=FILE_TIMEOUT)
-                if not isinstance(raw_files, list):
-                    raise GhError(f"Unexpected response for PR #{number} files")
-            _atomic_save_json(stage_root / "files" / f"{number}.json", raw_files)
-            pr = _parse_pr_item(item, raw_files, repo_slug, snapshot_id)
-            files_metadata[str(number)] = {
-                "fetched_at": listed_at if reused else _utc_timestamp(),
+            status: dict[str, Any] = {
+                "fetched_at": staged_fetched_at.get(item["number"], listed_at),
                 "updated_at": revision[0] if revision else None,
                 "head_sha": revision[1] if revision else None,
                 "base_sha": revision[2] if revision else None,
-                "evidence_complete": pr.evidence_complete,
+                "evidence_complete": _parse_pr_item(
+                    item, raw_files, repo_slug, snapshot_id
+                ).evidence_complete,
                 "file_count": len(raw_files),
                 "files_cap_reached": len(raw_files) >= MAX_PULL_FILES,
                 "missing_patch_count": sum(
                     1 for raw in raw_files
                     if isinstance(raw, dict)
-                    and (not isinstance(raw.get("patch"), str) or not raw.get("patch", "").strip())
+                    and (
+                        not isinstance(raw.get("patch"), str)
+                        or not raw.get("patch", "").strip()
+                    )
                 ),
             }
+            if outside_limit:
+                status["reused_outside_limit"] = True
+            return status
+
+        def stage_one(
+            item: dict[str, Any],
+            *,
+            reconciliation_round: int,
+            total_scopes: int,
+        ) -> tuple[int, tuple[str, str, str] | None, list[Any] | None, bool]:
+            number = item["number"]
+            revision = _pull_revision(item)
+            existing = staged.get(number)
+            # Unknown revisions are deliberately evidence-less.  In
+            # particular, never retain old bytes merely because the number is
+            # still present in the open list.
+            if revision is None:
+                staged.pop(number, None)
+                staged_fetched_at.pop(number, None)
+                raw_files = None
+                reused = False
+            elif existing is not None and _same_evidence_revision(existing[0], revision):
+                raw_files = existing[1]
+                reused = True
+                staged_fetched_at.setdefault(number, listed_at)
+            else:
+                staged.pop(number, None)
+                staged_fetched_at.pop(number, None)
+                raw_files = _raw_files_for(read_root, number, revision)
+                reused = raw_files is not None
+                if raw_files is None:
+                    files_endpoint = (
+                        f"repos/{owner}/{repo}/pulls/{number}/files?per_page=100"
+                    )
+                    raw_files = request(
+                        files_endpoint, paginate=True, timeout=FILE_TIMEOUT
+                    )
+                    if not isinstance(raw_files, list):
+                        raise GhError(f"Unexpected response for PR #{number} files")
+                staged[number] = (revision, raw_files)
+                staged_fetched_at[number] = listed_at if reused else _utc_timestamp()
             with progress_lock:
                 counts["done"] += 1
-                counts["cached" if reused else "fetched"] += 1
-                if not reused and old_pulls is not None:
-                    counts["refreshed"] += 1
+                if raw_files is not None:
+                    counts["cached" if reused else "fetched"] += 1
+                    if not reused and old_pulls is not None:
+                        counts["refreshed"] += 1
+                    _atomic_save_json(stage_root / "files" / f"{number}.json", raw_files)
                 _emit_progress(
-                    progress, on_progress, phase="files", done=counts["done"], total=total,
-                    message=f"files {counts['done']}/{total}", cached_files=counts["cached"],
-                    fetched_files=counts["fetched"], refreshed_files=counts["refreshed"],
+                    progress,
+                    on_progress,
+                    phase="files",
+                    done=counts["done"],
+                    total=total_scopes,
+                    reconciliation_round=reconciliation_round,
+                    message=f"files {counts['done']}/{total_scopes}",
+                    cached_files=counts["cached"],
+                    fetched_files=counts["fetched"],
+                    refreshed_files=counts["refreshed"],
                 )
-            return pr, raw_files
+            return number, revision, raw_files, reused
 
-        by_number: dict[int, PullRequest] = {}
-        if selected:
-            with ThreadPoolExecutor(max_workers=MAX_FILE_WORKERS) as pool:
-                futures = [pool.submit(stage_one, item) for item in selected if isinstance(item, dict)]
-                for future in as_completed(futures):
-                    pr, _ = future.result()
-                    by_number[pr.number] = pr
-        selected_numbers = set(by_number)
-        for item in raw_pulls:
-            if not isinstance(item, dict) or int(item["number"]) in selected_numbers:
-                continue
-            number = int(item["number"])
-            revision = _pull_revision(item)
-            raw_files = _raw_files_for(read_root, number, revision)
-            if raw_files is not None:
-                _atomic_save_json(stage_root / "files" / f"{number}.json", raw_files)
-                pr = _parse_pr_item(item, raw_files, repo_slug, snapshot_id)
-                files_metadata[str(number)] = {
-                    "fetched_at": listed_at,
-                    "updated_at": revision[0] if revision else None,
-                    "head_sha": revision[1] if revision else None,
-                    "base_sha": revision[2] if revision else None,
-                    "evidence_complete": pr.evidence_complete,
-                    "file_count": len(raw_files),
-                    "files_cap_reached": len(raw_files) >= MAX_PULL_FILES,
-                    "missing_patch_count": sum(
-                        1 for raw in raw_files
-                        if isinstance(raw, dict)
-                        and (not isinstance(raw.get("patch"), str) or not raw.get("patch", "").strip())
-                    ),
-                    "reused_outside_limit": True,
-                }
+        def stage_listing(
+            listing: list[dict[str, Any]],
+            *,
+            reconciliation_round: int,
+        ) -> None:
+            # Progress is scoped to this stage/reconciliation round.  The
+            # cumulative fetched/cached counters remain useful in the final
+            # publication status, but done/total must not grow past total.
+            counts["done"] = 0
+            if scope_numbers is None:
+                scoped = list(listing)
+                scope_total = len(scoped)
             else:
-                pr = _parse_pr_item(item, None, repo_slug, snapshot_id)
-            by_number[number] = pr
-        results = [by_number[int(item["number"])] for item in raw_pulls if isinstance(item, dict)]
+                scoped = [item for item in listing if item["number"] in scope_numbers]
+                scope_total = len(scope_numbers)
+            if scoped:
+                with ThreadPoolExecutor(max_workers=MAX_FILE_WORKERS) as pool:
+                    futures = [
+                        pool.submit(
+                            stage_one,
+                            item,
+                            reconciliation_round=reconciliation_round,
+                            total_scopes=scope_total,
+                        )
+                        for item in scoped
+                    ]
+                    for future in as_completed(futures):
+                        future.result()
+            # Reuse complete evidence outside the file cap when it is bound to
+            # the exact current SHA pair.  Changed/new outside-cap PRs remain
+            # stubs; they are never downloaded as a side effect of reordering.
+            scoped_set = {item["number"] for item in scoped}
+            for item in listing:
+                number = item["number"]
+                if number in scoped_set:
+                    continue
+                revision = _pull_revision(item)
+                existing = staged.get(number)
+                if revision is None:
+                    staged.pop(number, None)
+                    staged_fetched_at.pop(number, None)
+                    continue
+                if existing is not None and _same_evidence_revision(existing[0], revision):
+                    staged_fetched_at.setdefault(number, listed_at)
+                    continue
+                staged.pop(number, None)
+                staged_fetched_at.pop(number, None)
+                raw_files = _raw_files_for(read_root, number, revision)
+                if raw_files is not None:
+                    staged[number] = (revision, raw_files)
+                    staged_fetched_at[number] = listed_at
+                    _atomic_save_json(stage_root / "files" / f"{number}.json", raw_files)
 
-        # Files and revisions are not an atomic upstream read. A second complete
-        # listing proves no selected revision (or open-list membership) changed.
-        confirmed = request(endpoint, paginate=True, timeout=PULLS_TIMEOUT)
-        if not isinstance(confirmed, list) or _listing_signature(confirmed) != _listing_signature(raw_pulls):
-            _emit_progress(
-                progress, on_progress, phase="failed", cache_status="preserved",
-                error="GitHub changed during sync",
-                message="sync changed upstream; previous snapshot preserved",
+        current_listing = raw_pulls
+        final_listing: list[dict[str, Any]] | None = None
+        for reconciliation_round in range(MAX_RECONCILIATION_ROUNDS + 1):
+            if reconciliation_round:
+                _emit_progress(
+                    progress,
+                    on_progress,
+                    phase="reconciling",
+                    done=0,
+                    total=(len(current_listing) if limit == 0 else min(limit, len(current_listing))),
+                    reconciliation_round=reconciliation_round,
+                    message=(
+                        f"reconciling changed PR revisions (round "
+                        f"{reconciliation_round}/{MAX_RECONCILIATION_ROUNDS})"
+                    ),
+                )
+            stage_listing(current_listing, reconciliation_round=reconciliation_round)
+            confirmed = request_listing()
+            current_by_number = {item["number"]: item for item in current_listing}
+            confirmed_by_number = {item["number"]: item for item in confirmed}
+            revision_changed = any(
+                number in confirmed_by_number
+                and (
+                    number not in current_by_number
+                    or _evidence_revision(current_by_number[number])
+                    != _evidence_revision(confirmed_by_number[number])
+                )
+                and (scope_numbers is None or number in scope_numbers)
+                for number in set(current_by_number) | set(confirmed_by_number)
             )
-            raise GhError("GitHub changed during sync; staged snapshot was not published. Retry refresh.")
+            if not revision_changed or reconciliation_round >= MAX_RECONCILIATION_ROUNDS:
+                final_listing = confirmed
+                break
+            current_listing = confirmed
+        assert final_listing is not None
+
+        # Materialize results against the final complete list.  A staged file
+        # is usable only when its recorded SHA pair still matches that final
+        # listing.  This is the fail-closed boundary for repeatedly moving PRs.
+        _atomic_save_json(stage_root / "pulls.json", final_listing)
+        files_metadata: dict[str, Any] = {}
+        results: list[PullRequest] = []
+        for item in final_listing:
+            number = item["number"]
+            revision = _pull_revision(item)
+            evidence = staged.get(number)
+            raw_files = (
+                evidence[1]
+                if revision is not None
+                and evidence is not None
+                and _same_evidence_revision(evidence[0], revision)
+                else None
+            )
+            if raw_files is not None:
+                pr = _parse_pr_item(item, raw_files, repo_slug, snapshot_id)
+                files_metadata[str(number)] = file_status(
+                    item,
+                    raw_files,
+                    outside_limit=(
+                        scope_numbers is not None and number not in scope_numbers
+                    ),
+                )
+            else:
+                # No files manifest is emitted for an unknown or repeatedly
+                # moving revision, so cached_pr_evidence cannot surface stale
+                # patches for this final PR number.
+                staged.pop(number, None)
+                staged_fetched_at.pop(number, None)
+                try:
+                    (stage_root / "files" / f"{number}.json").unlink()
+                except FileNotFoundError:
+                    pass
+                pr = _parse_pr_item(item, None, repo_slug, snapshot_id)
+            results.append(pr)
+
+        # A PR can disappear or lose its revision while the bounded
+        # reconciliation is running.  Do not leave unreferenced staged files
+        # in the immutable snapshot where a future reader could mistake them
+        # for evidence.
+        staged_files_root = stage_root / "files"
+        if staged_files_root.is_dir():
+            for path in staged_files_root.glob("*.json"):
+                if path.stem not in files_metadata:
+                    try:
+                        path.unlink()
+                    except FileNotFoundError:
+                        pass
+
+        raw_pulls = final_listing
+        total = min(limit, len(raw_pulls)) if limit else len(raw_pulls)
+        limited = bool(limit and len(raw_pulls) > limit)
 
         generation = 1
         active = _load_json(root / ACTIVE_SNAPSHOT_FILE)

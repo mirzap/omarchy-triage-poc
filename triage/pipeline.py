@@ -97,6 +97,18 @@ def require_human_review(prs: list[PullRequest]) -> list[PullRequest]:
     return prs
 
 
+def _emit_progress(
+    progress: dict[str, Any] | None,
+    on_progress: Any | None,
+    **fields: Any,
+) -> None:
+    """Publish a bounded pipeline phase without changing the result API."""
+    if progress is not None:
+        progress.update(fields)
+    if on_progress is not None:
+        on_progress(dict(progress) if progress is not None else dict(fields))
+
+
 def _slim_prs(
     prs: list[PullRequest],
     groups: list[Group],
@@ -148,6 +160,8 @@ def run_pipeline(
     repo: str = "",
     incremental: bool | None = None,
     _retry_count: int = 0,
+    progress: dict[str, Any] | None = None,
+    on_progress: Any | None = None,
 ) -> dict[str, Any]:
     """
     File-set pipeline. Skips TF-IDF (that hung 2.2k PRs on 8GB).
@@ -180,6 +194,14 @@ def run_pipeline(
         prior = (data.get("pr_numbers_by_repo") or {}).get(active_repo, [])
         prev_nums = {int(n) for n in prior if n}
 
+    _emit_progress(
+        progress,
+        on_progress,
+        phase="grouping",
+        done=0,
+        total=len(prs),
+        message=f"grouping {len(prs)} PRs",
+    )
     if incremental or (persist and reserved_ids):
         groups = assign_incremental(
             prs,
@@ -200,6 +222,15 @@ def run_pipeline(
     for group in groups:
         group.bind_revisions(prs)
 
+    _emit_progress(
+        progress,
+        on_progress,
+        phase="grouping",
+        done=len(groups),
+        total=len(groups),
+        message=f"grouped {len(prs)} PRs into {len(groups)} groups",
+    )
+
     rules = []
     if apply_rules:
         rules = load_rules(path, repo=active_repo)
@@ -210,9 +241,33 @@ def run_pipeline(
     slim = _slim_prs(prs, groups, active_repo, source=source)
     overlap: dict[str, Any] = {}
     new_nums = [p.number for p in prs if p.number not in prev_nums]
+    _emit_progress(
+        progress,
+        on_progress,
+        phase="building_queue",
+        done=0,
+        total=0,
+        message="building review queue",
+    )
     queue = build_queue(groups, prs, rules, new_pr_numbers=new_nums, repo=active_repo)
+    _emit_progress(
+        progress,
+        on_progress,
+        phase="building_queue",
+        done=1,
+        total=1,
+        message="review queue ready",
+    )
 
     if persist:
+        _emit_progress(
+            progress,
+            on_progress,
+            phase="saving",
+            done=0,
+            total=0,
+            message="saving triage snapshot",
+        )
         try:
             save_run_state(
                 groups,
@@ -246,8 +301,18 @@ def run_pipeline(
                     repo=repo,
                     incremental=incremental,
                     _retry_count=_retry_count + 1,
+                    progress=progress,
+                    on_progress=on_progress,
                 )
             raise
+        _emit_progress(
+            progress,
+            on_progress,
+            phase="saving",
+            done=1,
+            total=1,
+            message="triage snapshot saved",
+        )
 
     return {
         "prs": prs,

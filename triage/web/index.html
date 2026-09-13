@@ -3,37 +3,70 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Omarchy triage</title>
-  <link rel="stylesheet" href="/styles.css?v=29" />
+  <title>Triage Workspace</title>
+  <link rel="stylesheet" href="/styles.css?v=31" />
 </head>
 <body>
   <header class="topbar">
-    <div class="brand">Omarchy triage</div>
-    <label class="field">
-      <span>source</span>
-      <select id="source">
-        <option value="gh" selected>gh</option>
-        <option value="fixtures">local fixtures</option>
-      </select>
-    </label>
-    <label class="field grow">
-      <span>workspace repo (draft)</span>
-      <input id="repo" type="text" value="omacom/omarchy" spellcheck="false" aria-describedby="activeWorkspace" />
-    </label>
-    <label class="field workspace-choice">
-      <span>saved workspaces</span>
-      <select id="workspaceChoices" aria-label="Saved workspaces"><option value="">discovering…</option></select>
-    </label>
-    <button id="openWorkspaceBtn" type="button" class="btn">Open workspace</button>
-    <label class="field narrow">
-      <span>file cap</span>
-      <input id="limit" type="number" value="0" min="0" max="5000" placeholder="0 = 5000" title="Limits file-evidence downloads; the open-PR list is not truncated" />
-    </label>
-    <label class="refresh-toggle" title="Revalidate the open-PR list and changed revisions">
-      <input id="refresh" type="checkbox" checked /> refresh
-    </label>
-    <button id="fetchBtn" type="button" class="btn primary">Sync</button>
-    <div class="status-wrap"><div id="activeWorkspace" class="workspace-active">active workspace: loading…</div><div id="status" class="status">idle</div><div id="syncMeta" class="sync-meta"></div><div id="agentToolsStatus" class="agent-tools-status">Browser seam ready · WebMCP adapter not loaded</div></div>
+    <div class="topbar-main">
+      <div class="brand">Triage Workspace</div>
+      <div class="topbar-status" aria-live="polite">
+        <div id="activeWorkspace" class="workspace-active">No workspace selected</div>
+        <div id="status" class="status" role="status">Create a workspace to begin.</div>
+      </div>
+      <div class="topbar-controls" aria-label="Workspace actions">
+        <div id="savedWorkspaceControls" class="saved-workspace-controls workspace-action" hidden>
+          <label class="field workspace-choice">
+            <span>workspace</span>
+            <select id="workspaceChoices" aria-label="Saved workspaces"><option value="">choose saved workspace…</option></select>
+          </label>
+          <button id="openWorkspaceBtn" type="button" class="btn">Open</button>
+          <label class="refresh-toggle" title="Revalidate the open-PR list and changed revisions">
+            <input id="refresh" type="checkbox" checked /> refresh
+          </label>
+          <button id="fetchBtn" type="button" class="btn primary">Sync</button>
+          <button id="settingsWorkspaceBtn" type="button" class="btn subtle">Settings</button>
+        </div>
+        <button id="newWorkspaceBtn" type="button" class="btn primary workspace-action">New workspace</button>
+      </div>
+    </div>
+    <details id="workspaceMetaDetails" class="workspace-meta-details">
+      <summary>Workspace details</summary>
+      <div class="status-secondary">
+        <div id="syncMeta" class="sync-meta" aria-live="polite"></div>
+        <div id="agentToolsStatus" class="agent-tools-status">Browser seam ready · WebMCP adapter not loaded</div>
+      </div>
+    </details>
+    <div id="workspaceSetupHint" class="workspace-setup-hint">Create a browser-local workspace profile to choose a source and file cap. The first Sync starts after Create &amp; sync.</div>
+    <dialog id="workspaceDialog" aria-labelledby="workspaceDialogTitle" aria-describedby="workspaceDialogIntro">
+      <form id="workspaceForm" method="dialog" novalidate>
+        <h2 id="workspaceDialogTitle">New workspace</h2>
+        <p id="workspaceDialogIntro" class="dialog-intro">Choose where this workspace reads from. Create &amp; sync saves the profile in this browser, then starts the first explicit Sync.</p>
+        <label class="dialog-field" for="source">
+          <span>source</span>
+          <select id="source">
+            <option value="gh" selected>GitHub</option>
+            <option value="fixtures">Local fixtures</option>
+          </select>
+        </label>
+        <label class="dialog-field" for="repo">
+          <span>owner/repo</span>
+          <input id="repo" type="text" maxlength="140" autocomplete="off" spellcheck="false" placeholder="owner/repository" aria-describedby="workspaceRepoHint" readonly />
+        </label>
+        <div id="workspaceRepoHint" class="field-hint">Use a GitHub owner/repository name.</div>
+        <label class="dialog-field" for="limit">
+          <span>file evidence cap</span>
+          <input id="limit" type="number" value="0" min="0" max="5000" step="1" inputmode="numeric" placeholder="0 = 5000" title="Limits file-evidence downloads; the open-PR list is not truncated" />
+        </label>
+        <div class="field-hint">0 uses the server maximum (5000); the open-PR list is never truncated.</div>
+        <div id="workspaceDialogError" class="dialog-error" role="alert" aria-live="assertive"></div>
+        <div id="workspaceProfileHint" class="dialog-profile-hint" role="status" aria-live="polite"></div>
+        <div class="dialog-actions">
+          <button id="workspaceCancelBtn" type="button" class="btn">Cancel</button>
+          <button id="workspaceSaveBtn" type="submit" class="btn primary">Create &amp; sync</button>
+        </div>
+      </form>
+    </dialog>
   </header>
 
   <main class="layout">
@@ -184,7 +217,7 @@
   </main>
 
   <script src="/vendor/virtual.js"></script>
-  <script src="/app.js?v=34"></script>
+  <script src="/app.js?v=36"></script>
   <script src="/webmcp.js?v=1"></script>
 </body>
 </html>

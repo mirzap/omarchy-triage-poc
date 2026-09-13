@@ -36,21 +36,48 @@ a:hover { text-decoration: underline; }
 
 .topbar {
   display: flex;
-  align-items: end;
-  gap: 10px;
-  padding: 10px 14px;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+  padding: 9px 14px 8px;
   border-bottom: 1px solid var(--border);
   background: var(--bg-elev);
   position: relative;
   flex-shrink: 0;
   z-index: 10;
+  min-width: 0;
+  max-width: 100%;
+}
+.topbar-main {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-width: 0;
+  max-width: 100%;
+}
+.topbar-controls {
+  display: flex;
+  align-items: center;
+  flex: 0 1 auto;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 7px;
+  min-width: 0;
+  max-width: 100%;
 }
 .brand {
-  font-weight: 650;
+  flex: 0 0 auto;
+  font-weight: 700;
   letter-spacing: 0.02em;
-  margin-right: 8px;
-  padding-bottom: 6px;
+  font-size: 14px;
   white-space: nowrap;
+}
+.topbar-status {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+  flex: 1 1 220px;
 }
 .field {
   display: flex;
@@ -64,15 +91,34 @@ a:hover { text-decoration: underline; }
   text-transform: uppercase;
   letter-spacing: 0.06em;
 }
-.field.grow { flex: 1; }
-.field.narrow { width: 72px; }
-.field.workspace-choice { width: 178px; }
+.field.grow { flex: 1 1 260px; min-width: 220px; }
+.field.source-field { flex: 0 1 165px; min-width: 104px; }
+.field.narrow { flex: 0 1 72px; width: 72px; min-width: 64px; }
+.field.workspace-choice { flex: 0 1 178px; width: 178px; min-width: 158px; }
 .field input, .field select {
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: 4px;
   padding: 6px 8px;
+  min-width: 0;
+  max-width: 100%;
 }
+.field input { width: 100%; }
+.field select { width: 100%; }
+.topbar-controls > .btn,
+.topbar-controls > .refresh-toggle { flex: 0 0 auto; }
+.saved-workspace-controls {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 7px;
+  min-width: 0;
+}
+.saved-workspace-controls[hidden] { display: none; }
+.saved-workspace-controls .field span { display: none; }
+.saved-workspace-controls .field.workspace-choice { width: 178px; }
+.btn.subtle { color: var(--muted); padding-inline: 9px; }
 .btn {
   border: 1px solid var(--border);
   background: var(--bg);
@@ -94,21 +140,114 @@ a:hover { text-decoration: underline; }
   align-items: center;
   gap: 5px;
   color: var(--muted);
-  padding-bottom: 7px;
+  padding: 6px 2px;
   white-space: nowrap;
 }
-.status-wrap { margin-left: auto; min-width: 0; text-align: right; }
-.workspace-active { color: var(--text); font-size: 10px; max-width: 420px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.workspace-active { color: var(--text); font-size: 11px; overflow-wrap: anywhere; min-width: 0; }
 .status {
   color: var(--muted);
-  max-width: 420px;
-  text-align: right;
+  overflow-wrap: anywhere;
+  min-width: 0;
   white-space: nowrap;
-  overflow: hidden;
   text-overflow: ellipsis;
+  overflow: hidden;
 }
-.sync-meta { color: var(--muted); font-size: 10px; margin-top: 3px; }
-.agent-tools-status { color: var(--muted); font-size: 10px; margin-top: 2px; }
+.workspace-meta-details {
+  align-self: flex-end;
+  max-width: min(100%, 980px);
+  color: var(--muted);
+  font-size: 10px;
+}
+.workspace-meta-details summary {
+  cursor: pointer;
+  text-align: right;
+  color: var(--muted);
+}
+.workspace-meta-details summary:hover { color: var(--text); }
+.workspace-meta-details .status-secondary {
+  display: flex;
+  justify-content: flex-end;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 2px 12px;
+  min-width: 0;
+  max-width: 100%;
+  padding-top: 4px;
+  text-align: right;
+}
+.sync-meta, .agent-tools-status { color: var(--muted); overflow-wrap: anywhere; }
+.workspace-setup-hint {
+  display: none;
+  color: var(--muted);
+  font-size: 11px;
+  margin: 1px 0 0;
+}
+.workspace-setup-hint.is-visible { display: block; }
+
+dialog#workspaceDialog {
+  width: min(460px, calc(100vw - 28px));
+  max-width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0;
+  background: var(--bg-elev);
+  color: var(--text);
+  box-shadow: 0 18px 60px rgb(0 0 0 / 45%);
+}
+dialog#workspaceDialog::backdrop { background: rgb(0 0 0 / 62%); }
+#workspaceForm { padding: 20px; }
+#workspaceForm h2 { margin: 0 0 6px; font-size: 17px; }
+.dialog-intro { margin: 0 0 17px; color: var(--muted); line-height: 1.45; }
+.dialog-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-top: 12px;
+  color: var(--muted);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+}
+.dialog-field input, .dialog-field select {
+  width: 100%;
+  min-height: 35px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 7px 9px;
+  color: var(--text);
+  text-transform: none;
+  letter-spacing: normal;
+}
+.dialog-field input[readonly] { color: var(--muted); background: #111113; }
+.field-hint, .dialog-profile-hint { margin-top: 4px; color: var(--muted); font-size: 11px; line-height: 1.4; }
+.dialog-error { min-height: 18px; margin-top: 13px; color: var(--danger); font-size: 12px; }
+.dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+.dialog-actions .btn { min-width: 82px; }
+
+@media (max-width: 900px) {
+  .topbar-main { align-items: flex-start; flex-wrap: wrap; }
+  .brand { flex: 0 0 auto; }
+  .topbar-status { flex: 1 1 200px; }
+  .topbar-controls { flex: 1 1 100%; justify-content: flex-start; }
+  .saved-workspace-controls { justify-content: flex-start; }
+  .workspace-meta-details { align-self: flex-start; }
+  .workspace-meta-details summary { text-align: left; }
+  .workspace-meta-details .status-secondary { justify-content: flex-start; text-align: left; }
+}
+
+@media (max-width: 540px) {
+  .topbar { padding: 8px 10px; }
+  .topbar-main { gap: 7px 10px; }
+  .topbar-status { flex: 1 1 100%; order: 3; }
+  .topbar-controls { width: 100%; }
+  .saved-workspace-controls { width: 100%; }
+  .saved-workspace-controls .field.workspace-choice { flex: 1 1 150px; width: auto; min-width: 0; }
+  .saved-workspace-controls > .btn { flex: 0 1 auto; }
+  .workspace-meta-details { align-self: stretch; }
+  .workspace-meta-details summary { text-align: left; }
+  .status { white-space: normal; }
+}
 
 .layout {
   display: grid;

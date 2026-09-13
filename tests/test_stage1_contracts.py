@@ -111,6 +111,7 @@ def _pull_item(number: int, revision: str) -> dict[str, Any]:
         "created_at": "2026-09-01T00:00:00Z",
         "updated_at": f"2026-09-0{revision}T00:00:00Z",
         "head": {"sha": f"sha-{number}-{revision}"},
+        "base": {"sha": "base-main"},
         "html_url": f"https://github.com/acme/widgets/pull/{number}",
     }
 

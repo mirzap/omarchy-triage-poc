@@ -1,6 +1,6 @@
-# Omarchy PR triage
+# Triage Workspace
 
-Omarchy PR triage is a local-first proof of concept for turning a large pull-request backlog into reviewable file-set groups. Grouping is advisory. The dashboard supports patch comparison, revision-bound group and per-PR decisions, and agent-created proposals that require human acceptance. Local agents can connect through MCP; supported browsers can expose WebMCP tools.
+Triage Workspace is a local-first proof of concept for turning a large pull-request backlog into reviewable file-set groups. Grouping is advisory. The dashboard supports patch comparison, revision-bound group and per-PR decisions, and agent-created proposals that require human acceptance. Local agents can connect through MCP; supported browsers can expose WebMCP tools.
 
 The application never writes to GitHub. It reads pull-request metadata and files, stores local JSON state, and serves a loopback-only dashboard. It does not merge, label, comment on, or approve a GitHub pull request.
 
@@ -13,17 +13,24 @@ and run this from the repository directory:
 triage serve --host 127.0.0.1 --port 8741
 ```
 
-Open <http://127.0.0.1:8741>, select **gh**, enter the repository (for example,
-`omacom/omarchy`), leave **refresh** checked, and click **Sync**. Authenticate
-GitHub CLI first with `gh auth login` if needed. No separate `triage run`
-command is required.
+Open <http://127.0.0.1:8741> and click **New workspace**. Choose the source,
+enter an `owner/repo` (for example, `omacom/omarchy`), choose the file-evidence
+cap, and click **Create & sync**. The first creation saves the profile in this
+browser and starts an explicit, refreshing Sync; authenticate GitHub first
+with `gh auth login` if needed. No separate `triage run` command is required.
 
 The server uses a separate workspace for each repository by default. Starting
-it does not fetch anything; **Sync** with **refresh** checked explicitly
-downloads GitHub data. Uncheck **refresh** to load existing cached evidence
-without network access. The first explicit **Sync** creates the selected
-workspace; merely entering or opening an unknown repository does not create
-files.
+it does not fetch anything. Existing workspaces appear in the selector: click
+**Open**, use **Settings** → **Save** to update that repository's source or cap,
+then click **Sync** when ready. **Refresh** is checked by default; uncheck it to
+load existing cached evidence without network access. Merely opening an
+unknown repository never creates a server store.
+
+Source and file-cap profiles are saved locally in browser storage for this
+origin. The durable server store is separate: it lives under
+`.triage/workspaces/<owner>/<repo>/store.json`, while immutable GitHub patch
+cache remains under `.triage/cache/<owner>/<repo>/`. In the UI, file cap `0`
+means the server maximum of 5,000; direct CLI `--limit 0` remains unlimited.
 
 ## Safety model
 
@@ -94,6 +101,15 @@ triage run --source github --repo omacom/omarchy --refresh
 
 `--limit N` limits file-evidence downloads, not the open-PR listing. Every PR from the complete fresh open list remains present. Outside the limit, same-revision verified evidence is reused; otherwise the PR remains as an incomplete pending stub. Refresh stages an immutable cache snapshot, revalidates the listing, and publishes it atomically. A failed refresh preserves the prior usable store view.
 
+When a PR changes during reconciliation, it remains a pending incomplete stub
+until its complete head/base revision is bound; the bounded refresh makes up to
+two additional reconciliation rounds for changing revisions. Repeatedly moving
+or unknown revisions remain incomplete pending stubs, and old patch evidence is
+never attached.
+The dashboard keeps loading through listing, file download, reconciliation,
+grouping, saving, state loading, and rendering, with progress describing the
+current phase.
+
 For direct CLI runs, use a separate fixed store for each repository. Commands
 refuse to replace a nonempty workspace with another repository:
 
@@ -161,11 +177,14 @@ contains a valid repository identity. It remains at that path and is used for
 that repository; the server never moves or copies it into the namespaced root.
 If no valid legacy store exists, the stable default is `omacom/omarchy`.
 
-The dashboard keeps repository entry separate from the displayed state. **Open**
-selects a saved or entered workspace (including an empty, not-yet-created one);
-**Sync** explicitly fetches and publishes data for that selected repository.
-Switching repositories does not carry over decisions, proposals, progress, or
-cached evidence from the previous workspace.
+The dashboard keeps browser-local profile drafts separate from the displayed
+state. **New workspace** asks for source, owner/repo, and file cap, then
+**Create & sync** saves that profile and starts the first refreshing Sync.
+Existing workspaces use the selector and **Open**; **Settings** → **Save** only
+updates that repository's browser-local profile, while **Sync** remains a
+separate explicit action. Switching repositories does not carry over
+decisions, proposals, progress, or cached evidence from the previous
+workspace. An unsaved switch is confirmed before the active workspace changes.
 
 To keep the server on one fixed store for compatibility or embedding, pass an
 explicit `--store PATH`:

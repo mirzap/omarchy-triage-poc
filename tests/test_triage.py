@@ -176,6 +176,9 @@ def test_ingest_gh_mocked(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> No
             "body": "body",
             "user": {"login": "mirzap"},
             "created_at": "2026-09-01T00:00:00Z",
+            "updated_at": "2026-09-02T00:00:00Z",
+            "head": {"sha": "head-42"},
+            "base": {"sha": "base-main"},
             "html_url": "https://github.com/omacom/omarchy/pull/42",
         }
     ]
@@ -334,6 +337,9 @@ def test_fetch_pulls_gh_limit_zero_and_cached_listing(monkeypatch: pytest.Monkey
             "body": "body",
             "user": {"login": "u"},
             "created_at": "2026-09-01T00:00:00Z",
+            "updated_at": "2026-09-02T00:00:00Z",
+            "head": {"sha": f"head-{n}"},
+            "base": {"sha": "base-main"},
             "html_url": f"https://github.com/omacom/omarchy/pull/{n}",
         }
         for n in (10, 20, 30, 40, 50)

@@ -58,6 +58,24 @@ class FakeTransport:
         return list(self.listing)
 
 
+class SequencedTransport:
+    """Return deterministic listing generations while recording endpoints."""
+
+    def __init__(self, listings: list[list[dict[str, Any]]]) -> None:
+        self.listings = listings
+        self.list_index = 0
+        self.calls: list[str] = []
+
+    def __call__(self, endpoint: str, **_kwargs: Any) -> Any:
+        self.calls.append(endpoint)
+        if "/files?" in endpoint:
+            number = int(endpoint.split("/pulls/")[1].split("/")[0])
+            return [changed_file(number)]
+        listing = self.listings[min(self.list_index, len(self.listings) - 1)]
+        self.list_index += 1
+        return list(listing)
+
+
 @pytest.mark.parametrize(
     "argv",
     [
@@ -154,9 +172,93 @@ def test_failure_between_files_and_mid_fetch_revision_change_preserve_active(tmp
 
     transport.fail_file = None
     transport.revalidate_listing = [pull(1, "3"), pull(2, "2")]
-    with pytest.raises(gh.GhError, match="changed during sync"):
+    result = gh.fetch_pulls_with_transport(
+        "acme", "widgets", transport=transport, cache_dir=tmp_path, refresh=True
+    )
+    # Reconciliation is bounded.  The final full list is retained, but the
+    # PR that kept moving never receives evidence from an older revision.
+    assert [item.number for item in result] == [1, 2]
+    assert result[0].head_sha == "head-1-2"
+    assert result[0].evidence_complete is False
+    assert active_path.read_bytes() != before
+
+
+def test_reorder_and_metadata_churn_reuses_head_base_evidence(tmp_path: Path) -> None:
+    initial = FakeTransport([pull(1), pull(2)])
+    gh.fetch_pulls_with_transport(
+        "acme", "widgets", transport=initial, cache_dir=tmp_path, refresh=True
+    )
+    metadata_one = pull(1)
+    metadata_one["title"] = "retagged"
+    metadata_one["updated_at"] = "2026-09-03T00:00:00Z"
+    metadata_two = pull(2)
+    transport = SequencedTransport([[metadata_two, metadata_one], [metadata_one, metadata_two]])
+    result = gh.fetch_pulls_with_transport(
+        "acme", "widgets", transport=transport, cache_dir=tmp_path, refresh=True
+    )
+    assert [item.number for item in result] == [1, 2]
+    assert result[0].title == "retagged"
+    assert not any("/files?" in call for call in transport.calls)
+    active = json.loads((tmp_path / "acme" / "widgets" / "active.json").read_text())
+    snapshot = tmp_path / "acme" / "widgets" / "snapshots" / active["snapshot_id"]
+    metadata = json.loads((snapshot / gh.FETCH_METADATA_FILE).read_text())
+    assert metadata["files"]["1"]["updated_at"] == metadata_one["updated_at"]
+
+
+def test_changed_revision_is_refetched_and_perpetual_churn_is_stubbed(
+    tmp_path: Path,
+) -> None:
+    stable = SequencedTransport([[pull(1)], [pull(1, "2")], [pull(1, "2")]])
+    result = gh.fetch_pulls_with_transport(
+        "acme", "widgets", transport=stable, cache_dir=tmp_path, refresh=True
+    )
+    assert result[0].head_sha == "head-1-2"
+    assert result[0].evidence_complete is True
+    assert sum("/files?" in call for call in stable.calls) == 2
+
+    moving = SequencedTransport(
+        [[pull(1, "1")], [pull(1, "2")], [pull(1, "3")], [pull(1, "4")]]
+    )
+    moving_cache = tmp_path / "moving"
+    result = gh.fetch_pulls_with_transport(
+        "acme", "widgets", transport=moving, cache_dir=moving_cache, refresh=True
+    )
+    assert result[0].head_sha == "head-1-4"
+    assert result[0].evidence_complete is False
+    assert sum("/files?" in call for call in moving.calls) == 3
+    assert gh.cached_pr_files("acme", "widgets", 1, moving_cache) == []
+    bundle = gh.cached_pr_evidence("acme", "widgets", 1, moving_cache)
+    assert bundle is not None and bundle["files"] == []
+    active = json.loads(
+        (moving_cache / "acme" / "widgets" / "active.json").read_text()
+    )
+    snapshot = moving_cache / "acme" / "widgets" / "snapshots" / active["snapshot_id"]
+    assert not (snapshot / "files" / "1.json").exists()
+
+
+def test_new_pr_is_fetched_in_bounded_unlimited_reconciliation(tmp_path: Path) -> None:
+    transport = SequencedTransport(
+        [[pull(1)], [pull(1), pull(2)], [pull(1), pull(2)]]
+    )
+    result = gh.fetch_pulls_with_transport(
+        "acme", "widgets", transport=transport, cache_dir=tmp_path, refresh=True
+    )
+    assert [item.number for item in result] == [1, 2]
+    assert all(item.evidence_complete for item in result)
+    assert any("/pulls/2/files?" in call for call in transport.calls)
+
+
+def test_duplicate_or_malformed_listing_preserves_active_snapshot(tmp_path: Path) -> None:
+    initial = FakeTransport([pull(1)])
+    gh.fetch_pulls_with_transport(
+        "acme", "widgets", transport=initial, cache_dir=tmp_path, refresh=True
+    )
+    active_path = tmp_path / "acme" / "widgets" / gh.ACTIVE_SNAPSHOT_FILE
+    before = active_path.read_bytes()
+    malformed = SequencedTransport([[pull(1), pull(1)]])
+    with pytest.raises(gh.GhError, match="Duplicate PR number"):
         gh.fetch_pulls_with_transport(
-            "acme", "widgets", transport=transport, cache_dir=tmp_path, refresh=True
+            "acme", "widgets", transport=malformed, cache_dir=tmp_path, refresh=True
         )
     assert active_path.read_bytes() == before
 
